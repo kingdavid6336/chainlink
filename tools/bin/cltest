@@ -1,0 +1,17 @@
+#!/bin/bash
+
+# Runs the Chainlink test suite parallelizing into 3 processes, each with their
+# dedicated postgres database URL.
+# Hardcoded to 3 after empirical observations showed it to be the most performant.
+
+set -e
+
+DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" >/dev/null 2>&1 && pwd )"
+go run "${DIR}/pgtest/main.go" $( dirname "$DIR/../.." )
+#packagearg="${1:-./...}"
+#PKGS=$(go list $packagearg | grep -v /vendor/)
+#echo ${PKGS}
+
+#declare -a DATABASES=("chainlink_test1" "chainlink_test2" "chainlink_test3")
+
+#DATABASE_URL=postgres://localhost:5432/chainlink_test?sslmode=disable go test -cpu 1 -parallel 1 -p 1 github.com/smartcontractkit/chainlink/core/utils github.com/smartcontractkit/chainlink/core/web
