@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"time"
 )
 
 var databaseNames = []string{"chainlink_test1", "chainlink_test2", "chainlink_test3"}
@@ -38,6 +39,7 @@ func main() {
 		}
 	}
 
+	start := time.Now()
 	//outputs := createOutputs()
 	var b bytes.Buffer
 	chunks := chunkify(packages)
@@ -59,12 +61,15 @@ func main() {
 
 	for _, cmd := range running {
 		if err := cmd.Wait(); err != nil {
+			fmt.Println("=== GOT THE FOLLOWING ERROR:")
 			fmt.Print(string(b.Bytes()))
-			panic(err)
+			//panic(err)
 		}
 	}
 
-	fmt.Println("=== DONE!")
+	t := time.Now()
+	elapsed := t.Sub(start)
+	fmt.Println("=== DONE in ", elapsed)
 }
 
 //func createOutputs() {
