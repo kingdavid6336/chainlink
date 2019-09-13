@@ -147,7 +147,7 @@ func (j JobSpec) NewRun(i Initiator) JobRun {
 		CreatedAt:   now,
 		UpdatedAt:   now,
 		TaskRuns:    taskRuns,
-		RunRequest:  runRequest,
+		RunRequest:  *runRequest,
 		Initiator:   i,
 		InitiatorID: i.ID,
 		Status:      RunStatusUnstarted,

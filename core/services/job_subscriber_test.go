@@ -60,7 +60,8 @@ func TestJobSubscriber_reconnectLoop_Resubscribing(t *testing.T) {
 	eth.RegisterSubscription("logs")
 	eth.RegisterSubscription("logs")
 
-	el := services.NewJobSubscriber(store)
+	jobManager := services.NewJobManager(store)
+	el := services.NewJobSubscriber(store, jobManager)
 	assert.Nil(t, el.Connect(cltest.Head(1)))
 	assert.Equal(t, 2, len(el.Jobs()))
 	el.Disconnect()

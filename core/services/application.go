@@ -1,7 +1,6 @@
 package services
 
 import (
-	"errors"
 	"os"
 	"os/signal"
 	"syscall"
@@ -25,14 +24,16 @@ type Application interface {
 	ArchiveJob(*models.ID) error
 	AddServiceAgreement(*models.ServiceAgreement) error
 	NewBox() packr.Box
+	JobManager
 }
 
 // ChainlinkApplication contains fields for the JobSubscriber, Scheduler,
 // and Store. The JobSubscriber and Scheduler are also available
 // in the services package, but the Store has its own package.
 type ChainlinkApplication struct {
-	Exiter                   func(int)
-	HeadTracker              *HeadTracker
+	Exiter      func(int)
+	HeadTracker *HeadTracker
+	JobManager
 	JobRunner                JobRunner
 	JobSubscriber            JobSubscriber
 	Scheduler                *Scheduler
@@ -49,13 +50,15 @@ func NewApplication(config *orm.Config, onConnectCallbacks ...func(Application))
 	store := store.NewStore(config)
 	config.SetRuntimeStore(store.ORM)
 
-	jobSubscriber := NewJobSubscriber(store)
-	pendingConnectionResumer := newPendingConnectionResumer(store)
+	jobManager := NewJobManager(store)
+	jobSubscriber := NewJobSubscriber(store, jobManager)
+	pendingConnectionResumer := newPendingConnectionResumer(jobManager)
 
 	app := &ChainlinkApplication{
 		JobSubscriber:            jobSubscriber,
+		JobManager:               jobManager,
 		JobRunner:                NewJobRunner(store),
-		Scheduler:                NewScheduler(store),
+		Scheduler:                NewScheduler(store, jobManager),
 		Store:                    store,
 		SessionReaper:            NewStoreReaper(store),
 		Exiter:                   os.Exit,
@@ -170,28 +173,15 @@ func (app *ChainlinkApplication) NewBox() packr.Box {
 }
 
 type pendingConnectionResumer struct {
-	store   *store.Store
-	resumer func(*models.JobRun, *store.Store) error
+	jobManager JobManager
 }
 
-func newPendingConnectionResumer(store *store.Store) *pendingConnectionResumer {
-	return &pendingConnectionResumer{store: store, resumer: ResumeConnectingTask}
+func newPendingConnectionResumer(jobManager JobManager) *pendingConnectionResumer {
+	return &pendingConnectionResumer{jobManager: jobManager}
 }
 
 func (p *pendingConnectionResumer) Connect(head *models.Head) error {
-	var merr error
-	err := p.store.UnscopedJobRunsWithStatus(func(run *models.JobRun) {
-		err := p.resumer(run, p.store.Unscoped())
-		if err != nil {
-			merr = multierr.Append(merr, err)
-		}
-	}, models.RunStatusPendingConnection)
-
-	if err != nil {
-		return multierr.Append(errors.New("error resuming pending connections"), err)
-	}
-
-	return merr
+	return p.jobManager.ResumeConnectingTasks()
 }
 
 func (p *pendingConnectionResumer) Disconnect()            {}

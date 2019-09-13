@@ -18,20 +18,22 @@ type Scheduler struct {
 	Recurring    *Recurring
 	OneTime      *OneTime
 	store        *store.Store
+	jobManager   JobManager
 	startedMutex sync.RWMutex
 	started      bool
 }
 
 // NewScheduler initializes the Scheduler instances with both Recurring
 // and OneTime fields since jobs can contain tasks which utilize both.
-func NewScheduler(store *store.Store) *Scheduler {
+func NewScheduler(store *store.Store, jobManager JobManager) *Scheduler {
 	return &Scheduler{
-		Recurring: NewRecurring(store),
+		Recurring: NewRecurring(store.Clock, jobManager),
 		OneTime: &OneTime{
-			Store: store,
-			Clock: store.Clock,
+			Clock:      store.Clock,
+			JobManager: jobManager,
 		},
-		store: store,
+		store:      store,
+		jobManager: jobManager,
 	}
 }
 
@@ -53,7 +55,7 @@ func (s *Scheduler) Start() error {
 	}
 	s.started = true
 
-	return s.store.Jobs(func(j models.JobSpec) bool {
+	return s.store.Jobs(func(j *models.JobSpec) bool {
 		s.addJob(j)
 		return true
 	})
@@ -71,9 +73,9 @@ func (s *Scheduler) Stop() {
 	}
 }
 
-func (s *Scheduler) addJob(job models.JobSpec) {
-	s.Recurring.AddJob(job)
-	s.OneTime.AddJob(job)
+func (s *Scheduler) addJob(job *models.JobSpec) {
+	s.Recurring.AddJob(*job)
+	s.OneTime.AddJob(*job)
 }
 
 // AddJob is the governing function for Recurring and OneTime,
@@ -84,23 +86,23 @@ func (s *Scheduler) AddJob(job models.JobSpec) {
 	if !s.started {
 		return
 	}
-	s.addJob(job)
+	s.addJob(&job)
 }
 
 // Recurring is used for runs that need to execute on a schedule,
 // and is configured with cron.
 // Instances of Recurring must be initialized using NewRecurring().
 type Recurring struct {
-	Cron  Cron
-	Clock utils.Nower
-	store *store.Store
+	Cron       Cron
+	Clock      utils.Nower
+	jobManager JobManager
 }
 
 // NewRecurring create a new instance of Recurring, ready to use.
-func NewRecurring(store *store.Store) *Recurring {
+func NewRecurring(clock utils.Nower, jobManager JobManager) *Recurring {
 	return &Recurring{
-		store: store,
-		Clock: store.Clock,
+		Clock:      clock,
+		jobManager: jobManager,
 	}
 }
 
@@ -123,13 +125,8 @@ func (r *Recurring) AddJob(job models.JobSpec) {
 	for _, i := range job.InitiatorsFor(models.InitiatorCron) {
 		initr := i
 		if !job.Ended(r.Clock.Now()) {
-			archived := false
 			r.Cron.AddFunc(string(initr.Schedule), func() {
-				if archived || r.store.Archived(job.ID) {
-					archived = true
-					return
-				}
-				_, err := ExecuteJob(job, initr, models.RunResult{}, nil, r.store)
+				_, err := r.jobManager.ExecuteJob(&job, &initr, &models.RunResult{}, nil)
 				if err != nil && !expectedRecurringScheduleJobError(err) {
 					logger.Errorw(err.Error())
 				}
@@ -140,9 +137,10 @@ func (r *Recurring) AddJob(job models.JobSpec) {
 
 // OneTime represents runs that are to be executed only once.
 type OneTime struct {
-	Store *store.Store
-	Clock utils.Afterer
-	done  chan struct{}
+	Store      *store.Store
+	Clock      utils.Afterer
+	JobManager JobManager
+	done       chan struct{}
 }
 
 // Start allocates a channel for the "done" field with an empty struct.
@@ -173,14 +171,11 @@ func (ot *OneTime) RunJobAt(initr models.Initiator, job models.JobSpec) {
 	select {
 	case <-ot.done:
 	case <-ot.Clock.After(utils.DurationFromNow(initr.Time.Time)):
-		if ot.Store.Archived(job.ID) {
-			return
-		}
 		if err := ot.Store.MarkRan(&initr, true); err != nil {
 			logger.Error(err.Error())
 			return
 		}
-		_, err := ExecuteJob(job, initr, models.RunResult{}, nil, ot.Store)
+		_, err := ot.JobManager.ExecuteJob(&job, &initr, &models.RunResult{}, nil)
 		if err != nil {
 			logger.Error(err.Error())
 			if err := ot.Store.MarkRan(&initr, false); err != nil {

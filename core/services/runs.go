@@ -14,47 +14,160 @@ import (
 	"github.com/smartcontractkit/chainlink/core/utils"
 )
 
-// ExecuteJob saves and immediately begins executing a run for a specified job
-// if it is ready.
-func ExecuteJob(
-	job models.JobSpec,
-	initiator models.Initiator,
-	input models.RunResult,
+type JobManager interface {
+	ExecuteJob(
+		job *models.JobSpec,
+		initiator *models.Initiator,
+		input *models.RunResult,
+		creationHeight *big.Int) (*models.JobRun, error)
+	ExecuteJobWithRunRequest(
+		job *models.JobSpec,
+		initiator *models.Initiator,
+		input *models.RunResult,
+		creationHeight *big.Int,
+		runRequest *models.RunRequest) (*models.JobRun, error)
+
+	ResumeConfirmingTasks(currentBlockHeight *big.Int) error
+	ResumeConnectingTasks() error
+	ResumePendingTask(runID *models.ID, input models.RunResult) error
+	CancelTask(runID *models.ID) error
+}
+
+// jobManager implements JobManager
+type jobManager struct {
+	store *store.Store
+}
+
+// NewJobManager returns a new job manager
+func NewJobManager(store *store.Store) JobManager {
+	return &jobManager{store: store}
+}
+
+func (jm *jobManager) ExecuteJob(
+	job *models.JobSpec,
+	initiator *models.Initiator,
+	input *models.RunResult,
 	creationHeight *big.Int,
-	store *store.Store) (*models.JobRun, error) {
-	return ExecuteJobWithRunRequest(
+) (*models.JobRun, error) {
+	return jm.ExecuteJobWithRunRequest(
 		job,
 		initiator,
 		input,
 		creationHeight,
-		store,
 		models.NewRunRequest(),
 	)
 }
 
-// ExecuteJobWithRunRequest saves and immediately begins executing a run
-// for a specified job if it is ready, assigning the passed initiator run.
-func ExecuteJobWithRunRequest(
-	job models.JobSpec,
-	initiator models.Initiator,
-	input models.RunResult,
+func (jm *jobManager) ExecuteJobWithRunRequest(
+	job *models.JobSpec,
+	initiator *models.Initiator,
+	input *models.RunResult,
 	creationHeight *big.Int,
-	store *store.Store,
-	runRequest models.RunRequest) (*models.JobRun, error) {
-
+	runRequest *models.RunRequest,
+) (*models.JobRun, error) {
 	logger.Debugw(fmt.Sprintf("New run triggered by %s", initiator.Type),
 		"job", job.ID,
 		"input_status", input.Status,
 		"creation_height", creationHeight,
 	)
 
-	run, err := NewRun(job, initiator, input, creationHeight, store, runRequest.Payment)
+	run, err := NewRun(job, initiator, input, creationHeight, jm.store, runRequest.Payment)
 	if err != nil {
 		return nil, errors.Wrap(err, "NewRun failed")
 	}
 
-	run.RunRequest = runRequest
-	return run, createAndTrigger(run, store)
+	run.RunRequest = *runRequest
+	return run, createAndTrigger(run, jm.store)
+}
+
+func (jm *jobManager) ResumeConfirmingTasks(currentBlockHeight *big.Int) error {
+	return jm.store.UnscopedJobRunsWithStatus(func(run *models.JobRun) {
+		logger.Debugw("New head resuming run", run.ForLogger()...)
+
+		currentTaskRun := run.NextTaskRun()
+		if currentTaskRun == nil {
+			logger.Error("Attempting to resume confirming run with no remaining tasks %s", run.ID)
+			return
+		}
+
+		run.ObservedHeight = models.NewBig(currentBlockHeight)
+
+		validateMinimumConfirmations(run, currentTaskRun, run.ObservedHeight, jm.store)
+		updateAndTrigger(run, jm.store)
+	}, models.RunStatusPendingConfirmations)
+}
+
+func (jm *jobManager) ResumeConnectingTasks() error {
+	return jm.store.UnscopedJobRunsWithStatus(func(run *models.JobRun) {
+		logger.Debugw("New connection resuming run", run.ForLogger()...)
+
+		currentTaskRun := run.NextTaskRun()
+		if currentTaskRun == nil {
+			logger.Error("Attempting to resume connecting run with no remaining tasks %s", run.ID)
+			return
+		}
+
+		run.Status = models.RunStatusInProgress
+		updateAndTrigger(run, jm.store)
+	}, models.RunStatusPendingConnection, models.RunStatusPendingConfirmations)
+}
+
+func (jm *jobManager) ResumePendingTask(
+	runID *models.ID,
+	input models.RunResult,
+) error {
+	run, err := jm.store.Unscoped().FindJobRun(runID)
+	if err != nil {
+		return err
+	}
+
+	logger.Debugw("External adapter resuming job", []interface{}{
+		"run", run.ID,
+		"job", run.JobSpecID,
+		"status", run.Status,
+		"input_data", input.Data,
+		"input_result", input.Status,
+	}...)
+
+	if !run.Status.PendingBridge() {
+		return fmt.Errorf("Attempting to resume non pending run %s", run.ID)
+	}
+
+	currentTaskRun := run.NextTaskRun()
+	if currentTaskRun == nil {
+		return fmt.Errorf("Attempting to resume pending run with no remaining tasks %s", run.ID)
+	}
+
+	run.Overrides.Merge(input)
+
+	currentTaskRun.ApplyResult(input)
+	if currentTaskRun.Status.Finished() && run.TasksRemain() {
+		run.Status = models.RunStatusInProgress
+	} else if currentTaskRun.Status.Finished() {
+		run.ApplyResult(input)
+		run.SetFinishedAt()
+	} else {
+		run.ApplyResult(input)
+	}
+
+	return updateAndTrigger(&run, jm.store)
+}
+
+func (jm *jobManager) CancelTask(
+	runID *models.ID,
+) error {
+	run, err := jm.store.FindJobRun(runID)
+	if err != nil {
+		return err
+	}
+
+	logger.Debugw("Cancelling job", []interface{}{
+		"run", run.ID,
+		"job", run.JobSpecID,
+		"status", run.Status,
+	}...)
+
+	return nil
 }
 
 // MeetsMinimumPayment is a helper that returns true if jobrun received
@@ -72,9 +185,9 @@ func MeetsMinimumPayment(
 // NewRun returns a run from an input job, in an initial state ready for
 // processing by the job runner system
 func NewRun(
-	job models.JobSpec,
-	initiator models.Initiator,
-	input models.RunResult,
+	job *models.JobSpec,
+	initiator *models.Initiator,
+	input *models.RunResult,
 	currentHeight *big.Int,
 	store *store.Store,
 	payment *assets.Link) (*models.JobRun, error) {
@@ -92,10 +205,10 @@ func NewRun(
 		}
 	}
 
-	run := job.NewRun(initiator)
+	run := job.NewRun(*initiator)
 
-	run.Overrides = input
-	run.ApplyResult(input)
+	run.Overrides = *input
+	run.ApplyResult(*input)
 	run.CreationHeight = models.NewBig(currentHeight)
 	run.ObservedHeight = models.NewBig(currentHeight)
 
@@ -169,95 +282,6 @@ func NewRun(
 	initialTask := run.TaskRuns[0]
 	validateMinimumConfirmations(&run, &initialTask, run.CreationHeight, store)
 	return &run, nil
-}
-
-// ResumeConfirmingTask resumes a confirming run if the minimum confirmations have been met
-func ResumeConfirmingTask(
-	run *models.JobRun,
-	store *store.Store,
-	currentBlockHeight *big.Int,
-) error {
-
-	logger.Debugw("New head resuming run", run.ForLogger()...)
-
-	if !run.Status.PendingConfirmations() && !run.Status.PendingConnection() {
-		return fmt.Errorf("Attempt to resume non confirming task")
-	}
-
-	currentTaskRun := run.NextTaskRun()
-	if currentTaskRun == nil {
-		return fmt.Errorf("Attempting to resume confirming run with no remaining tasks %s", run.ID.String())
-	}
-
-	if currentBlockHeight == nil {
-		return fmt.Errorf("Attempting to resume confirming run with no currentBlockHeight %s", run.ID.String())
-	}
-
-	run.ObservedHeight = models.NewBig(currentBlockHeight)
-
-	validateMinimumConfirmations(run, currentTaskRun, run.ObservedHeight, store)
-	return updateAndTrigger(run, store)
-}
-
-// ResumeConnectingTask resumes a run that was left in pending_connection.
-func ResumeConnectingTask(
-	run *models.JobRun,
-	store *store.Store,
-) error {
-
-	logger.Debugw("New connection resuming run", run.ForLogger()...)
-
-	if !run.Status.PendingConnection() {
-		return fmt.Errorf("Attempt to resume non connecting task")
-	}
-
-	currentTaskRun := run.NextTaskRun()
-	if currentTaskRun == nil {
-		return fmt.Errorf("Attempting to resume connecting run with no remaining tasks %s", run.ID.String())
-	}
-
-	run.Status = models.RunStatusInProgress
-	return updateAndTrigger(run, store)
-}
-
-// ResumePendingTask takes the body provided from an external adapter,
-// saves it for the next task to process, then tells the job runner to execute
-// it
-func ResumePendingTask(
-	run *models.JobRun,
-	store *store.Store,
-	input models.RunResult,
-) error {
-	logger.Debugw("External adapter resuming job", []interface{}{
-		"run", run.ID.String(),
-		"job", run.JobSpecID.String(),
-		"status", run.Status,
-		"input_data", input.Data,
-		"input_result", input.Status,
-	}...)
-
-	if !run.Status.PendingBridge() {
-		return fmt.Errorf("Attempting to resume non pending run %s", run.ID.String())
-	}
-
-	currentTaskRun := run.NextTaskRun()
-	if currentTaskRun == nil {
-		return fmt.Errorf("Attempting to resume pending run with no remaining tasks %s", run.ID.String())
-	}
-
-	run.Overrides.Merge(input)
-
-	currentTaskRun.ApplyResult(input)
-	if currentTaskRun.Status.Finished() && run.TasksRemain() {
-		run.Status = models.RunStatusInProgress
-	} else if currentTaskRun.Status.Finished() {
-		run.ApplyResult(input)
-		run.SetFinishedAt()
-	} else {
-		run.ApplyResult(input)
-	}
-
-	return updateAndTrigger(run, store)
 }
 
 func prepareAdapter(

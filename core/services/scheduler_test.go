@@ -25,7 +25,8 @@ func TestScheduler_Start_LoadingRecurringJobs(t *testing.T) {
 	jobWoCron := cltest.NewJob()
 	require.NoError(t, store.CreateJob(&jobWoCron))
 
-	sched := services.NewScheduler(store)
+	jm := services.NewJobManager(store)
+	sched := services.NewScheduler(store, jm)
 	require.NoError(t, sched.Start())
 	defer sched.Stop()
 
@@ -38,7 +39,8 @@ func TestScheduler_AddJob_WhenStopped(t *testing.T) {
 
 	store, cleanup := cltest.NewStore(t)
 	defer cleanup()
-	sched := services.NewScheduler(store)
+	jm := services.NewJobManager(store)
+	sched := services.NewScheduler(store, jm)
 	defer sched.Stop()
 
 	j := cltest.NewJobWithSchedule("* * * * *")
@@ -58,7 +60,8 @@ func TestScheduler_Start_AddingUnstartedJob(t *testing.T) {
 	j.StartAt = cltest.NullableTime(startAt)
 	assert.Nil(t, store.CreateJob(&j))
 
-	sched := services.NewScheduler(store)
+	jm := services.NewJobManager(store)
+	sched := services.NewScheduler(store, jm)
 	defer sched.Stop()
 	assert.Nil(t, sched.Start())
 
@@ -97,7 +100,8 @@ func TestRecurring_AddJob(t *testing.T) {
 	for _, tt := range tests {
 		test := tt
 		t.Run(test.name, func(t *testing.T) {
-			r := services.NewRecurring(store)
+			jm := services.NewJobManager(store)
+			r := services.NewRecurring(store.Clock, jm)
 			cron := cltest.NewMockCron()
 			r.Cron = cron
 			defer r.Stop()
@@ -122,7 +126,8 @@ func TestRecurring_AddJob(t *testing.T) {
 func TestRecurring_AddJob_Archived(t *testing.T) {
 	store, cleanup := cltest.NewStore(t)
 	defer cleanup()
-	r := services.NewRecurring(store)
+	jm := services.NewJobManager(store)
+	r := services.NewRecurring(store.Clock, jm)
 	cron := cltest.NewMockCron()
 	r.Cron = cron
 	defer r.Stop()
@@ -173,9 +178,11 @@ func TestOneTime_AddJob(t *testing.T) {
 	for _, tt := range tests {
 		test := tt
 		t.Run(test.name, func(t *testing.T) {
+			jm := services.NewJobManager(store)
 			ot := services.OneTime{
-				Clock: store.Clock,
-				Store: store,
+				Clock:      store.Clock,
+				Store:      store,
+				JobManager: jm,
 			}
 			require.NoError(t, ot.Start())
 			defer ot.Stop()
@@ -214,9 +221,11 @@ func TestOneTime_RunJobAt_StopJobBeforeExecution(t *testing.T) {
 	store, cleanup := cltest.NewStore(t)
 	defer cleanup()
 
+	jm := services.NewJobManager(store)
 	ot := services.OneTime{
-		Clock: &cltest.NeverClock{},
-		Store: store,
+		Clock:      &cltest.NeverClock{},
+		Store:      store,
+		JobManager: jm,
 	}
 	ot.Start()
 	j := cltest.NewJobWithRunAtInitiator(time.Now().Add(time.Hour))
@@ -245,9 +254,11 @@ func TestOneTime_RunJobAt_ExecuteLateJob(t *testing.T) {
 	store, cleanup := cltest.NewStore(t)
 	defer cleanup()
 
+	jm := services.NewJobManager(store)
 	ot := services.OneTime{
-		Clock: store.Clock,
-		Store: store,
+		Clock:      store.Clock,
+		Store:      store,
+		JobManager: jm,
 	}
 	j := cltest.NewJobWithRunAtInitiator(time.Now().Add(time.Hour * -1))
 	assert.Nil(t, store.CreateJob(&j))
@@ -275,16 +286,18 @@ func TestOneTime_RunJobAt_RunTwice(t *testing.T) {
 	store, cleanup := cltest.NewStore(t)
 	defer cleanup()
 
+	jm := services.NewJobManager(store)
 	ot := services.OneTime{
-		Clock: store.Clock,
-		Store: store,
+		Clock:      store.Clock,
+		Store:      store,
+		JobManager: jm,
 	}
 
 	j := cltest.NewJobWithRunAtInitiator(time.Now())
 	assert.NoError(t, store.CreateJob(&j))
 	ot.RunJobAt(j.Initiators[0], j)
 
-	j2, err := ot.Store.FindJob(j.ID)
+	j2, err := store.FindJob(j.ID)
 	require.NoError(t, err)
 	require.Len(t, j2.Initiators, 1)
 	ot.RunJobAt(j2.Initiators[0], j2)
@@ -300,9 +313,11 @@ func TestOneTime_RunJobAt_UnstartedRun(t *testing.T) {
 	store, cleanup := cltest.NewStore(t)
 	defer cleanup()
 
+	jm := services.NewJobManager(store)
 	ot := services.OneTime{
-		Clock: store.Clock,
-		Store: store,
+		Clock:      store.Clock,
+		Store:      store,
+		JobManager: jm,
 	}
 
 	j := cltest.NewJobWithRunAtInitiator(time.Now())
@@ -323,9 +338,11 @@ func TestOneTime_RunJobAt_ArchivedRun(t *testing.T) {
 	store, cleanup := cltest.NewStore(t)
 	defer cleanup()
 
+	jm := services.NewJobManager(store)
 	ot := services.OneTime{
-		Clock: cltest.InstantClock{},
-		Store: store,
+		Clock:      cltest.InstantClock{},
+		Store:      store,
+		JobManager: jm,
 	}
 
 	j := cltest.NewJobWithRunAtInitiator(time.Now())

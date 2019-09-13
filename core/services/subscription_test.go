@@ -27,9 +27,10 @@ func TestServices_NewInitiatorSubscription_BackfillLogs(t *testing.T) {
 	eth.RegisterSubscription("logs")
 
 	var count int32
-	callback := func(*strpkg.Store, models.LogRequest) { atomic.AddInt32(&count, 1) }
+	callback := func(*strpkg.Store, services.JobManager, models.LogRequest) { atomic.AddInt32(&count, 1) }
 	fromBlock := cltest.Head(0)
-	sub, err := services.NewInitiatorSubscription(initr, job, store, fromBlock, callback)
+	jm := services.NewJobManager(store)
+	sub, err := services.NewInitiatorSubscription(initr, job, store, jm, fromBlock, callback)
 	assert.NoError(t, err)
 	defer sub.Unsubscribe()
 
@@ -52,8 +53,9 @@ func TestServices_NewInitiatorSubscription_BackfillLogs_WithNoHead(t *testing.T)
 	eth.RegisterSubscription("logs")
 
 	var count int32
-	callback := func(*strpkg.Store, models.LogRequest) { atomic.AddInt32(&count, 1) }
-	sub, err := services.NewInitiatorSubscription(initr, job, store, nil, callback)
+	callback := func(*strpkg.Store, services.JobManager, models.LogRequest) { atomic.AddInt32(&count, 1) }
+	jm := services.NewJobManager(store)
+	sub, err := services.NewInitiatorSubscription(initr, job, store, jm, nil, callback)
 	assert.NoError(t, err)
 	defer sub.Unsubscribe()
 
@@ -77,9 +79,10 @@ func TestServices_NewInitiatorSubscription_PreventsDoubleDispatch(t *testing.T) 
 	eth.RegisterSubscription("logs", logsChan)
 
 	var count int32
-	callback := func(*strpkg.Store, models.LogRequest) { atomic.AddInt32(&count, 1) }
+	callback := func(*strpkg.Store, services.JobManager, models.LogRequest) { atomic.AddInt32(&count, 1) }
 	head := cltest.Head(0)
-	sub, err := services.NewInitiatorSubscription(initr, job, store, head, callback)
+	jm := services.NewJobManager(store)
+	sub, err := services.NewInitiatorSubscription(initr, job, store, jm, head, callback)
 	assert.NoError(t, err)
 	defer sub.Unsubscribe()
 
@@ -114,7 +117,8 @@ func TestServices_ReceiveLogRequest_IgnoredLogWithRemovedFlag(t *testing.T) {
 	err := store.ORM.DB.Model(&models.JobRun{}).Count(&originalCount).Error
 	require.NoError(t, err)
 
-	services.ReceiveLogRequest(store, log)
+	jm := services.NewJobManager(store)
+	services.ReceiveLogRequest(store, jm, log)
 
 	gomega.NewGomegaWithT(t).Consistently(func() int {
 		count := 0

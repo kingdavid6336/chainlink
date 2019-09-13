@@ -29,7 +29,7 @@ type JobSubscription struct {
 // StartJobSubscription constructs a JobSubscription which listens for and
 // tracks event logs corresponding to the specified job. Ignores any errors if
 // there is at least one successful subscription to an initiator log.
-func StartJobSubscription(job models.JobSpec, head *models.Head, store *strpkg.Store) (JobSubscription, error) {
+func StartJobSubscription(job models.JobSpec, head *models.Head, store *strpkg.Store, jobManager JobManager) (JobSubscription, error) {
 	var merr error
 	var unsubscribers []Unsubscriber
 
@@ -40,7 +40,7 @@ func StartJobSubscription(job models.JobSpec, head *models.Head, store *strpkg.S
 	)
 
 	for _, initr := range initrs {
-		unsubscriber, err := NewInitiatorSubscription(initr, job, store, head, ReceiveLogRequest)
+		unsubscriber, err := NewInitiatorSubscription(initr, job, store, jobManager, head, ReceiveLogRequest)
 		if err == nil {
 			unsubscribers = append(unsubscribers, unsubscriber)
 		} else {
@@ -68,10 +68,11 @@ func (js JobSubscription) Unsubscribe() {
 // to the callback.
 type InitiatorSubscription struct {
 	*ManagedSubscription
-	Job       models.JobSpec
-	Initiator models.Initiator
-	store     *strpkg.Store
-	callback  func(*strpkg.Store, models.LogRequest)
+	jobManager JobManager
+	Job        models.JobSpec
+	Initiator  models.Initiator
+	store      *strpkg.Store
+	callback   func(*strpkg.Store, JobManager, models.LogRequest)
 }
 
 // NewInitiatorSubscription creates a new InitiatorSubscription that feeds received
@@ -80,8 +81,9 @@ func NewInitiatorSubscription(
 	initr models.Initiator,
 	job models.JobSpec,
 	store *strpkg.Store,
+	jobManager JobManager,
 	from *models.Head,
-	callback func(*strpkg.Store, models.LogRequest),
+	callback func(*strpkg.Store, JobManager, models.LogRequest),
 ) (InitiatorSubscription, error) {
 	filter, err := models.FilterQueryFactory(initr, from.NextInt()) // Exclude current block from subscription
 	if err != nil {
@@ -89,10 +91,11 @@ func NewInitiatorSubscription(
 	}
 
 	sub := InitiatorSubscription{
-		Job:       job,
-		Initiator: initr,
-		store:     store,
-		callback:  callback,
+		Job:        job,
+		jobManager: jobManager,
+		Initiator:  initr,
+		store:      store,
+		callback:   callback,
 	}
 
 	managedSub, err := NewManagedSubscription(store, filter, sub.dispatchLog)
@@ -114,7 +117,7 @@ func (sub InitiatorSubscription) dispatchLog(log models.Log) {
 		Initiator: sub.Initiator,
 		Log:       log,
 	}
-	sub.callback(sub.store, base.LogRequest())
+	sub.callback(sub.store, sub.jobManager, base.LogRequest())
 }
 
 func loggerLogListening(initr models.Initiator, blockNumber *big.Int) {
@@ -129,7 +132,7 @@ func loggerLogListening(initr models.Initiator, blockNumber *big.Int) {
 
 // ReceiveLogRequest parses the log and runs the job indicated by a RunLog or
 // ServiceAgreementExecutionLog. (Both log events have the same format.)
-func ReceiveLogRequest(store *strpkg.Store, le models.LogRequest) {
+func ReceiveLogRequest(store *strpkg.Store, jobManager JobManager, le models.LogRequest) {
 	if !le.Validate() {
 		return
 	}
@@ -146,10 +149,10 @@ func ReceiveLogRequest(store *strpkg.Store, le models.LogRequest) {
 		return
 	}
 
-	runJob(store, le, data)
+	runJob(store, jobManager, le, data)
 }
 
-func runJob(store *strpkg.Store, le models.LogRequest, data models.JSON) {
+func runJob(store *strpkg.Store, jobManager JobManager, le models.LogRequest, data models.JSON) {
 	input := models.RunResult{Data: data}
 	if err := le.ValidateRequester(); err != nil {
 		input.SetError(err)
@@ -161,14 +164,9 @@ func runJob(store *strpkg.Store, le models.LogRequest, data models.JSON) {
 		logger.Errorw(err.Error(), le.ForLogger()...)
 	}
 
-	_, err = ExecuteJobWithRunRequest(
-		le.GetJobSpec(),
-		le.GetInitiator(),
-		input,
-		le.BlockNumber(),
-		store.Unscoped(),
-		rr,
-	)
+	job := le.GetJobSpec()
+	initr := le.GetInitiator()
+	_, err = jobManager.ExecuteJobWithRunRequest(&job, &initr, &input, le.BlockNumber(), &rr)
 	if err != nil {
 		logger.Errorw(err.Error(), le.ForLogger()...)
 	}

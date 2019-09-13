@@ -355,7 +355,7 @@ func (orm *ORM) FindServiceAgreement(id string) (models.ServiceAgreement, error)
 }
 
 // Jobs fetches all jobs.
-func (orm *ORM) Jobs(cb func(models.JobSpec) bool) error {
+func (orm *ORM) Jobs(cb func(*models.JobSpec) bool) error {
 	return Batch(1000, func(offset, limit uint) (uint, error) {
 		jobs := []models.JobSpec{}
 		err := orm.preloadJobs().
@@ -367,7 +367,7 @@ func (orm *ORM) Jobs(cb func(models.JobSpec) bool) error {
 		}
 
 		for _, j := range jobs {
-			if !cb(j) {
+			if !cb(&j) {
 				return 0, nil
 			}
 		}

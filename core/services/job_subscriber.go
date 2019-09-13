@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"sync"
 
-	"github.com/smartcontractkit/chainlink/core/logger"
 	"github.com/smartcontractkit/chainlink/core/store"
 	"github.com/smartcontractkit/chainlink/core/store/models"
 	"go.uber.org/multierr"
@@ -21,15 +20,17 @@ type JobSubscriber interface {
 
 // jobSubscriber implementation
 type jobSubscriber struct {
+	jobManager       JobManager
 	store            *store.Store
 	jobSubscriptions map[string]JobSubscription
 	jobsMutex        *sync.RWMutex
 }
 
 // NewJobSubscriber returns a new job subscriber.
-func NewJobSubscriber(store *store.Store) JobSubscriber {
+func NewJobSubscriber(store *store.Store, jobManager JobManager) JobSubscriber {
 	return &jobSubscriber{
 		store:            store,
+		jobManager:       jobManager,
 		jobSubscriptions: map[string]JobSubscription{},
 		jobsMutex:        &sync.RWMutex{},
 	}
@@ -42,7 +43,7 @@ func (js *jobSubscriber) AddJob(job models.JobSpec, bn *models.Head) error {
 		return nil
 	}
 
-	sub, err := StartJobSubscription(job, bn, js.store)
+	sub, err := StartJobSubscription(job, bn, js.store, js.jobManager)
 	if err != nil {
 		return err
 	}
@@ -83,8 +84,8 @@ func (js *jobSubscriber) addSubscription(sub JobSubscription) {
 // Connect connects the jobs to the ethereum node by creating corresponding subscriptions.
 func (js *jobSubscriber) Connect(bn *models.Head) error {
 	var merr error
-	err := js.store.Jobs(func(j models.JobSpec) bool {
-		merr = multierr.Append(merr, js.AddJob(j, bn))
+	err := js.store.Jobs(func(j *models.JobSpec) bool {
+		merr = multierr.Append(merr, js.AddJob(*j, bn))
 		return true
 	})
 	return multierr.Append(merr, err)
@@ -104,16 +105,5 @@ func (js *jobSubscriber) Disconnect() {
 // OnNewHead resumes all pending job runs based on the new head activity.
 func (js *jobSubscriber) OnNewHead(head *models.Head) {
 	height := head.ToInt()
-
-	err := js.store.UnscopedJobRunsWithStatus(func(run *models.JobRun) {
-		err := ResumeConfirmingTask(run, js.store.Unscoped(), height)
-		if err != nil {
-			logger.Errorf("JobSubscriber.OnNewHead: %v", err)
-		}
-
-	}, models.RunStatusPendingConnection, models.RunStatusPendingConfirmations)
-
-	if err != nil {
-		logger.Errorf("error fetching pending job runs: %v", err)
-	}
+	js.jobManager.ResumeConfirmingTasks(height)
 }
