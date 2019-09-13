@@ -2818,9 +2818,9 @@
   integrity sha512-tLRDU1hmcWamtgRT2iVRdraAQVGFQGgtcqracSo9XyMN1VeZLSVGb8RJJxVqab7UGbijoUijGPVFMjmqzyZIUw==
 
 "@types/node@^11.9.5":
-  version "11.12.0"
-  resolved "https://registry.npmjs.org/@types/node/-/node-11.12.0.tgz#ec5594728811dc2797e42396cfcdf786f2052c12"
-  integrity sha512-Lg00egj78gM+4aE0Erw05cuDbvX9sLJbaaPwwRtdCdAMnIudqrQZ0oZX98Ek0yiSK/A2nubHgJfvII/rTT2Dwg==
+  version "11.13.20"
+  resolved "https://registry.npmjs.org/@types/node/-/node-11.13.20.tgz#da42fe93d6599f80b35ffeb5006f4c31f40d89ea"
+  integrity sha512-JE0UpLWZTV1sGcaj0hN+Q0760OEjpgyFJ06DOMVW6qKBducKdJQaIw0TGL6ccj7VXRduIOHLWQi+tHwulZJHVQ==
 
 "@types/numeral@^0.0.25":
   version "0.0.25"
@@ -6373,12 +6373,7 @@ core-js@^1.0.0:
   resolved "https://registry.npmjs.org/core-js/-/core-js-1.2.7.tgz#652294c14651db28fa93bd2d5ff2983a4f08c636"
   integrity sha1-ZSKUwUZR2yj6k70tX/KYOk8IxjY=
 
-core-js@^2.4.0, core-js@^2.5.0:
-  version "2.6.5"
-  resolved "https://registry.npmjs.org/core-js/-/core-js-2.6.5.tgz#44bc8d249e7fb2ff5d00e0341a7ffb94fbf67895"
-  integrity sha512-klh/kDpwX8hryYL14M9w/xei6vrv6sE8gTHDG7/T/+SEovB/G4ejwcfE/CBzO6Edsu+OETZMZ3wcX/EjUkrl5A==
-
-core-js@^2.6.5:
+core-js@^2.4.0, core-js@^2.5.0, core-js@^2.6.5, core-js@^2.6.9:
   version "2.6.9"
   resolved "https://registry.npmjs.org/core-js/-/core-js-2.6.9.tgz#6b4b214620c834152e179323727fc19741b084f2"
   integrity sha512-HOpZf6eXmnl7la+cUdMnLvUxKNqLUzJvgIziQ0DiF3JwSImNphIqdGqzj6hIKyX04MmV0poclQ7+wjWvxQyR2A==
@@ -8992,11 +8987,12 @@ fecha@^2.3.3:
   integrity sha512-lUGBnIamTAwk4znq5BcqsDaxSmZ9nDVJaij6NvRt/Tg4R69gERA+otPKbS86ROw9nxVMw2/mp1fnaiWqbs6Sdg==
 
 fetch-mock@^7.3.1:
-  version "7.3.1"
-  resolved "https://registry.npmjs.org/fetch-mock/-/fetch-mock-7.3.1.tgz#a3e28d8f141caaf68d78112354381a7303f87049"
-  integrity sha512-euKqWnxeApj0toZ5MSavZJ7IIxbMaHpgteV2GNuz6/slAY0JUbRe95U/ueaz2spT/4nR75H4wpEmy2MMEsCoRg==
+  version "7.3.9"
+  resolved "https://registry.npmjs.org/fetch-mock/-/fetch-mock-7.3.9.tgz#a80fd2a1728f72e0634ef7a9734bc61200096487"
+  integrity sha512-PgsTbiQBNapFz2P2UwDl3gowK3nZqfV4HdyDZ1dI4eTGGH9MLAeBglIPbyDbbNQoGYBOfla6/9uaiq7az2z4Aw==
   dependencies:
     babel-polyfill "^6.26.0"
+    core-js "^2.6.9"
     glob-to-regexp "^0.4.0"
     path-to-regexp "^2.2.1"
     whatwg-url "^6.5.0"
@@ -9792,9 +9788,9 @@ glob-to-regexp@^0.3.0:
   integrity sha1-jFoUlNIGbFcMw7/kSWF1rMTVAqs=
 
 glob-to-regexp@^0.4.0:
-  version "0.4.0"
-  resolved "https://registry.npmjs.org/glob-to-regexp/-/glob-to-regexp-0.4.0.tgz#49bd677b1671022bd10921c3788f23cdebf9c7e6"
-  integrity sha512-fyPCII4vn9Gvjq2U/oDAfP433aiE64cyP/CJjRJcpVGjqqNdioUYn9+r0cSzT1XPwmGAHuTT7iv+rQT8u/YHKQ==
+  version "0.4.1"
+  resolved "https://registry.npmjs.org/glob-to-regexp/-/glob-to-regexp-0.4.1.tgz#c75297087c851b9a578bd217dd59a92f59fe546e"
+  integrity sha512-lkX1HJXwyMcprw/5YUZc2s7DrpAiHB21/V+E1rHUrVNokkvB6bqMzT0VfV6/86ZNabt1k14YOIaT7nDvOX3Iiw==
 
 glob-watcher@^5.0.3:
   version "5.0.3"
@@ -13130,7 +13126,7 @@ lodash.some@^4.6.0:
 
 lodash.sortby@^4.7.0:
   version "4.7.0"
-  resolved "https://registry.yarnpkg.com/lodash.sortby/-/lodash.sortby-4.7.0.tgz#edd14c824e2cc9c1e0b0a1b42bb5210516a42438"
+  resolved "https://registry.npmjs.org/lodash.sortby/-/lodash.sortby-4.7.0.tgz#edd14c824e2cc9c1e0b0a1b42bb5210516a42438"
   integrity sha1-7dFMgk4sycHgsKG0K7UhBRakJDg=
 
 lodash.tail@^4.1.1:
@@ -17876,7 +17872,7 @@ regenerator-runtime@^0.10.5:
 
 regenerator-runtime@^0.11.0:
   version "0.11.1"
-  resolved "https://registry.yarnpkg.com/regenerator-runtime/-/regenerator-runtime-0.11.1.tgz#be05ad7f9bf7d22e056f9726cee5017fbf19e2e9"
+  resolved "https://registry.npmjs.org/regenerator-runtime/-/regenerator-runtime-0.11.1.tgz#be05ad7f9bf7d22e056f9726cee5017fbf19e2e9"
   integrity sha512-MguG95oij0fC3QV3URf4V2SDYGJhJnJGqvIIgdECeODCT98wSWDAJ94SSuVpYQUoTcGUIL6L4yNB7j1DFFHSBg==
 
 regenerator-runtime@^0.12.0, regenerator-runtime@^0.12.1:
@@ -20269,7 +20265,7 @@ tough-cookie@~2.4.3:
 
 tr46@^1.0.1:
   version "1.0.1"
-  resolved "https://registry.yarnpkg.com/tr46/-/tr46-1.0.1.tgz#a8b13fd6bfd2489519674ccde55ba3693b706d09"
+  resolved "https://registry.npmjs.org/tr46/-/tr46-1.0.1.tgz#a8b13fd6bfd2489519674ccde55ba3693b706d09"
   integrity sha1-qLE/1r/SSJUZZ0zN5VujaTtwbQk=
   dependencies:
     punycode "^2.1.0"
