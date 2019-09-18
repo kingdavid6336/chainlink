@@ -14,162 +14,6 @@ import (
 	"github.com/smartcontractkit/chainlink/core/utils"
 )
 
-type JobManager interface {
-	ExecuteJob(
-		job *models.JobSpec,
-		initiator *models.Initiator,
-		input *models.RunResult,
-		creationHeight *big.Int) (*models.JobRun, error)
-	ExecuteJobWithRunRequest(
-		job *models.JobSpec,
-		initiator *models.Initiator,
-		input *models.RunResult,
-		creationHeight *big.Int,
-		runRequest *models.RunRequest) (*models.JobRun, error)
-
-	ResumeConfirmingTasks(currentBlockHeight *big.Int) error
-	ResumeConnectingTasks() error
-	ResumePendingTask(runID *models.ID, input models.RunResult) error
-	CancelTask(runID *models.ID) error
-}
-
-// jobManager implements JobManager
-type jobManager struct {
-	store *store.Store
-}
-
-// NewJobManager returns a new job manager
-func NewJobManager(store *store.Store) JobManager {
-	return &jobManager{store: store}
-}
-
-func (jm *jobManager) ExecuteJob(
-	job *models.JobSpec,
-	initiator *models.Initiator,
-	input *models.RunResult,
-	creationHeight *big.Int,
-) (*models.JobRun, error) {
-	return jm.ExecuteJobWithRunRequest(
-		job,
-		initiator,
-		input,
-		creationHeight,
-		models.NewRunRequest(),
-	)
-}
-
-func (jm *jobManager) ExecuteJobWithRunRequest(
-	job *models.JobSpec,
-	initiator *models.Initiator,
-	input *models.RunResult,
-	creationHeight *big.Int,
-	runRequest *models.RunRequest,
-) (*models.JobRun, error) {
-	logger.Debugw(fmt.Sprintf("New run triggered by %s", initiator.Type),
-		"job", job.ID,
-		"input_status", input.Status,
-		"creation_height", creationHeight,
-	)
-
-	run, err := NewRun(job, initiator, input, creationHeight, jm.store, runRequest.Payment)
-	if err != nil {
-		return nil, errors.Wrap(err, "NewRun failed")
-	}
-
-	run.RunRequest = *runRequest
-	return run, createAndTrigger(run, jm.store)
-}
-
-func (jm *jobManager) ResumeConfirmingTasks(currentBlockHeight *big.Int) error {
-	return jm.store.UnscopedJobRunsWithStatus(func(run *models.JobRun) {
-		logger.Debugw("New head resuming run", run.ForLogger()...)
-
-		currentTaskRun := run.NextTaskRun()
-		if currentTaskRun == nil {
-			logger.Error("Attempting to resume confirming run with no remaining tasks %s", run.ID)
-			return
-		}
-
-		run.ObservedHeight = models.NewBig(currentBlockHeight)
-
-		validateMinimumConfirmations(run, currentTaskRun, run.ObservedHeight, jm.store)
-		updateAndTrigger(run, jm.store)
-	}, models.RunStatusPendingConfirmations)
-}
-
-func (jm *jobManager) ResumeConnectingTasks() error {
-	return jm.store.UnscopedJobRunsWithStatus(func(run *models.JobRun) {
-		logger.Debugw("New connection resuming run", run.ForLogger()...)
-
-		currentTaskRun := run.NextTaskRun()
-		if currentTaskRun == nil {
-			logger.Error("Attempting to resume connecting run with no remaining tasks %s", run.ID)
-			return
-		}
-
-		run.Status = models.RunStatusInProgress
-		updateAndTrigger(run, jm.store)
-	}, models.RunStatusPendingConnection, models.RunStatusPendingConfirmations)
-}
-
-func (jm *jobManager) ResumePendingTask(
-	runID *models.ID,
-	input models.RunResult,
-) error {
-	run, err := jm.store.Unscoped().FindJobRun(runID)
-	if err != nil {
-		return err
-	}
-
-	logger.Debugw("External adapter resuming job", []interface{}{
-		"run", run.ID,
-		"job", run.JobSpecID,
-		"status", run.Status,
-		"input_data", input.Data,
-		"input_result", input.Status,
-	}...)
-
-	if !run.Status.PendingBridge() {
-		return fmt.Errorf("Attempting to resume non pending run %s", run.ID)
-	}
-
-	currentTaskRun := run.NextTaskRun()
-	if currentTaskRun == nil {
-		return fmt.Errorf("Attempting to resume pending run with no remaining tasks %s", run.ID)
-	}
-
-	run.Overrides.Merge(input)
-
-	currentTaskRun.ApplyResult(input)
-	if currentTaskRun.Status.Finished() && run.TasksRemain() {
-		run.Status = models.RunStatusInProgress
-	} else if currentTaskRun.Status.Finished() {
-		run.ApplyResult(input)
-		run.SetFinishedAt()
-	} else {
-		run.ApplyResult(input)
-	}
-
-	return updateAndTrigger(&run, jm.store)
-}
-
-func (jm *jobManager) CancelTask(
-	runID *models.ID,
-) error {
-	run, err := jm.store.FindJobRun(runID)
-	if err != nil {
-		return err
-	}
-
-	logger.Debugw("Cancelling job", []interface{}{
-		"run", run.ID,
-		"job", run.JobSpecID,
-		"status", run.Status,
-	}...)
-
-	return nil
-}
-
 // MeetsMinimumPayment is a helper that returns true if jobrun received
 // sufficient payment (more than jobspec's MinimumPayment) to be considered successful
 func MeetsMinimumPayment(
@@ -193,11 +37,13 @@ func NewRun(
 	payment *assets.Link) (*models.JobRun, error) {
 
 	now := store.Clock.Now()
+	fmt.Println("now", now)
 	if !job.Started(now) {
 		return nil, RecurringScheduleJobError{
 			msg: fmt.Sprintf("Job runner: Job %s unstarted: %v before job's start time %v", job.ID.String(), now, job.EndAt),
 		}
 	}
+	fmt.Println("time before started", job.StartAt)
 
 	if job.Ended(now) {
 		return nil, RecurringScheduleJobError{

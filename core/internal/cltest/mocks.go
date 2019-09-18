@@ -429,7 +429,7 @@ func (*SettableClock) After(_ time.Duration) <-chan time.Time {
 // InstantClock an InstantClock
 type InstantClock struct{}
 
-// Now current local time
+// Now returns the current local time
 func (InstantClock) Now() time.Time {
 	return time.Now()
 }
@@ -458,6 +458,11 @@ func NewTriggerClock() *TriggerClock {
 // Trigger sends a time to unblock the After call.
 func (t *TriggerClock) Trigger() {
 	t.triggers <- time.Now()
+}
+
+// Now returns the current local time
+func (t TriggerClock) Now() time.Time {
+	return time.Now()
 }
 
 // After waits on a manual trigger.

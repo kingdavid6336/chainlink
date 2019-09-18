@@ -122,7 +122,7 @@ func FilterQueryFactory(i Initiator, from *big.Int) (ethereum.FilterQuery, error
 // i.e. EthLogEvent, RunLogEvent, ServiceAgreementLogEvent, OracleLogEvent
 type LogRequest interface {
 	GetLog() Log
-	GetJobSpec() JobSpec
+	GetJobSpecID() *ID
 	GetInitiator() Initiator
 
 	Validate() bool
@@ -137,8 +137,8 @@ type LogRequest interface {
 // InitiatorLogEvent encapsulates all information as a result of a received log from an
 // InitiatorSubscription.
 type InitiatorLogEvent struct {
+	JobSpecID ID
 	Log       Log
-	JobSpec   JobSpec
 	Initiator Initiator
 }
 
@@ -162,9 +162,9 @@ func (le InitiatorLogEvent) GetLog() Log {
 	return le.Log
 }
 
-// GetJobSpec returns the associated JobSpec
-func (le InitiatorLogEvent) GetJobSpec() JobSpec {
-	return le.JobSpec
+// GetJobSpecID returns the associated JobSpecID
+func (le InitiatorLogEvent) GetJobSpecID() *ID {
+	return &le.JobSpecID
 }
 
 // GetInitiator returns the initiator.
@@ -249,7 +249,7 @@ type RunLogEvent struct {
 // Validate returns whether or not the contained log has a properly encoded
 // job id.
 func (le RunLogEvent) Validate() bool {
-	jobSpecID := le.JobSpec.ID
+	jobSpecID := &le.JobSpecID
 	topic := le.Log.Topics[RequestLogTopicJobID]
 
 	if IDToTopic(jobSpecID) != topic && IDToHexTopic(jobSpecID) != topic {

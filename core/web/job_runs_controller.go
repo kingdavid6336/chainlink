@@ -59,7 +59,7 @@ func (jrc *JobRunsController) Create(c *gin.Context) {
 		jsonAPIError(c, http.StatusForbidden, err)
 	} else if data, err := getRunData(c); err != nil {
 		jsonAPIError(c, http.StatusInternalServerError, err)
-	} else if jr, err := jrc.App.ExecuteJob(&j, initiator, &models.RunResult{Data: data}, nil); errors.Cause(err) == orm.ErrorNotFound {
+	} else if jr, err := jrc.App.ExecuteJob(j.ID, initiator, &models.RunResult{Data: data}, nil); errors.Cause(err) == orm.ErrorNotFound {
 		jsonAPIError(c, http.StatusNotFound, errors.New("Job not found"))
 	} else if err != nil {
 		jsonAPIError(c, http.StatusInternalServerError, err)

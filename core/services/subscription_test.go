@@ -107,7 +107,7 @@ func TestServices_ReceiveLogRequest_IgnoredLogWithRemovedFlag(t *testing.T) {
 	require.NoError(t, store.CreateJob(&jobSpec))
 
 	log := models.InitiatorLogEvent{
-		JobSpec: jobSpec,
+		JobSpecID: *jobSpec.ID,
 		Log: models.Log{
 			Removed: true,
 		},

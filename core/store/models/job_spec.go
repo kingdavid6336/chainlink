@@ -220,6 +220,11 @@ func (j JobSpec) Started(t time.Time) bool {
 	return t.After(j.StartAt.Time) || t.Equal(j.StartAt.Time)
 }
 
+// Archived returns true if the job spec has been soft deleted
+func (j JobSpec) Archived() bool {
+	return j.DeletedAt.Valid
+}
+
 // Types of Initiators (see Initiator struct just below.)
 const (
 	// InitiatorRunLog for tasks in a job to watch an ethereum address

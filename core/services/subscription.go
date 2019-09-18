@@ -69,7 +69,7 @@ func (js JobSubscription) Unsubscribe() {
 type InitiatorSubscription struct {
 	*ManagedSubscription
 	jobManager JobManager
-	Job        models.JobSpec
+	JobSpecID  models.ID
 	Initiator  models.Initiator
 	store      *strpkg.Store
 	callback   func(*strpkg.Store, JobManager, models.LogRequest)
@@ -91,7 +91,7 @@ func NewInitiatorSubscription(
 	}
 
 	sub := InitiatorSubscription{
-		Job:        job,
+		JobSpecID:  *job.ID,
 		jobManager: jobManager,
 		Initiator:  initr,
 		store:      store,
@@ -113,7 +113,7 @@ func (sub InitiatorSubscription) dispatchLog(log models.Log) {
 		"txHash", log.TxHash.Hex(), "logIndex", log.Index, "blockNumber", log.BlockNumber, "job", sub.Job.ID.String())
 
 	base := models.InitiatorLogEvent{
-		JobSpec:   sub.Job,
+		JobSpecID: sub.JobSpecID,
 		Initiator: sub.Initiator,
 		Log:       log,
 	}
@@ -164,9 +164,9 @@ func runJob(store *strpkg.Store, jobManager JobManager, le models.LogRequest, da
 		logger.Errorw(err.Error(), le.ForLogger()...)
 	}
 
-	job := le.GetJobSpec()
-	initr := le.GetInitiator()
-	_, err = jobManager.ExecuteJobWithRunRequest(&job, &initr, &input, le.BlockNumber(), &rr)
+	jobSpecID := le.GetJobSpecID()
+	initiator := le.GetInitiator()
+	_, err = jobManager.ExecuteJobWithRunRequest(jobSpecID, &initiator, &input, le.BlockNumber(), &rr)
 	if err != nil {
 		logger.Errorw(err.Error(), le.ForLogger()...)
 	}
