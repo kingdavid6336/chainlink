@@ -104,6 +104,5 @@ func (js *jobSubscriber) Disconnect() {
 
 // OnNewHead resumes all pending job runs based on the new head activity.
 func (js *jobSubscriber) OnNewHead(head *models.Head) {
-	height := head.ToInt()
-	js.jobManager.ResumeConfirmingTasks(height)
+	js.jobManager.ResumeConfirmingTasks(head.ToInt())
 }

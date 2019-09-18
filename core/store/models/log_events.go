@@ -176,7 +176,7 @@ func (le InitiatorLogEvent) GetInitiator() Initiator {
 // formatting in logs (trace statements, not ethereum events).
 func (le InitiatorLogEvent) ForLogger(kvs ...interface{}) []interface{} {
 	output := []interface{}{
-		"job", le.JobSpec.ID.String(),
+		"job", le.JobSpecID.String(),
 		"log", le.Log.BlockNumber,
 		"initiator", le.Initiator,
 	}
@@ -190,7 +190,7 @@ func (le InitiatorLogEvent) ForLogger(kvs ...interface{}) []interface{} {
 // ToDebug prints this event via logger.Debug.
 func (le InitiatorLogEvent) ToDebug() {
 	friendlyAddress := utils.LogListeningAddress(le.Initiator.Address)
-	msg := fmt.Sprintf("Received log from block #%v for address %v for job %v", le.Log.BlockNumber, friendlyAddress, le.JobSpec.ID.String())
+	msg := fmt.Sprintf("Received log from block #%v for address %v for job %v", le.Log.BlockNumber, friendlyAddress, le.JobSpecID.String())
 	logger.Debugw(msg, le.ForLogger()...)
 }
 
@@ -253,7 +253,7 @@ func (le RunLogEvent) Validate() bool {
 	topic := le.Log.Topics[RequestLogTopicJobID]
 
 	if IDToTopic(jobSpecID) != topic && IDToHexTopic(jobSpecID) != topic {
-		logger.Errorw("Run Log didn't have matching job ID", le.ForLogger("id", le.JobSpec.ID.String())...)
+		logger.Errorw("Run Log didn't have matching job ID", le.ForLogger("id", le.JobSpecID.String())...)
 		return false
 	}
 	return true
@@ -352,7 +352,7 @@ func parserFromLog(log Log) (logRequestParser, error) {
 	}
 	parser, ok := topicFactoryMap[topic]
 	if !ok {
-		return nil, fmt.Errorf("No parser for the RunLogEvent topic %v", topic)
+		return nil, fmt.Errorf("No parser for the RunLogEvent topic %s", topic.String())
 	}
 	return parser, nil
 }

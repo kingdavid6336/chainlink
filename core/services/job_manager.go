@@ -110,7 +110,7 @@ func (jm *jobManager) ResumeConfirmingTasks(currentBlockHeight *big.Int) error {
 
 		validateMinimumConfirmations(run, currentTaskRun, run.ObservedHeight, jm.store)
 		updateAndTrigger(run, jm.store)
-	}, models.RunStatusPendingConfirmations)
+	}, models.RunStatusPendingConnection, models.RunStatusPendingConfirmations)
 }
 
 // ResumeConnectingTasks wakes up all tasks that have gone to sleep because
