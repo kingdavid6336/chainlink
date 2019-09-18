@@ -126,7 +126,7 @@ func NewRun(
 	}
 
 	initialTask := run.TaskRuns[0]
-	validateMinimumConfirmations(&run, &initialTask, run.CreationHeight, store)
+	validateMinimumConfirmations(&run, &initialTask, run.CreationHeight, store.TxManager)
 	return &run, nil
 }
 
@@ -222,13 +222,13 @@ func validateMinimumConfirmations(
 	run *models.JobRun,
 	taskRun *models.TaskRun,
 	currentHeight *models.Big,
-	store *store.Store) {
+	txManager store.TxManager) {
 
 	updateTaskRunConfirmations(currentHeight, run, taskRun)
 	if !meetsMinimumConfirmations(run, taskRun, run.ObservedHeight) {
 		logger.Debugw("Run cannot continue because it lacks sufficient confirmations", []interface{}{"run", run.ID.String(), "required_height", taskRun.MinimumConfirmations}...)
 		run.Status = models.RunStatusPendingConfirmations
-	} else if err := validateOnMainChain(run, taskRun, store); err != nil {
+	} else if err := validateOnMainChain(run, taskRun, txManager); err != nil {
 		run.SetError(err)
 	} else {
 		logger.Debugw("Adding next task to job run queue", []interface{}{"run", run.ID.String(), "nextTask", taskRun.TaskSpec.Type}...)
@@ -249,13 +249,13 @@ func updateTaskRunConfirmations(currentHeight *models.Big, jr *models.JobRun, ta
 	taskRun.Confirmations = clnull.Uint32From(uint32(diff.Int64()))
 }
 
-func validateOnMainChain(jr *models.JobRun, taskRun *models.TaskRun, store *store.Store) error {
+func validateOnMainChain(jr *models.JobRun, taskRun *models.TaskRun, txManager store.TxManager) error {
 	txhash := jr.RunRequest.TxHash
 	if txhash == nil || !taskRun.MinimumConfirmations.Valid || taskRun.MinimumConfirmations.Uint32 == 0 {
 		return nil
 	}
 
-	receipt, err := store.TxManager.GetTxReceipt(*txhash)
+	receipt, err := txManager.GetTxReceipt(*txhash)
 	if err != nil {
 		return err
 	}

@@ -99,18 +99,25 @@ func (jm *jobManager) ExecuteJobWithRunRequest(
 func (jm *jobManager) ResumeConfirmingTasks(currentBlockHeight *big.Int) error {
 	return jm.store.UnscopedJobRunsWithStatus(func(run *models.JobRun) {
 		logger.Debugw("New head resuming run", run.ForLogger()...)
-
-		currentTaskRun := run.NextTaskRun()
-		if currentTaskRun == nil {
-			logger.Error("Attempting to resume confirming run with no remaining tasks %s", run.ID)
-			return
+		err := ResumeConfirmingTask(run, currentBlockHeight, jm.store.TxManager)
+		if err != nil {
+			logger.Error(err)
 		}
 
-		run.ObservedHeight = models.NewBig(currentBlockHeight)
-
-		validateMinimumConfirmations(run, currentTaskRun, run.ObservedHeight, jm.store)
 		updateAndTrigger(run, jm.store)
 	}, models.RunStatusPendingConnection, models.RunStatusPendingConfirmations)
+}
+
+func ResumeConfirmingTask(run *models.JobRun, currentBlockHeight *big.Int, txManager store.TxManager) error {
+	currentTaskRun := run.NextTaskRun()
+	if currentTaskRun == nil {
+		return fmt.Errorf("Attempting to resume confirming run with no remaining tasks %s", run.ID)
+	}
+
+	run.ObservedHeight = models.NewBig(currentBlockHeight)
+
+	validateMinimumConfirmations(run, currentTaskRun, run.ObservedHeight, txManager)
+	return nil
 }
 
 // ResumeConnectingTasks wakes up all tasks that have gone to sleep because
@@ -130,6 +137,18 @@ func (jm *jobManager) ResumeConnectingTasks() error {
 	}, models.RunStatusPendingConnection, models.RunStatusPendingConfirmations)
 }
 
+func ResumeConnectingTask(run *models.JobRun) error {
+	logger.Debugw("New connection resuming run", run.ForLogger()...)
+
+	currentTaskRun := run.NextTaskRun()
+	if currentTaskRun == nil {
+		return fmt.Errorf("Attempting to resume connecting run with no remaining tasks %s", run.ID)
+	}
+
+	run.Status = models.RunStatusInProgress
+	return nil
+}
+
 // ResumePendingTask wakes up a task that required a response from a bridge adapter.
 func (jm *jobManager) ResumePendingTask(
 	runID *models.ID,
@@ -140,6 +159,18 @@ func (jm *jobManager) ResumePendingTask(
 		return err
 	}
 
+	err = ResumePendingTask(&run, input)
+	if err != nil {
+		return err
+	}
+
+	return updateAndTrigger(&run, jm.store)
+}
+
+func ResumePendingTask(
+	run *models.JobRun,
+	input models.RunResult,
+) error {
 	logger.Debugw("External adapter resuming job", []interface{}{
 		"run", run.ID,
 		"job", run.JobSpecID,
@@ -169,7 +200,7 @@ func (jm *jobManager) ResumePendingTask(
 		run.ApplyResult(input)
 	}
 
-	return updateAndTrigger(&run, jm.store)
+	return nil
 }
 
 // CancelTask suspends a running task.

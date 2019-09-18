@@ -260,7 +260,7 @@ func executeRun(run *models.JobRun, store *store.Store) error {
 	} else if currentTaskRun.Status.Unstarted() {
 		return fmt.Errorf("run %s task %s cannot return a status of empty string or Unstarted", run.ID.String(), currentTaskRun.TaskSpec.Type)
 	} else if futureTaskRun := run.NextTaskRun(); futureTaskRun != nil {
-		validateMinimumConfirmations(run, futureTaskRun, run.ObservedHeight, store)
+		validateMinimumConfirmations(run, futureTaskRun, run.ObservedHeight, store.TxManager)
 	}
 
 	if run.Status.Finished() {
