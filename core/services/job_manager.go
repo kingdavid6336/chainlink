@@ -35,12 +35,20 @@ type JobManager interface {
 
 // jobManager implements JobManager
 type jobManager struct {
-	store *store.Store
+	store   *store.Store
+	updates chan *runUpdate
+}
+
+type runUpdate struct {
+	run    *models.JobRun
+	result chan error
 }
 
 // NewJobManager returns a new job manager
 func NewJobManager(store *store.Store) JobManager {
-	return &jobManager{store: store}
+	jm := &jobManager{store: store, updates: make(chan *runUpdate)}
+	go jm.run()
+	return jm
 }
 
 // ExecuteJob immediately sends a new job to the JobRunner for execution
@@ -104,7 +112,7 @@ func (jm *jobManager) ResumeConfirmingTasks(currentBlockHeight *big.Int) error {
 			logger.Error(err)
 		}
 
-		updateAndTrigger(run, jm.store)
+		jm.updateAndTrigger(run)
 	}, models.RunStatusPendingConnection, models.RunStatusPendingConfirmations)
 }
 
@@ -133,7 +141,7 @@ func (jm *jobManager) ResumeConnectingTasks() error {
 		}
 
 		run.Status = models.RunStatusInProgress
-		updateAndTrigger(run, jm.store)
+		jm.updateAndTrigger(run)
 	}, models.RunStatusPendingConnection, models.RunStatusPendingConfirmations)
 }
 
@@ -164,7 +172,7 @@ func (jm *jobManager) ResumePendingTask(
 		return err
 	}
 
-	return updateAndTrigger(&run, jm.store)
+	return jm.updateAndTrigger(&run)
 }
 
 func ResumePendingTask(
@@ -219,4 +227,26 @@ func (jm *jobManager) CancelTask(
 	}...)
 
 	return nil
+}
+
+func (jm *jobManager) run() {
+	for {
+		select {
+		case update := <-jm.updates:
+			if err := jm.store.SaveJobRun(update.run); err != nil {
+				update.result <- err
+				continue
+			}
+			update.result <- triggerIfReady(update.run, jm.store)
+		}
+	}
+}
+
+func (jm *jobManager) updateAndTrigger(run *models.JobRun) error {
+	update := &runUpdate{
+		run:    run,
+		result: make(chan error),
+	}
+	jm.updates <- update
+	return <-update.result
 }
