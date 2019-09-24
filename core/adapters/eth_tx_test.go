@@ -499,7 +499,7 @@ func TestEthTxAdapter_DeserializationBytesFormat(t *testing.T) {
 	assert.NoError(t, err)
 	assert.Equal(t, task.Type, adapters.TaskTypeEthTx)
 
-	adapter, err := adapters.For(task, store)
+	adapter, err := adapters.For(task, store.Config, store.ORM)
 	assert.NoError(t, err)
 	ethtx, ok := adapter.BaseAdapter.(*adapters.EthTx)
 	assert.True(t, ok)

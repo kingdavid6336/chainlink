@@ -1,7 +1,6 @@
 package internal_test
 
 import (
-	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -13,7 +12,6 @@ import (
 	"time"
 
 	"github.com/ethereum/go-ethereum/common"
-	"github.com/onsi/gomega"
 	"github.com/smartcontractkit/chainlink/core/internal/cltest"
 	"github.com/smartcontractkit/chainlink/core/store/assets"
 	"github.com/smartcontractkit/chainlink/core/store/models"
@@ -371,35 +369,6 @@ func TestIntegration_RunLog(t *testing.T) {
 	}
 }
 
-func TestIntegration_EndAt(t *testing.T) {
-	t.Parallel()
-
-	app, cleanup := cltest.NewApplication(t)
-	defer cleanup()
-	eth := app.MockEthCallerSubscriber(cltest.Strict)
-	eth.Register("eth_chainId", app.Store.Config.ChainID())
-	clock := cltest.UseSettableClock(app.Store)
-	app.Start()
-	client := app.NewHTTPClient()
-
-	j := cltest.FixtureCreateJobViaWeb(t, app, "fixtures/web/end_at_job.json")
-	endAt := cltest.ParseISO8601(t, "3000-01-01T00:00:00.000Z")
-	assert.Equal(t, endAt, j.EndAt.Time)
-
-	cltest.CreateJobRunViaWeb(t, app, j)
-
-	clock.SetTime(endAt.Add(time.Nanosecond))
-
-	resp, cleanup := client.Post("/v2/specs/"+j.ID.String()+"/runs", &bytes.Buffer{})
-	defer cleanup()
-	assert.Equal(t, http.StatusInternalServerError, resp.StatusCode)
-	gomega.NewGomegaWithT(t).Consistently(func() []models.JobRun {
-		jobRuns, err := app.Store.JobRunsFor(j.ID)
-		assert.NoError(t, err)
-		return jobRuns
-	}).Should(gomega.HaveLen(1))
-}
-
 func TestIntegration_StartAt(t *testing.T) {
 	t.Parallel()
 
@@ -407,20 +376,11 @@ func TestIntegration_StartAt(t *testing.T) {
 	defer cleanup()
 	eth := app.MockEthCallerSubscriber(cltest.Strict)
 	eth.Register("eth_chainId", app.Store.Config.ChainID())
-	clock := cltest.UseSettableClock(app.Store)
 	app.Start()
-	client := app.NewHTTPClient()
 
 	j := cltest.FixtureCreateJobViaWeb(t, app, "fixtures/web/start_at_job.json")
-	startAt := cltest.ParseISO8601(t, "3000-01-01T00:00:00.000Z")
+	startAt := cltest.ParseISO8601(t, "1970-01-01T00:00:00.000Z")
 	assert.Equal(t, startAt, j.StartAt.Time)
-
-	resp, cleanup := client.Post("/v2/specs/"+j.ID.String()+"/runs", &bytes.Buffer{})
-	defer cleanup()
-	assert.Equal(t, http.StatusInternalServerError, resp.StatusCode)
-	cltest.WaitForRuns(t, j, app.Store, 0)
-
-	clock.SetTime(startAt)
 
 	cltest.CreateJobRunViaWeb(t, app, j)
 }

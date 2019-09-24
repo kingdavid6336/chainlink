@@ -703,32 +703,6 @@ func TestORM_FindBridge(t *testing.T) {
 	}
 }
 
-func TestORM_PendingBridgeType_alreadyCompleted(t *testing.T) {
-	t.Parallel()
-
-	store, cleanup := cltest.NewStore(t)
-	defer cleanup()
-	jobRunner, cleanup := cltest.NewJobRunner(store)
-	defer cleanup()
-	jobRunner.Start()
-
-	_, bt := cltest.NewBridgeType(t)
-	require.NoError(t, store.CreateBridgeType(bt))
-
-	job := cltest.NewJobWithWebInitiator()
-	require.NoError(t, store.CreateJob(&job))
-	initr := job.Initiators[0]
-
-	run := job.NewRun(initr)
-	require.NoError(t, store.CreateJobRun(&run))
-
-	store.RunChannel.Send(run.ID)
-	cltest.WaitForJobRunStatus(t, store, run, models.RunStatusCompleted)
-
-	_, err := store.PendingBridgeType(run)
-	assert.Error(t, err)
-}
-
 func TestORM_PendingBridgeType_success(t *testing.T) {
 	t.Parallel()
 

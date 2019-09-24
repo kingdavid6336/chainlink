@@ -751,28 +751,6 @@ func (m mockSecretGenerator) Generate(orm.Config) ([]byte, error) {
 	return []byte(SessionSecret), nil
 }
 
-type MockRunChannel struct {
-	Runs               []models.RunResult
-	neverReturningChan chan store.RunRequest
-}
-
-func NewMockRunChannel() *MockRunChannel {
-	return &MockRunChannel{
-		neverReturningChan: make(chan store.RunRequest, 1),
-	}
-}
-
-func (m *MockRunChannel) Send(jobRunID *models.ID) error {
-	m.Runs = append(m.Runs, models.RunResult{})
-	return nil
-}
-
-func (m *MockRunChannel) Receive() <-chan store.RunRequest {
-	return m.neverReturningChan
-}
-
-func (m *MockRunChannel) Close() {}
-
 // extractERC20BalanceTargetAddress returns the address whose balance is being
 // queried by the message in the given call to an ERC20 contract, which is
 // interpreted as a callArgs.

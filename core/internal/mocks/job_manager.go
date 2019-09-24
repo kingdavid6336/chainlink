@@ -99,6 +99,20 @@ func (_m *JobManager) ResumeConnectingTasks() error {
 	return r0
 }
 
+// ResumeInProgressTasks provides a mock function with given fields:
+func (_m *JobManager) ResumeInProgressTasks() error {
+	ret := _m.Called()
+
+	var r0 error
+	if rf, ok := ret.Get(0).(func() error); ok {
+		r0 = rf()
+	} else {
+		r0 = ret.Error(0)
+	}
+
+	return r0
+}
+
 // ResumePendingTask provides a mock function with given fields: runID, input
 func (_m *JobManager) ResumePendingTask(runID *models.ID, input models.RunResult) error {
 	ret := _m.Called(runID, input)

@@ -9,15 +9,14 @@ import (
 	"github.com/smartcontractkit/chainlink/core/logger"
 	"github.com/smartcontractkit/chainlink/core/store"
 	"github.com/smartcontractkit/chainlink/core/store/models"
-	"go.uber.org/multierr"
 )
 
 // JobRunner safely handles coordinating job runs.
 type JobRunner interface {
 	Start() error
 	Stop()
-	resumeRunsSinceLastShutdown() error
-	channelForRun(*models.ID) chan<- struct{}
+	Run(*models.JobRun) error
+
 	workerCount() int
 }
 
@@ -25,125 +24,105 @@ type jobRunner struct {
 	started              bool
 	done                 chan struct{}
 	bootMutex            sync.Mutex
-	store                *store.Store
 	workerMutex          sync.RWMutex
 	workers              map[string]chan struct{}
 	workersWg            sync.WaitGroup
 	demultiplexStopperWg sync.WaitGroup
+	runChannel           chan string
+
+	store *store.Store
 }
 
 // NewJobRunner initializes a JobRunner.
 func NewJobRunner(str *store.Store) JobRunner {
 	return &jobRunner{
 		// Unscoped allows the processing of runs that are soft deleted asynchronously
-		store:   str.Unscoped(),
-		workers: make(map[string]chan struct{}),
+		store:      str.Unscoped(),
+		workers:    make(map[string]chan struct{}, 1),
+		runChannel: make(chan string, 1000),
 	}
 }
 
 // Start reinitializes runs and starts the execution of the store's runs.
-func (rm *jobRunner) Start() error {
-	rm.bootMutex.Lock()
-	defer rm.bootMutex.Unlock()
+func (jr *jobRunner) Start() error {
+	jr.bootMutex.Lock()
+	defer jr.bootMutex.Unlock()
 
-	if rm.started {
+	if jr.started {
 		return errors.New("JobRunner already started")
 	}
-	rm.done = make(chan struct{})
-	rm.started = true
+	jr.done = make(chan struct{})
+	jr.started = true
 
 	var starterWg sync.WaitGroup
 	starterWg.Add(1)
-	go rm.demultiplexRuns(&starterWg)
+	go jr.demultiplexRuns(&starterWg)
 	starterWg.Wait()
 
-	rm.demultiplexStopperWg.Add(1)
+	jr.demultiplexStopperWg.Add(1)
 	return nil
 }
 
 // Stop closes all open worker channels.
-func (rm *jobRunner) Stop() {
-	rm.bootMutex.Lock()
-	defer rm.bootMutex.Unlock()
+func (jr *jobRunner) Stop() {
+	jr.bootMutex.Lock()
+	defer jr.bootMutex.Unlock()
 
-	if !rm.started {
+	if !jr.started {
 		return
 	}
-	close(rm.done)
-	rm.started = false
-	rm.demultiplexStopperWg.Wait()
+	close(jr.done)
+	jr.started = false
+	jr.demultiplexStopperWg.Wait()
 }
 
-// resumeRunsSinceLastShutdown queries the db for job runs that should be resumed
-// since a previous node shutdown.
-//
-// As a result of its reliance on the database, it must run before anything
-// persists a job RunStatus to the db to ensure that it only captures pending and in progress
-// jobs as a result of the last shutdown, and not as a result of what's happening now.
-//
-// To recap: This must run before anything else writes job run status to the db,
-// ie. tries to run a job.
-// https://github.com/smartcontractkit/chainlink/pull/807
-func (rm *jobRunner) resumeRunsSinceLastShutdown() error {
-	// Do all querying of run statuses since last shutdown before enqueuing
-	// runs in progress and asleep, to prevent the following race condition:
-	// 1. resume sleep, 2. awake from sleep, 3. in progress, 4. resume in progress (double enqueued).
-	var merr error
-	err := rm.store.UnscopedJobRunsWithStatus(func(run *models.JobRun) {
-
-		if run.Result.Status == models.RunStatusPendingSleep {
-			if err := QueueSleepingTask(run, rm.store.Unscoped()); err != nil {
-				logger.Errorw("Error resuming sleeping job", "error", err)
-			}
-		} else {
-			merr = multierr.Append(merr, rm.store.RunChannel.Send(run.ID))
-		}
-
-	}, models.RunStatusInProgress, models.RunStatusPendingSleep)
-
-	if err != nil {
-		return err
+// Run tells the job runner to start executing a job
+func (jr *jobRunner) Run(run *models.JobRun) error {
+	if run.Status.PendingSleep() {
+		return jr.queueSleepingTask(run)
 	}
 
-	return merr
+	jr.runChannel <- run.ID.String()
+	return nil
 }
 
-func (rm *jobRunner) demultiplexRuns(starterWg *sync.WaitGroup) {
+func (jr *jobRunner) demultiplexRuns(starterWg *sync.WaitGroup) {
 	starterWg.Done()
-	defer rm.demultiplexStopperWg.Done()
+	defer jr.demultiplexStopperWg.Done()
 	for {
 		select {
-		case <-rm.done:
+		case <-jr.done:
 			logger.Debug("JobRunner demultiplexing of job runs finished")
-			rm.workersWg.Wait()
+			jr.workersWg.Wait()
 			return
-		case rr, ok := <-rm.store.RunChannel.Receive():
+		case runID, ok := <-jr.runChannel:
 			if !ok {
 				logger.Panic("RunChannel closed before JobRunner, can no longer demultiplexing job runs")
 				return
 			}
-			rm.channelForRun(rr.ID) <- struct{}{}
+			jr.channelForRun(runID) <- struct{}{}
 		}
 	}
 }
 
-func (rm *jobRunner) channelForRun(runID *models.ID) chan<- struct{} {
-	rm.workerMutex.Lock()
-	defer rm.workerMutex.Unlock()
+func (jr *jobRunner) channelForRun(runID string) chan<- struct{} {
+	jr.workerMutex.Lock()
+	defer jr.workerMutex.Unlock()
 
-	workerChannel, present := rm.workers[runID.String()]
+	workerChannel, present := jr.workers[runID]
 	if !present {
 		workerChannel = make(chan struct{}, 1)
-		rm.workers[runID.String()] = workerChannel
-		rm.workersWg.Add(1)
+		jr.workers[runID] = workerChannel
+		jr.workersWg.Add(1)
 
 		go func() {
-			rm.workerLoop(runID, workerChannel)
+			id, _ := models.NewIDFromString(runID)
+			jr.workerLoop(id, workerChannel)
 
-			rm.workerMutex.Lock()
-			delete(rm.workers, runID.String())
-			rm.workersWg.Done()
-			rm.workerMutex.Unlock()
+			jr.workerMutex.Lock()
+			delete(jr.workers, runID)
+			jr.workersWg.Done()
+			jr.workerMutex.Unlock()
 
 			logger.Debug("Worker finished for ", runID)
 		}()
@@ -151,52 +130,40 @@ func (rm *jobRunner) channelForRun(runID *models.ID) chan<- struct{} {
 	return workerChannel
 }
 
-func (rm *jobRunner) workerLoop(runID *models.ID, workerChannel chan struct{}) {
+func (jr *jobRunner) workerLoop(runID *models.ID, workerChannel chan struct{}) {
 	for {
 		select {
 		case <-workerChannel:
-			run, err := rm.store.FindJobRun(runID)
+			run, err := jr.store.FindJobRun(runID)
 			if err != nil {
 				logger.Errorw(fmt.Sprint("Error finding run ", runID), run.ForLogger("error", err)...)
 			}
 
-			if err := executeRun(&run, rm.store); err != nil {
+			if err := jr.executeRun(&run); err != nil {
 				logger.Errorw(fmt.Sprint("Error executing run ", runID), run.ForLogger("error", err)...)
 				return
 			}
 
 			if run.Status.Finished() {
-				logger.Debugw("All tasks complete for run", "run", run.ID.String())
+				logger.Debugw("All tasks complete for run", "run", run.ID)
 				return
 			}
 
-		case <-rm.done:
-			logger.Debug("JobRunner worker loop for ", runID.String(), " finished")
+		case <-jr.done:
+			logger.Debug("JobRunner worker loop for ", runID, " finished")
 			return
 		}
 	}
 }
 
-func (rm *jobRunner) workerCount() int {
-	rm.workerMutex.RLock()
-	defer rm.workerMutex.RUnlock()
+func (jr *jobRunner) workerCount() int {
+	jr.workerMutex.RLock()
+	defer jr.workerMutex.RUnlock()
 
-	return len(rm.workers)
+	return len(jr.workers)
 }
 
-func prepareTaskInput(run *models.JobRun, input models.JSON) (models.JSON, error) {
-	var err error
-	if input, err = run.Result.Data.Merge(input); err != nil {
-		return models.JSON{}, err
-	}
-
-	if input, err = run.Overrides.Data.Merge(input); err != nil {
-		return models.JSON{}, err
-	}
-	return input, nil
-}
-
-func executeTask(run *models.JobRun, currentTaskRun *models.TaskRun, store *store.Store) models.RunResult {
+func (jr *jobRunner) executeTask(run *models.JobRun, currentTaskRun *models.TaskRun) models.RunResult {
 	taskCopy := currentTaskRun.TaskSpec // deliberately copied to keep mutations local
 
 	var err error
@@ -205,13 +172,13 @@ func executeTask(run *models.JobRun, currentTaskRun *models.TaskRun, store *stor
 		return currentTaskRun.Result
 	}
 
-	adapter, err := adapters.For(taskCopy, store)
+	adapter, err := adapters.For(taskCopy, jr.store.Config, jr.store.ORM)
 	if err != nil {
 		currentTaskRun.Result.SetError(err)
 		return currentTaskRun.Result
 	}
 
-	logger.Infow(fmt.Sprintf("Processing task %s", taskCopy.Type), []interface{}{"task", currentTaskRun.ID.String()}...)
+	logger.Infow(fmt.Sprintf("Processing task %s", taskCopy.Type), []interface{}{"task", currentTaskRun.ID}...)
 
 	data, err := prepareTaskInput(run, currentTaskRun.Result.Data)
 	if err != nil {
@@ -221,7 +188,7 @@ func executeTask(run *models.JobRun, currentTaskRun *models.TaskRun, store *stor
 
 	currentTaskRun.Result.CachedJobRunID = run.ID
 	currentTaskRun.Result.Data = data
-	result := adapter.Perform(currentTaskRun.Result, store)
+	result := adapter.Perform(currentTaskRun.Result, jr.store)
 	result.ID = currentTaskRun.Result.ID
 
 	logger.Infow(fmt.Sprintf("Finished processing task %s", taskCopy.Type), []interface{}{
@@ -233,7 +200,7 @@ func executeTask(run *models.JobRun, currentTaskRun *models.TaskRun, store *stor
 	return result
 }
 
-func executeRun(run *models.JobRun, store *store.Store) error {
+func (jr *jobRunner) executeRun(run *models.JobRun) error {
 	logger.Infow("Processing run", run.ForLogger()...)
 
 	if !run.Status.Runnable() {
@@ -245,32 +212,67 @@ func executeRun(run *models.JobRun, store *store.Store) error {
 		return errors.New("Run triggered with no remaining tasks")
 	}
 
-	result := executeTask(run, currentTaskRun, store)
+	result := jr.executeTask(run, currentTaskRun)
 
 	currentTaskRun.ApplyResult(result)
 	run.ApplyResult(result)
 
 	if currentTaskRun.Status.PendingSleep() {
-		logger.Debugw("Task is sleeping", []interface{}{"run", run.ID.String()}...)
-		if err := QueueSleepingTask(run, store); err != nil {
-			return err
-		}
+		logger.Debugw("Task is sleeping", []interface{}{"run", run.ID}...)
 	} else if !currentTaskRun.Status.Runnable() {
-		logger.Debugw("Task execution blocked", []interface{}{"run", run.ID.String(), "task", currentTaskRun.ID.String(), "state", currentTaskRun.Result.Status}...)
+		logger.Debugw("Task execution blocked", []interface{}{"run", run.ID, "task", currentTaskRun.ID, "state", currentTaskRun.Result.Status}...)
 	} else if currentTaskRun.Status.Unstarted() {
-		return fmt.Errorf("run %s task %s cannot return a status of empty string or Unstarted", run.ID.String(), currentTaskRun.TaskSpec.Type)
+		return fmt.Errorf("run %s task %s cannot return a status of empty string or Unstarted", run.ID, currentTaskRun.TaskSpec.Type)
 	} else if futureTaskRun := run.NextTaskRun(); futureTaskRun != nil {
-		validateMinimumConfirmations(run, futureTaskRun, run.ObservedHeight, store.TxManager)
+		validateMinimumConfirmations(run, futureTaskRun, run.ObservedHeight, jr.store.TxManager)
 	}
 
-	if run.Status.Finished() {
-		run.SetFinishedAt()
-	}
-
-	if err := updateAndTrigger(run, store); err != nil {
+	if err := jr.updateAndTrigger(run); err != nil {
 		return err
 	}
 	logger.Infow("Run finished processing", run.ForLogger()...)
+
+	return nil
+}
+
+// QueueSleepingTask creates a go routine which will wake up the job runner
+// once the sleep's time has elapsed
+func (jr *jobRunner) queueSleepingTask(run *models.JobRun) error {
+	if !run.Status.PendingSleep() {
+		return fmt.Errorf("Attempting to resume non sleeping run %s", run.ID)
+	}
+
+	currentTaskRun := run.NextTaskRun()
+	if currentTaskRun == nil {
+		return fmt.Errorf("Attempting to resume sleeping run with no remaining tasks %s", run.ID)
+	}
+
+	if !currentTaskRun.Status.PendingSleep() {
+		return fmt.Errorf("Attempting to resume sleeping run with non sleeping task %s", run.ID)
+	}
+
+	adapter, err := prepareAdapter(currentTaskRun, run.Overrides.Data, jr.store.Config, jr.store.ORM)
+	if err != nil {
+		currentTaskRun.SetError(err)
+		run.SetError(err)
+		return jr.store.SaveJobRun(run)
+	}
+
+	if sleepAdapter, ok := adapter.BaseAdapter.(*adapters.Sleep); ok {
+		return performTaskSleep(run, currentTaskRun, sleepAdapter, jr.store.Clock, jr)
+	}
+
+	return fmt.Errorf("Attempting to resume non sleeping task for run %s (%s)", run.ID, currentTaskRun.TaskSpec.Type)
+}
+
+func (jr *jobRunner) updateAndTrigger(run *models.JobRun) error {
+	if err := jr.store.ORM.SaveJobRun(run); err != nil {
+		return err
+	}
+
+	if run.Status == models.RunStatusInProgress || run.Status == models.RunStatusPendingSleep {
+		return jr.Run(run)
+	}
 
 	return nil
 }

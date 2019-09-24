@@ -410,7 +410,8 @@ func NewJobSubscriber(t testing.TB) (*strpkg.Store, services.JobSubscriber, func
 	t.Helper()
 
 	store, cl := NewStore(t)
-	jobManager := services.NewJobManager(store)
+	jobRunner := services.NewJobRunner(store)
+	jobManager := services.NewJobManager(jobRunner, store.Config, store.ORM, store.TxManager, store.Clock)
 	nl := services.NewJobSubscriber(store, jobManager)
 	return store, nl, func() {
 		cl()

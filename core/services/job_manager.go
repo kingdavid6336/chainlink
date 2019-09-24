@@ -5,10 +5,25 @@ import (
 	"math/big"
 
 	"github.com/pkg/errors"
+	"github.com/smartcontractkit/chainlink/core/adapters"
 	"github.com/smartcontractkit/chainlink/core/logger"
+	clnull "github.com/smartcontractkit/chainlink/core/null"
 	"github.com/smartcontractkit/chainlink/core/store"
+	"github.com/smartcontractkit/chainlink/core/store/assets"
 	"github.com/smartcontractkit/chainlink/core/store/models"
+	"github.com/smartcontractkit/chainlink/core/store/orm"
+	"github.com/smartcontractkit/chainlink/core/utils"
 )
+
+// RecurringScheduleJobError contains the field for the error message.
+type RecurringScheduleJobError struct {
+	msg string
+}
+
+// Error returns the error message for the run.
+func (err RecurringScheduleJobError) Error() string {
+	return err.msg
+}
 
 //go:generate mockery -name JobManager -output ../internal/mocks/ -case=underscore
 
@@ -30,13 +45,18 @@ type JobManager interface {
 	ResumeConfirmingTasks(currentBlockHeight *big.Int) error
 	ResumeConnectingTasks() error
 	ResumePendingTask(runID *models.ID, input models.RunResult) error
+	ResumeInProgressTasks() error
 	CancelTask(runID *models.ID) error
 }
 
 // jobManager implements JobManager
 type jobManager struct {
-	store   *store.Store
-	updates chan *runUpdate
+	orm       *orm.ORM
+	jobRunner JobRunner
+	txManager store.TxManager
+	config    orm.ConfigReader
+	clock     utils.AfterNower
+	updates   chan *runUpdate
 }
 
 type runUpdate struct {
@@ -44,9 +64,122 @@ type runUpdate struct {
 	result chan error
 }
 
+// NewRun returns a run from an input job, in an initial state ready for
+// processing by the job runner system
+func NewRun(
+	job *models.JobSpec,
+	initiator *models.Initiator,
+	input *models.RunResult,
+	currentHeight *big.Int,
+	payment *assets.Link,
+	config orm.ConfigReader,
+	orm *orm.ORM,
+	clock utils.AfterNower,
+	txManager store.TxManager) (*models.JobRun, error) {
+
+	now := clock.Now()
+	if !job.Started(now) {
+		return nil, RecurringScheduleJobError{
+			msg: fmt.Sprintf("Job runner: Job %v unstarted: %v before job's start time %v", job.ID, now, job.EndAt),
+		}
+	}
+	fmt.Println("time before started", job.StartAt)
+
+	if job.Ended(now) {
+		return nil, RecurringScheduleJobError{
+			msg: fmt.Sprintf("Job runner: Job %v ended: %v past job's end time %v", job.ID, now, job.EndAt),
+		}
+	}
+
+	run := job.NewRun(*initiator)
+
+	run.Overrides = *input
+	run.ApplyResult(*input)
+	run.CreationHeight = models.NewBig(currentHeight)
+	run.ObservedHeight = models.NewBig(currentHeight)
+
+	if !MeetsMinimumPayment(job.MinPayment, payment) {
+		logger.Infow("Rejecting run with insufficient payment", []interface{}{
+			"run", run.ID,
+			"job", run.JobSpecID,
+			"input_payment", payment,
+			"required_payment", job.MinPayment,
+		}...)
+
+		err := fmt.Errorf(
+			"Rejecting job %s with payment %s below job-specific-minimum threshold (%s)",
+			job.ID,
+			payment,
+			job.MinPayment.Text(10))
+		run.SetError(err)
+	}
+
+	cost := assets.NewLink(0)
+	for i, taskRun := range run.TaskRuns {
+		adapter, err := adapters.For(taskRun.TaskSpec, config, orm)
+
+		if err != nil {
+			run.SetError(err)
+			return &run, nil
+		}
+
+		mp := adapter.MinContractPayment()
+		if mp != nil {
+			cost.Add(cost, mp)
+		}
+
+		if currentHeight != nil {
+			run.TaskRuns[i].MinimumConfirmations = clnull.Uint32From(
+				utils.MaxUint32(
+					config.MinIncomingConfirmations(),
+					taskRun.TaskSpec.Confirmations.Uint32,
+					adapter.MinConfs()),
+			)
+		}
+	}
+
+	// payment is always present for runs triggered by ethlogs
+	if payment != nil {
+		if cost.Cmp(payment) > 0 {
+			logger.Debugw("Rejecting run with insufficient payment", []interface{}{
+				"run", run.ID,
+				"job", run.JobSpecID,
+				"input_payment", payment,
+				"required_payment", cost,
+			}...)
+
+			err := fmt.Errorf(
+				"Rejecting job %s with payment %s below minimum threshold (%s)",
+				job.ID,
+				payment,
+				config.MinimumContractPayment().Text(10))
+			run.SetError(err)
+		}
+	}
+
+	if len(run.TaskRuns) == 0 {
+		run.SetError(fmt.Errorf("invariant for job %s: no tasks to run in NewRun", job.ID))
+	}
+
+	if !run.Status.Runnable() {
+		return &run, nil
+	}
+
+	initialTask := run.TaskRuns[0]
+	validateMinimumConfirmations(&run, &initialTask, run.CreationHeight, txManager)
+	return &run, nil
+}
+
 // NewJobManager returns a new job manager
-func NewJobManager(store *store.Store) JobManager {
-	jm := &jobManager{store: store, updates: make(chan *runUpdate)}
+func NewJobManager(jobRunner JobRunner, config orm.ConfigReader, orm *orm.ORM, txManager store.TxManager, clock utils.AfterNower) JobManager {
+	jm := &jobManager{
+		orm:       orm,
+		jobRunner: jobRunner,
+		txManager: txManager,
+		config:    config,
+		clock:     clock,
+		updates:   make(chan *runUpdate),
+	}
 	go jm.run()
 	return jm
 }
@@ -82,7 +215,7 @@ func (jm *jobManager) ExecuteJobWithRunRequest(
 		"creation_height", creationHeight,
 	)
 
-	job, err := jm.store.Unscoped().FindJob(jobSpecID)
+	job, err := jm.orm.Unscoped().FindJob(jobSpecID)
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to find job spec")
 	}
@@ -93,21 +226,34 @@ func (jm *jobManager) ExecuteJobWithRunRequest(
 		}
 	}
 
-	run, err := NewRun(&job, initiator, input, creationHeight, jm.store, runRequest.Payment)
+	run, err := NewRun(&job, initiator, input, creationHeight, runRequest.Payment, jm.config, jm.orm, jm.clock, jm.txManager)
 	if err != nil {
 		return nil, errors.Wrap(err, "NewRun failed")
 	}
 
 	run.RunRequest = *runRequest
-	return run, createAndTrigger(run, jm.store)
+
+	if err := jm.orm.CreateJobRun(run); err != nil {
+		return nil, errors.Wrap(err, "CreateJobRun failed")
+	}
+
+	if run.Status == models.RunStatusInProgress {
+		logger.Debugw(
+			fmt.Sprintf("Executing run originally initiated by %s", run.Initiator.Type),
+			run.ForLogger()...,
+		)
+		return run, jm.jobRunner.Run(run)
+	}
+
+	return run, nil
 }
 
 // ResumeConfirmingTasks wakes up all jobs that were sleeping because they were
 // waiting for block confirmations.
 func (jm *jobManager) ResumeConfirmingTasks(currentBlockHeight *big.Int) error {
-	return jm.store.UnscopedJobRunsWithStatus(func(run *models.JobRun) {
+	return jm.orm.UnscopedJobRunsWithStatus(func(run *models.JobRun) {
 		logger.Debugw("New head resuming run", run.ForLogger()...)
-		err := ResumeConfirmingTask(run, currentBlockHeight, jm.store.TxManager)
+		err := ResumeConfirmingTask(run, currentBlockHeight, jm.txManager)
 		if err != nil {
 			logger.Error(err)
 		}
@@ -116,6 +262,8 @@ func (jm *jobManager) ResumeConfirmingTasks(currentBlockHeight *big.Int) error {
 	}, models.RunStatusPendingConnection, models.RunStatusPendingConfirmations)
 }
 
+// ResumeConfirmingTasks wakes up a task that was sleeping because it is
+// waiting for block confirmations.
 func ResumeConfirmingTask(run *models.JobRun, currentBlockHeight *big.Int, txManager store.TxManager) error {
 	currentTaskRun := run.NextTaskRun()
 	if currentTaskRun == nil {
@@ -131,7 +279,7 @@ func ResumeConfirmingTask(run *models.JobRun, currentBlockHeight *big.Int, txMan
 // ResumeConnectingTasks wakes up all tasks that have gone to sleep because
 // they needed an ethereum client connection.
 func (jm *jobManager) ResumeConnectingTasks() error {
-	return jm.store.UnscopedJobRunsWithStatus(func(run *models.JobRun) {
+	return jm.orm.UnscopedJobRunsWithStatus(func(run *models.JobRun) {
 		logger.Debugw("New connection resuming run", run.ForLogger()...)
 
 		currentTaskRun := run.NextTaskRun()
@@ -145,6 +293,8 @@ func (jm *jobManager) ResumeConnectingTasks() error {
 	}, models.RunStatusPendingConnection, models.RunStatusPendingConfirmations)
 }
 
+// ResumeConnectingTask wakes up a task that has gone to sleep because
+// it required an ethereum connection
 func ResumeConnectingTask(run *models.JobRun) error {
 	logger.Debugw("New connection resuming run", run.ForLogger()...)
 
@@ -162,7 +312,7 @@ func (jm *jobManager) ResumePendingTask(
 	runID *models.ID,
 	input models.RunResult,
 ) error {
-	run, err := jm.store.Unscoped().FindJobRun(runID)
+	run, err := jm.orm.Unscoped().FindJobRun(runID)
 	if err != nil {
 		return err
 	}
@@ -175,10 +325,8 @@ func (jm *jobManager) ResumePendingTask(
 	return jm.updateAndTrigger(&run)
 }
 
-func ResumePendingTask(
-	run *models.JobRun,
-	input models.RunResult,
-) error {
+// ResumePendingTask wakes up a task that required a response from a bridge adapter.
+func ResumePendingTask(run *models.JobRun, input models.RunResult) error {
 	logger.Debugw("External adapter resuming job", []interface{}{
 		"run", run.ID,
 		"job", run.JobSpecID,
@@ -203,7 +351,6 @@ func ResumePendingTask(
 		run.Status = models.RunStatusInProgress
 	} else if currentTaskRun.Status.Finished() {
 		run.ApplyResult(input)
-		run.SetFinishedAt()
 	} else {
 		run.ApplyResult(input)
 	}
@@ -211,11 +358,32 @@ func ResumePendingTask(
 	return nil
 }
 
+// ResumeInProgressTasks queries the db for job runs that should be resumed
+// since a previous node shutdown.
+//
+// As a result of its reliance on the database, it must run before anything
+// persists a job RunStatus to the db to ensure that it only captures pending and in progress
+// jobs as a result of the last shutdown, and not as a result of what's happening now.
+//
+// To recap: This must run before anything else writes job run status to the db,
+// ie. tries to run a job.
+// https://github.com/smartcontractkit/chainlink/pull/807
+func (jm *jobManager) ResumeInProgressTasks() error {
+	// Do all querying of run statuses since last shutdown before enqueuing
+	// runs in progress and asleep, to prevent the following race condition:
+	// 1. resume sleep, 2. awake from sleep, 3. in progress, 4. resume in progress (double enqueued).
+	return jm.orm.UnscopedJobRunsWithStatus(func(run *models.JobRun) {
+
+		if err := jm.jobRunner.Run(run); err != nil {
+			logger.Errorw("Error resuming job run", "error", err, "run", run.ID.String())
+		}
+
+	}, models.RunStatusInProgress, models.RunStatusPendingSleep)
+}
+
 // CancelTask suspends a running task.
-func (jm *jobManager) CancelTask(
-	runID *models.ID,
-) error {
-	run, err := jm.store.FindJobRun(runID)
+func (jm *jobManager) CancelTask(runID *models.ID) error {
+	run, err := jm.orm.FindJobRun(runID)
 	if err != nil {
 		return err
 	}
@@ -233,11 +401,11 @@ func (jm *jobManager) run() {
 	for {
 		select {
 		case update := <-jm.updates:
-			if err := jm.store.SaveJobRun(update.run); err != nil {
+			if err := jm.orm.SaveJobRun(update.run); err != nil {
 				update.result <- err
 				continue
 			}
-			update.result <- triggerIfReady(update.run, jm.store)
+			update.result <- jm.jobRunner.Run(update.run)
 		}
 	}
 }

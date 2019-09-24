@@ -133,11 +133,6 @@ func (jr *JobRun) ApplyResult(result RunResult) error {
 	return nil
 }
 
-// SetFinishedAt sets the JobRun's finished at time to now.
-func (jr *JobRun) SetFinishedAt() {
-	jr.FinishedAt = null.TimeFrom(time.Now())
-}
-
 // JobRunsWithStatus filters passed job runs returning those that have
 // the desired status, entirely in memory.
 func JobRunsWithStatus(runs []JobRun, status RunStatus) []JobRun {

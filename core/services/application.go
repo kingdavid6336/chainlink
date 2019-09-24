@@ -50,14 +50,15 @@ func NewApplication(config *orm.Config, onConnectCallbacks ...func(Application))
 	store := store.NewStore(config)
 	config.SetRuntimeStore(store.ORM)
 
-	jobManager := NewJobManager(store)
+	jobRunner := NewJobRunner(store)
+	jobManager := NewJobManager(jobRunner, config, store.ORM, store.TxManager, store.Clock)
 	jobSubscriber := NewJobSubscriber(store, jobManager)
 	pendingConnectionResumer := newPendingConnectionResumer(jobManager)
 
 	app := &ChainlinkApplication{
 		JobSubscriber:            jobSubscriber,
 		JobManager:               jobManager,
-		JobRunner:                NewJobRunner(store),
+		JobRunner:                jobRunner,
 		Scheduler:                NewScheduler(store, jobManager),
 		Store:                    store,
 		SessionReaper:            NewStoreReaper(store),
@@ -100,7 +101,6 @@ func (app *ChainlinkApplication) Start() error {
 
 		// Deliberately started immediately after Store, to start the RunChannel consumer
 		app.JobRunner.Start(),
-		app.JobRunner.resumeRunsSinceLastShutdown(), // Started before any other service writes RunStatus to db.
 
 		// HeadTracker deliberately started after JobRunner#resumeRunsSinceLastShutdown
 		// since it Connects JobSubscriber which leads to writes of JobRuns RunStatus to the db.

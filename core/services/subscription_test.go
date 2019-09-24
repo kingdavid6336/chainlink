@@ -6,6 +6,7 @@ import (
 
 	"github.com/onsi/gomega"
 	"github.com/smartcontractkit/chainlink/core/internal/cltest"
+	"github.com/smartcontractkit/chainlink/core/internal/mocks"
 	"github.com/smartcontractkit/chainlink/core/services"
 	strpkg "github.com/smartcontractkit/chainlink/core/store"
 	"github.com/smartcontractkit/chainlink/core/store/models"
@@ -29,7 +30,7 @@ func TestServices_NewInitiatorSubscription_BackfillLogs(t *testing.T) {
 	var count int32
 	callback := func(*strpkg.Store, services.JobManager, models.LogRequest) { atomic.AddInt32(&count, 1) }
 	fromBlock := cltest.Head(0)
-	jm := services.NewJobManager(store)
+	jm := new(mocks.JobManager)
 	sub, err := services.NewInitiatorSubscription(initr, job, store, jm, fromBlock, callback)
 	assert.NoError(t, err)
 	defer sub.Unsubscribe()
@@ -54,7 +55,7 @@ func TestServices_NewInitiatorSubscription_BackfillLogs_WithNoHead(t *testing.T)
 
 	var count int32
 	callback := func(*strpkg.Store, services.JobManager, models.LogRequest) { atomic.AddInt32(&count, 1) }
-	jm := services.NewJobManager(store)
+	jm := new(mocks.JobManager)
 	sub, err := services.NewInitiatorSubscription(initr, job, store, jm, nil, callback)
 	assert.NoError(t, err)
 	defer sub.Unsubscribe()
@@ -81,7 +82,7 @@ func TestServices_NewInitiatorSubscription_PreventsDoubleDispatch(t *testing.T) 
 	var count int32
 	callback := func(*strpkg.Store, services.JobManager, models.LogRequest) { atomic.AddInt32(&count, 1) }
 	head := cltest.Head(0)
-	jm := services.NewJobManager(store)
+	jm := new(mocks.JobManager)
 	sub, err := services.NewInitiatorSubscription(initr, job, store, jm, head, callback)
 	assert.NoError(t, err)
 	defer sub.Unsubscribe()
@@ -117,7 +118,7 @@ func TestServices_ReceiveLogRequest_IgnoredLogWithRemovedFlag(t *testing.T) {
 	err := store.ORM.DB.Model(&models.JobRun{}).Count(&originalCount).Error
 	require.NoError(t, err)
 
-	jm := services.NewJobManager(store)
+	jm := new(mocks.JobManager)
 	services.ReceiveLogRequest(store, jm, log)
 
 	gomega.NewGomegaWithT(t).Consistently(func() int {

@@ -170,15 +170,15 @@ func TestJobSpecsController_Create_HappyPath(t *testing.T) {
 	err := cltest.ParseJSONAPIResponse(t, resp, &j)
 	require.NoError(t, err)
 
-	adapter1, _ := adapters.For(j.Tasks[0], app.Store)
+	adapter1, _ := adapters.For(j.Tasks[0], app.Store.Config, app.Store.ORM)
 	httpGet := adapter1.BaseAdapter.(*adapters.HTTPGet)
 	assert.Equal(t, httpGet.GetURL(), "https://bitstamp.net/api/ticker/")
 
-	adapter2, _ := adapters.For(j.Tasks[1], app.Store)
+	adapter2, _ := adapters.For(j.Tasks[1], app.Store.Config, app.Store.ORM)
 	jsonParse := adapter2.BaseAdapter.(*adapters.JSONParse)
 	assert.Equal(t, []string(jsonParse.Path), []string{"last"})
 
-	adapter4, _ := adapters.For(j.Tasks[3], app.Store)
+	adapter4, _ := adapters.For(j.Tasks[3], app.Store.Config, app.Store.ORM)
 	signTx := adapter4.BaseAdapter.(*adapters.EthTx)
 	assert.Equal(t, "0x356a04bCe728ba4c62A30294A55E6A8600a320B3", signTx.Address.String())
 	assert.Equal(t, "0x609ff1bd", signTx.FunctionSelector.String())
@@ -194,7 +194,7 @@ func TestJobSpecsController_Create_HappyPath(t *testing.T) {
 	require.Len(t, j.Initiators, 1)
 	assert.Equal(t, models.InitiatorWeb, j.Initiators[0].Type)
 
-	adapter1, _ = adapters.For(j.Tasks[0], app.Store)
+	adapter1, _ = adapters.For(j.Tasks[0], app.Store.Config, app.Store.ORM)
 	httpGet = adapter1.BaseAdapter.(*adapters.HTTPGet)
 	assert.Equal(t, httpGet.GetURL(), "https://bitstamp.net/api/ticker/")
 }
@@ -247,17 +247,17 @@ func TestJobSpecsController_Create_CaseInsensitiveTypes(t *testing.T) {
 
 	j := cltest.FixtureCreateJobViaWeb(t, app, "testdata/caseinsensitive_hello_world_job.json")
 
-	adapter1, _ := adapters.For(j.Tasks[0], app.Store)
+	adapter1, _ := adapters.For(j.Tasks[0], app.Store.Config, app.Store.ORM)
 	httpGet := adapter1.BaseAdapter.(*adapters.HTTPGet)
 	assert.Equal(t, httpGet.GetURL(), "https://bitstamp.net/api/ticker/")
 
-	adapter2, _ := adapters.For(j.Tasks[1], app.Store)
+	adapter2, _ := adapters.For(j.Tasks[1], app.Store.Config, app.Store.ORM)
 	jsonParse := adapter2.BaseAdapter.(*adapters.JSONParse)
 	assert.Equal(t, []string(jsonParse.Path), []string{"last"})
 
 	assert.Equal(t, "ethbytes32", j.Tasks[2].Type.String())
 
-	adapter4, _ := adapters.For(j.Tasks[3], app.Store)
+	adapter4, _ := adapters.For(j.Tasks[3], app.Store.Config, app.Store.ORM)
 	signTx := adapter4.BaseAdapter.(*adapters.EthTx)
 	assert.Equal(t, "0x356a04bCe728ba4c62A30294A55E6A8600a320B3", signTx.Address.String())
 	assert.Equal(t, "0x609ff1bd", signTx.FunctionSelector.String())

@@ -7,7 +7,6 @@ import (
 	"math/big"
 	"testing"
 
-	"github.com/smartcontractkit/chainlink/core/adapters"
 	"github.com/smartcontractkit/chainlink/core/internal/cltest"
 	"github.com/smartcontractkit/chainlink/core/store/assets"
 	"github.com/smartcontractkit/chainlink/core/store/models"
@@ -169,34 +168,6 @@ func TestForLogger(t *testing.T) {
 	assert.Equal(t, logsWithErr[6], "job_error")
 	assert.Equal(t, logsWithErr[7], jrErr.Result.Error())
 
-}
-
-func TestJobRun_NextTaskRun(t *testing.T) {
-	t.Parallel()
-
-	store, cleanup := cltest.NewStore(t)
-	defer cleanup()
-	jobRunner, cleanup := cltest.NewJobRunner(store)
-	defer cleanup()
-	jobRunner.Start()
-
-	job := cltest.NewJobWithWebInitiator()
-	job.Tasks = []models.TaskSpec{
-		{Type: adapters.TaskTypeNoOp},
-		{Type: adapters.TaskTypeNoOpPend},
-		{Type: adapters.TaskTypeNoOp},
-	}
-	assert.NoError(t, store.CreateJob(&job))
-	run := job.NewRun(job.Initiators[0])
-	assert.NoError(t, store.CreateJobRun(&run))
-	assert.Equal(t, &run.TaskRuns[0], run.NextTaskRun())
-
-	store.RunChannel.Send(run.ID)
-	cltest.WaitForJobRunStatus(t, store, run, models.RunStatusPendingConfirmations)
-
-	run, err := store.FindJobRun(run.ID)
-	assert.NoError(t, err)
-	assert.Equal(t, &run.TaskRuns[1], run.NextTaskRun())
 }
 
 func TestRunResult_Value(t *testing.T) {
