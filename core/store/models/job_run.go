@@ -119,6 +119,7 @@ func (jr *JobRun) SetError(err error) {
 	jr.Result.ErrorMessage = null.StringFrom(err.Error())
 	jr.Result.Status = RunStatusErrored
 	jr.Status = jr.Result.Status
+	jr.FinishedAt = null.TimeFrom(time.Now())
 }
 
 // ApplyResult updates the JobRun's Result and Status
@@ -130,6 +131,9 @@ func (jr *JobRun) ApplyResult(result RunResult) error {
 	jr.Result = result
 	jr.Result.Data = data
 	jr.Status = result.Status
+	if jr.Status.Finished() {
+		jr.FinishedAt = null.TimeFrom(time.Now())
+	}
 	return nil
 }
 

@@ -17,7 +17,12 @@ import (
 
 func TestJobManager_ResumePendingTask(t *testing.T) {
 	// reject a run with an invalid state
-	run := &models.JobRun{}
+	jobID := models.NewID()
+	runID := models.NewID()
+	run := &models.JobRun{
+		ID:        runID,
+		JobSpecID: jobID,
+	}
 	err := services.ResumePendingTask(run, models.RunResult{})
 	assert.Error(t, err)
 
@@ -27,8 +32,6 @@ func TestJobManager_ResumePendingTask(t *testing.T) {
 	assert.Error(t, err)
 
 	// input with error errors run
-	jobID := models.NewID()
-	runID := models.NewID()
 	run = &models.JobRun{
 		ID:        runID,
 		JobSpecID: jobID,
@@ -119,14 +122,19 @@ func TestJobManager_ResumeConfirmingTask(t *testing.T) {
 
 func TestJobManager_ResumeConnectingTask(t *testing.T) {
 	// reject a run with no tasks
-	run := &models.JobRun{Status: models.RunStatusPendingConnection}
+	run := &models.JobRun{
+		ID:        models.NewID(),
+		JobSpecID: models.NewID(),
+		Status:    models.RunStatusPendingConnection,
+	}
 	err := services.ResumeConnectingTask(run)
 	assert.Error(t, err)
 
 	// input, should go from pending -> in progress
 	run = &models.JobRun{
-		ID:     models.NewID(),
-		Status: models.RunStatusPendingConnection,
+		ID:        models.NewID(),
+		JobSpecID: models.NewID(),
+		Status:    models.RunStatusPendingConnection,
 		TaskRuns: []models.TaskRun{models.TaskRun{
 			ID: models.NewID(),
 		}},
