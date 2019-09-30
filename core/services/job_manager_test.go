@@ -41,6 +41,8 @@ func TestJobManager_ResumePendingTask(t *testing.T) {
 	err = services.ResumePendingTask(run, models.RunResult{CachedJobRunID: runID, Status: models.RunStatusErrored})
 	assert.NoError(t, err)
 	assert.True(t, run.FinishedAt.Valid)
+	assert.Len(t, run.TaskRuns, 1)
+	assert.Equal(t, string(models.RunStatusErrored), string(run.TaskRuns[0].Result.Status))
 
 	// completed input with remaining tasks should put task into pending
 	run = &models.JobRun{

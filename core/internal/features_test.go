@@ -296,14 +296,12 @@ func TestIntegration_RunLog(t *testing.T) {
 			logBlockHash:     triggeringBlockHash,
 			receiptBlockHash: triggeringBlockHash,
 			wantStatus:       models.RunStatusCompleted,
-			wantFinishedAt:   true,
 		},
 		{
 			name:             "ommered request",
 			logBlockHash:     triggeringBlockHash,
 			receiptBlockHash: otherBlockHash,
 			wantStatus:       models.RunStatusErrored,
-			wantFinishedAt:   false,
 		},
 	}
 
@@ -362,7 +360,7 @@ func TestIntegration_RunLog(t *testing.T) {
 			})
 
 			jr = cltest.WaitForJobRunStatus(t, app.Store, jr, test.wantStatus)
-			assert.Equal(t, test.wantFinishedAt, jr.FinishedAt.Valid)
+			assert.True(t, jr.FinishedAt.Valid)
 			assert.Equal(t, requiredConfs, jr.TaskRuns[0].Confirmations.Uint32)
 			assert.True(t, eth.AllCalled(), eth.Remaining())
 		})

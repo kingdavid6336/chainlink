@@ -83,7 +83,6 @@ func NewRun(
 			msg: fmt.Sprintf("Job runner: Job %v unstarted: %v before job's start time %v", job.ID, now, job.EndAt),
 		}
 	}
-	fmt.Println("time before started", job.StartAt)
 
 	if job.Ended(now) {
 		return nil, RecurringScheduleJobError{
