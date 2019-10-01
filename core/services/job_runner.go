@@ -11,6 +11,8 @@ import (
 	"github.com/smartcontractkit/chainlink/core/store/models"
 )
 
+//go:generate mockery -name JobRunner -output ../internal/mocks/ -case=underscore
+
 // JobRunner safely handles coordinating job runs.
 type JobRunner interface {
 	Start() error
