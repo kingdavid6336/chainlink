@@ -393,7 +393,12 @@ func (jm *jobManager) CancelTask(runID *models.ID) error {
 		"status", run.Status,
 	}...)
 
-	return nil
+	if !run.Status.Runnable() {
+		return fmt.Errorf("Cannot cancell a non runnable job")
+	}
+
+	run.Status = models.RunStatusCancelled
+	return jm.orm.SaveJobRun(&run)
 }
 
 func (jm *jobManager) run() {
