@@ -163,6 +163,33 @@ func TestORM_SaveJobRun_ArchivedDoesNotRevertDeletedAt(t *testing.T) {
 	require.NoError(t, utils.JustError(store.Unscoped().FindJobRun(jr.ID)))
 }
 
+func TestORM_SaveJobRun_Cancelled(t *testing.T) {
+	t.Parallel()
+	store, cleanup := cltest.NewStore(t)
+	defer cleanup()
+	store.ORM.SetLogging(true)
+
+	job := cltest.NewJobWithWebInitiator()
+	require.NoError(t, store.CreateJob(&job))
+
+	jr := job.NewRun(job.Initiators[0])
+	require.NoError(t, store.CreateJobRun(&jr))
+
+	jr.Status = models.RunStatusInProgress
+	require.NoError(t, store.SaveJobRun(&jr))
+
+	// Save the updated at before saving with cancelled
+	updatedAt := jr.UpdatedAt
+
+	jr.Status = models.RunStatusCancelled
+	require.NoError(t, store.SaveJobRun(&jr))
+
+	// Restore the previous updated at to simulate a conflict
+	jr.UpdatedAt = updatedAt
+	jr.Status = models.RunStatusInProgress
+	assert.Equal(t, orm.OptimisticUpdateConflictError, store.SaveJobRun(&jr))
+}
+
 func coercedJSON(v string) string {
 	if v == "" {
 		return "{}"

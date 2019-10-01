@@ -286,10 +286,23 @@ func (orm *ORM) convenientTransaction(callback func(*gorm.DB) error) error {
 	return dbtx.Commit().Error
 }
 
+// OptimisticUpdateConflictError is returned when a record update failed
+// because another update occurred while the model was in memory and the
+// differences must be reconciled.
+var OptimisticUpdateConflictError = errors.New("conflict while updating record")
+
 // SaveJobRun updates UpdatedAt for a JobRun and saves it
 func (orm *ORM) SaveJobRun(run *models.JobRun) error {
 	return orm.convenientTransaction(func(dbtx *gorm.DB) error {
-		return dbtx.Unscoped().Omit("deleted_at").Save(run).Error
+		result := dbtx.Unscoped().
+			Model(run).
+			Where("updated_at = ?", run.UpdatedAt).
+			Omit("deleted_at").
+			Save(run)
+		if result.RowsAffected == 0 {
+			return OptimisticUpdateConflictError
+		}
+		return result.Error
 	})
 }
 
