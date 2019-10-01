@@ -45,7 +45,9 @@ type JobManager interface {
 	ResumeConfirmingTasks(currentBlockHeight *big.Int) error
 	ResumeConnectingTasks() error
 	ResumePendingTask(runID *models.ID, input models.RunResult) error
+
 	ResumeInProgressTasks() error
+
 	CancelTask(runID *models.ID) error
 }
 

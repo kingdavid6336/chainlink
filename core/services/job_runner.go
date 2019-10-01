@@ -5,9 +5,7 @@ import (
 	"fmt"
 	"sync"
 
-	"github.com/smartcontractkit/chainlink/core/adapters"
 	"github.com/smartcontractkit/chainlink/core/logger"
-	"github.com/smartcontractkit/chainlink/core/store"
 	"github.com/smartcontractkit/chainlink/core/store/models"
 )
 
@@ -31,21 +29,19 @@ type jobRunner struct {
 	workersWg            sync.WaitGroup
 	demultiplexStopperWg sync.WaitGroup
 	runChannel           chan string
-
-	store *store.Store
+	jobExecutor          JobExecutor
 }
 
 // NewJobRunner initializes a JobRunner.
-func NewJobRunner(str *store.Store) JobRunner {
+func NewJobRunner(jobExecutor JobExecutor) JobRunner {
 	return &jobRunner{
-		// Unscoped allows the processing of runs that are soft deleted asynchronously
-		store:      str.Unscoped(),
-		workers:    make(map[string]chan struct{}, 1),
-		runChannel: make(chan string, 1000),
+		workers:     make(map[string]chan struct{}, 1),
+		runChannel:  make(chan string, 1000),
+		jobExecutor: jobExecutor,
 	}
 }
 
-// Start reinitializes runs and starts the execution of the store's runs.
+// Start prepares the job runner for accepting runs to execute.
 func (jr *jobRunner) Start() error {
 	jr.bootMutex.Lock()
 	defer jr.bootMutex.Unlock()
@@ -136,21 +132,10 @@ func (jr *jobRunner) workerLoop(runID *models.ID, workerChannel chan struct{}) {
 	for {
 		select {
 		case <-workerChannel:
-			run, err := jr.store.FindJobRun(runID)
-			if err != nil {
-				logger.Errorw(fmt.Sprint("Error finding run ", runID), run.ForLogger("error", err)...)
-			}
-
-			if err := jr.executeRun(&run); err != nil {
-				logger.Errorw(fmt.Sprint("Error executing run ", runID), run.ForLogger("error", err)...)
+			if err := jr.jobExecutor.Execute(runID); err != nil {
+				logger.Errorw(fmt.Sprint("Error executing run ", runID))
 				return
 			}
-
-			if run.Status.Finished() {
-				logger.Debugw("All tasks complete for run", "run", run.ID)
-				return
-			}
-
 		case <-jr.done:
 			logger.Debug("JobRunner worker loop for ", runID, " finished")
 			return
@@ -163,118 +148,4 @@ func (jr *jobRunner) workerCount() int {
 	defer jr.workerMutex.RUnlock()
 
 	return len(jr.workers)
-}
-
-func (jr *jobRunner) executeTask(run *models.JobRun, currentTaskRun *models.TaskRun) models.RunResult {
-	taskCopy := currentTaskRun.TaskSpec // deliberately copied to keep mutations local
-
-	var err error
-	if taskCopy.Params, err = taskCopy.Params.Merge(run.Overrides.Data); err != nil {
-		currentTaskRun.Result.SetError(err)
-		return currentTaskRun.Result
-	}
-
-	adapter, err := adapters.For(taskCopy, jr.store.Config, jr.store.ORM)
-	if err != nil {
-		currentTaskRun.Result.SetError(err)
-		return currentTaskRun.Result
-	}
-
-	logger.Infow(fmt.Sprintf("Processing task %s", taskCopy.Type), []interface{}{"task", currentTaskRun.ID}...)
-
-	data, err := prepareTaskInput(run, currentTaskRun.Result.Data)
-	if err != nil {
-		currentTaskRun.Result.SetError(err)
-		return currentTaskRun.Result
-	}
-
-	currentTaskRun.Result.CachedJobRunID = run.ID
-	currentTaskRun.Result.Data = data
-	result := adapter.Perform(currentTaskRun.Result, jr.store)
-	result.ID = currentTaskRun.Result.ID
-
-	logger.Infow(fmt.Sprintf("Finished processing task %s", taskCopy.Type), []interface{}{
-		"task", currentTaskRun.ID,
-		"result", result.Status,
-		"result_data", result.Data,
-	}...)
-
-	return result
-}
-
-func (jr *jobRunner) executeRun(run *models.JobRun) error {
-	logger.Infow("Processing run", run.ForLogger()...)
-
-	if !run.Status.Runnable() {
-		return fmt.Errorf("Run triggered in non runnable state %s", run.Status)
-	}
-
-	currentTaskRun := run.NextTaskRun()
-	if currentTaskRun == nil {
-		return errors.New("Run triggered with no remaining tasks")
-	}
-
-	result := jr.executeTask(run, currentTaskRun)
-
-	currentTaskRun.ApplyResult(result)
-	run.ApplyResult(result)
-
-	if currentTaskRun.Status.PendingSleep() {
-		logger.Debugw("Task is sleeping", []interface{}{"run", run.ID}...)
-	} else if !currentTaskRun.Status.Runnable() {
-		logger.Debugw("Task execution blocked", []interface{}{"run", run.ID, "task", currentTaskRun.ID, "state", currentTaskRun.Result.Status}...)
-	} else if currentTaskRun.Status.Unstarted() {
-		return fmt.Errorf("run %s task %s cannot return a status of empty string or Unstarted", run.ID, currentTaskRun.TaskSpec.Type)
-	} else if futureTaskRun := run.NextTaskRun(); futureTaskRun != nil {
-		validateMinimumConfirmations(run, futureTaskRun, run.ObservedHeight, jr.store.TxManager)
-	}
-
-	if err := jr.updateAndTrigger(run); err != nil {
-		return err
-	}
-	logger.Infow("Run finished processing", run.ForLogger()...)
-
-	return nil
-}
-
-// QueueSleepingTask creates a go routine which will wake up the job runner
-// once the sleep's time has elapsed
-func (jr *jobRunner) queueSleepingTask(run *models.JobRun) error {
-	if !run.Status.PendingSleep() {
-		return fmt.Errorf("Attempting to resume non sleeping run %s", run.ID)
-	}
-
-	currentTaskRun := run.NextTaskRun()
-	if currentTaskRun == nil {
-		return fmt.Errorf("Attempting to resume sleeping run with no remaining tasks %s", run.ID)
-	}
-
-	if !currentTaskRun.Status.PendingSleep() {
-		return fmt.Errorf("Attempting to resume sleeping run with non sleeping task %s", run.ID)
-	}
-
-	adapter, err := prepareAdapter(currentTaskRun, run.Overrides.Data, jr.store.Config, jr.store.ORM)
-	if err != nil {
-		currentTaskRun.SetError(err)
-		run.SetError(err)
-		return jr.store.SaveJobRun(run)
-	}
-
-	if sleepAdapter, ok := adapter.BaseAdapter.(*adapters.Sleep); ok {
-		return performTaskSleep(run, currentTaskRun, sleepAdapter, jr.store.Clock, jr)
-	}
-
-	return fmt.Errorf("Attempting to resume non sleeping task for run %s (%s)", run.ID, currentTaskRun.TaskSpec.Type)
-}
-
-func (jr *jobRunner) updateAndTrigger(run *models.JobRun) error {
-	if err := jr.store.ORM.SaveJobRun(run); err != nil {
-		return err
-	}
-
-	if run.Status == models.RunStatusInProgress || run.Status == models.RunStatusPendingSleep {
-		return jr.Run(run)
-	}
-
-	return nil
 }

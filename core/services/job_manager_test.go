@@ -1,8 +1,10 @@
 package services_test
 
 import (
+	"fmt"
 	"math/big"
 	"testing"
+	"time"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/smartcontractkit/chainlink/core/adapters"
@@ -10,6 +12,7 @@ import (
 	clnull "github.com/smartcontractkit/chainlink/core/null"
 	"github.com/smartcontractkit/chainlink/core/services"
 	"github.com/smartcontractkit/chainlink/core/store/models"
+	"github.com/smartcontractkit/chainlink/core/utils"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/tidwall/gjson"
@@ -338,4 +341,41 @@ func TestJobManager_ExecuteJobWithRunRequest_fromRunLog_ConnectToLaggingEthNode(
 	assert.True(t, updatedJR.TaskRuns[0].Confirmations.Valid)
 	assert.Equal(t, uint32(0), updatedJR.TaskRuns[0].Confirmations.Uint32)
 	assert.True(t, eth.AllCalled(), eth.Remaining())
+}
+
+func TestJobManager_ResumeInProgressTasks(t *testing.T) {
+	store, cleanup := cltest.NewStore(t)
+	defer cleanup()
+
+	//jr := new(mocks.JobRunner)
+
+	j := models.NewJob()
+	i := models.Initiator{Type: models.InitiatorWeb}
+	j.Initiators = []models.Initiator{i}
+	json := fmt.Sprintf(`{"until":"%v"}`, utils.ISO8601UTC(time.Now().Add(time.Second)))
+	j.Tasks = []models.TaskSpec{cltest.NewTask(t, "sleep", json)}
+	assert.NoError(t, store.CreateJob(&j))
+
+	sleepingRun := j.NewRun(i)
+	sleepingRun.Status = models.RunStatusPendingSleep
+	sleepingRun.TaskRuns[0].Status = models.RunStatusPendingSleep
+	assert.NoError(t, store.CreateJobRun(&sleepingRun))
+
+	inProgressRun := j.NewRun(i)
+	inProgressRun.Status = models.RunStatusInProgress
+	assert.NoError(t, store.CreateJobRun(&inProgressRun))
+
+	//assert.NoError(t, services.ExportedResumeRunsSinceLastShutdown(rm))
+	//messages := []*models.ID{}
+
+	//rr, open := <-store.RunChannel.Receive()
+	//assert.True(t, open)
+	//messages = append(messages, rr.ID)
+
+	//rr, open = <-store.RunChannel.Receive()
+	//assert.True(t, open)
+	//messages = append(messages, rr.ID)
+
+	//expectedMessages := []*models.ID{sleepingRun.ID, inProgressRun.ID}
+	//assert.ElementsMatch(t, expectedMessages, messages)
 }

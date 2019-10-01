@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"sync"
 
+	"github.com/smartcontractkit/chainlink/core/logger"
 	"github.com/smartcontractkit/chainlink/core/store"
 	"github.com/smartcontractkit/chainlink/core/store/models"
 	"go.uber.org/multierr"
@@ -20,10 +21,10 @@ type JobSubscriber interface {
 
 // jobSubscriber implementation
 type jobSubscriber struct {
-	jobManager       JobManager
 	store            *store.Store
 	jobSubscriptions map[string]JobSubscription
 	jobsMutex        *sync.RWMutex
+	jobManager       JobManager
 }
 
 // NewJobSubscriber returns a new job subscriber.
@@ -57,6 +58,7 @@ func (js *jobSubscriber) RemoveJob(ID *models.ID) error {
 	sub, ok := js.jobSubscriptions[ID.String()]
 	delete(js.jobSubscriptions, ID.String())
 	js.jobsMutex.Unlock()
+
 	if !ok {
 		return fmt.Errorf("JobSubscriber#RemoveJob: job %s not found", ID)
 	}
@@ -68,6 +70,7 @@ func (js *jobSubscriber) RemoveJob(ID *models.ID) error {
 func (js *jobSubscriber) Jobs() []models.JobSpec {
 	js.jobsMutex.RLock()
 	defer js.jobsMutex.RUnlock()
+
 	var jobs []models.JobSpec
 	for _, sub := range js.jobSubscriptions {
 		jobs = append(jobs, sub.Job)
@@ -78,6 +81,7 @@ func (js *jobSubscriber) Jobs() []models.JobSpec {
 func (js *jobSubscriber) addSubscription(sub JobSubscription) {
 	js.jobsMutex.Lock()
 	defer js.jobsMutex.Unlock()
+
 	js.jobSubscriptions[sub.Job.ID.String()] = sub
 }
 
@@ -96,6 +100,7 @@ func (js *jobSubscriber) Connect(bn *models.Head) error {
 func (js *jobSubscriber) Disconnect() {
 	js.jobsMutex.Lock()
 	defer js.jobsMutex.Unlock()
+
 	for _, sub := range js.jobSubscriptions {
 		sub.Unsubscribe()
 	}
@@ -104,5 +109,8 @@ func (js *jobSubscriber) Disconnect() {
 
 // OnNewHead resumes all pending job runs based on the new head activity.
 func (js *jobSubscriber) OnNewHead(head *models.Head) {
-	js.jobManager.ResumeConfirmingTasks(head.ToInt())
+	err := js.jobManager.ResumeConfirmingTasks(head.ToInt())
+	if err != nil {
+		logger.Errorw("Failed to resume confirming tasks on new head", "error", err)
+	}
 }

@@ -405,19 +405,6 @@ func cleanUpStore(t testing.TB, store *strpkg.Store) {
 	require.NoError(t, store.Close())
 }
 
-// NewJobSubscriber creates a new JobSubscriber
-func NewJobSubscriber(t testing.TB) (*strpkg.Store, services.JobSubscriber, func()) {
-	t.Helper()
-
-	store, cl := NewStore(t)
-	jobRunner := services.NewJobRunner(store)
-	jobManager := services.NewJobManager(jobRunner, store.Config, store.ORM, store.TxManager, store.Clock)
-	nl := services.NewJobSubscriber(store, jobManager)
-	return store, nl, func() {
-		cl()
-	}
-}
-
 // CommonJSON has an ID, and Name
 type CommonJSON struct {
 	ID     string `json:"id"`

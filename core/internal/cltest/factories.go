@@ -18,7 +18,6 @@ import (
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/smartcontractkit/chainlink/core/adapters"
 	"github.com/smartcontractkit/chainlink/core/logger"
-	"github.com/smartcontractkit/chainlink/core/services"
 	"github.com/smartcontractkit/chainlink/core/store"
 	strpkg "github.com/smartcontractkit/chainlink/core/store"
 	"github.com/smartcontractkit/chainlink/core/store/assets"
@@ -471,11 +470,6 @@ func MarkJobRunPendingBridge(jr models.JobRun, i int) models.JobRun {
 	jr.TaskRuns[i].Status = models.RunStatusPendingBridge
 	jr.TaskRuns[i].Result.Status = models.RunStatusPendingBridge
 	return jr
-}
-
-func NewJobRunner(s *strpkg.Store) (services.JobRunner, func()) {
-	rm := services.NewJobRunner(s)
-	return rm, func() { rm.Stop() }
 }
 
 type MockSigner struct{}
