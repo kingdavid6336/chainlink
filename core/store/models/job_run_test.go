@@ -13,7 +13,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestJobRuns_RetrievingFromDBWithError(t *testing.T) {
+func TestJobRun_RetrievingFromDBWithError(t *testing.T) {
 	t.Parallel()
 	store, cleanup := cltest.NewStore(t)
 	defer cleanup()
@@ -32,7 +32,7 @@ func TestJobRuns_RetrievingFromDBWithError(t *testing.T) {
 	assert.Equal(t, "bad idea", run.Result.Error())
 }
 
-func TestJobRuns_RetrievingFromDBWithData(t *testing.T) {
+func TestJobRun_RetrievingFromDBWithData(t *testing.T) {
 	t.Parallel()
 	store, cleanup := cltest.NewStore(t)
 	defer cleanup()
@@ -54,7 +54,7 @@ func TestJobRuns_RetrievingFromDBWithData(t *testing.T) {
 	assert.JSONEq(t, data, run.Result.Data.String())
 }
 
-func TestJobRuns_SavesASyncEvent(t *testing.T) {
+func TestJobRun_SavesASyncEvent(t *testing.T) {
 	t.Parallel()
 	config, _ := cltest.NewConfig(t)
 	config.Set("EXPLORER_URL", "http://localhost:4201")
@@ -93,7 +93,7 @@ func TestJobRuns_SavesASyncEvent(t *testing.T) {
 	assert.Contains(t, data, "status")
 }
 
-func TestJobRuns_SkipsEventSaveIfURLBlank(t *testing.T) {
+func TestJobRun_SkipsEventSaveIfURLBlank(t *testing.T) {
 	t.Parallel()
 	config, _ := cltest.NewConfig(t)
 	config.Set("EXPLORER_URL", "")
@@ -120,7 +120,7 @@ func TestJobRuns_SkipsEventSaveIfURLBlank(t *testing.T) {
 	require.Len(t, events, 0)
 }
 
-func TestForLogger(t *testing.T) {
+func TestJobRun_ForLogger(t *testing.T) {
 	t.Parallel()
 	store, cleanup := cltest.NewStore(t)
 	defer cleanup()
@@ -164,4 +164,61 @@ func TestForLogger(t *testing.T) {
 	logsWithErr := jrErr.ForLogger()
 	assert.Equal(t, logsWithErr[6], "job_error")
 	assert.Equal(t, logsWithErr[7], jrErr.Result.Error())
+}
+
+func TestJobRun_ApplyResult(t *testing.T) {
+	t.Parallel()
+
+	job := cltest.NewJobWithWebInitiator()
+	jobRun := job.NewRun(job.Initiators[0])
+
+	result := models.RunResult{Data: cltest.JSONFromString(t, `{"a": "x"}`)}
+	err := jobRun.ApplyResult(result)
+	assert.NoError(t, err)
+	assert.JSONEq(t, `{"a": "x"}`, jobRun.Result.Data.String())
+	assert.Equal(t, models.RunStatusUnstarted, jobRun.Status)
+	assert.Equal(t, models.RunStatusUnstarted, jobRun.Result.Status)
+	assert.False(t, jobRun.FinishedAt.Valid)
+
+	result = models.RunResult{Data: cltest.JSONFromString(t, `{"b": "y"}`), Status: models.RunStatusInProgress}
+	err = jobRun.ApplyResult(result)
+	assert.NoError(t, err)
+	assert.JSONEq(t, `{"a": "x", "b": "y"}`, jobRun.Result.Data.String())
+	assert.Equal(t, models.RunStatusInProgress, jobRun.Status)
+	assert.Equal(t, models.RunStatusInProgress, jobRun.Result.Status)
+	assert.False(t, jobRun.FinishedAt.Valid)
+
+	result = models.RunResult{Data: cltest.JSONFromString(t, `{"b": "8"}`), Status: models.RunStatusCompleted}
+	err = jobRun.ApplyResult(result)
+	assert.NoError(t, err)
+	assert.JSONEq(t, `{"a": "x", "b": "8"}`, jobRun.Result.Data.String())
+	assert.Equal(t, models.RunStatusCompleted, jobRun.Status)
+	assert.Equal(t, models.RunStatusCompleted, jobRun.Result.Status)
+	assert.True(t, jobRun.FinishedAt.Valid)
+}
+
+// XXX: This is infallible
+//func TestJobRun_ApplyResult_ErrorsWhenApplyingToErroredRun(t *testing.T) {
+//t.Parallel()
+
+//job := cltest.NewJobWithWebInitiator()
+//jobRun := job.NewRun(job.Initiators[0])
+//jobRun.Result.Status = models.RunStatusErrored
+
+//result := models.RunResult{}
+//err := jobRun.ApplyResult(result)
+//assert.Error(t, err)
+//}
+
+func TestJobRun_ApplyResult_ErrorSetsFinishedAt(t *testing.T) {
+	t.Parallel()
+
+	job := cltest.NewJobWithWebInitiator()
+	jobRun := job.NewRun(job.Initiators[0])
+	jobRun.Status = models.RunStatusErrored
+
+	result := models.RunResult{Status: models.RunStatusErrored}
+	err := jobRun.ApplyResult(result)
+	assert.NoError(t, err)
+	assert.True(t, jobRun.FinishedAt.Valid)
 }
