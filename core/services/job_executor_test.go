@@ -77,6 +77,7 @@ func TestJobExecutor_Execute_RunNotRunnableError(t *testing.T) {
 	require.Error(t, err)
 }
 
+// FIXME: need to test this somewhere more appropriate
 //func TestJobRunner_executeRun_correctlyAddsLinkEarnings(t *testing.T) {
 //store, cleanup := cltest.NewStore(t)
 //defer cleanup()

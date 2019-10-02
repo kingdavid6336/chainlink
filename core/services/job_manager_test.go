@@ -344,6 +344,39 @@ func TestJobManager_ExecuteJobWithRunRequest_fromRunLog_ConnectToLaggingEthNode(
 	assert.True(t, eth.AllCalled(), eth.Remaining())
 }
 
+func TestJobManager_ResumeConfirmingTasks(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		status models.RunStatus
+	}{
+		{models.RunStatusPendingConnection},
+		{models.RunStatusPendingConfirmations},
+	}
+
+	for _, test := range tests {
+		t.Run(string(test.status), func(t *testing.T) {
+			store, cleanup := cltest.NewStore(t)
+			defer cleanup()
+
+			job := cltest.NewJobWithWebInitiator()
+			require.NoError(t, store.CreateJob(&job))
+			initr := job.Initiators[0]
+			run := job.NewRun(initr)
+			run.ApplyResult(models.RunResult{Status: test.status})
+			require.NoError(t, store.CreateJobRun(&run))
+
+			jobRunner := new(mocks.JobRunner)
+			jobRunner.On("Run", mock.Anything).Return(nil)
+
+			jobManager := services.NewJobManager(jobRunner, store.Config, store.ORM, store.TxManager, store.Clock)
+			jobManager.ResumeConfirmingTasks(big.NewInt(3821))
+
+			jobRunner.AssertExpectations(t)
+		})
+	}
+}
+
 func TestJobManager_ResumeInProgressTasks(t *testing.T) {
 	t.Parallel()
 
