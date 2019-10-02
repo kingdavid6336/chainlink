@@ -190,8 +190,10 @@ func (le InitiatorLogEvent) ForLogger(kvs ...interface{}) []interface{} {
 // ToDebug prints this event via logger.Debug.
 func (le InitiatorLogEvent) ToDebug() {
 	friendlyAddress := utils.LogListeningAddress(le.Initiator.Address)
-	msg := fmt.Sprintf("Received log from block #%v for address %v for job %v", le.Log.BlockNumber, friendlyAddress, le.JobSpecID.String())
-	logger.Debugw(msg, le.ForLogger()...)
+	logger.Debugw(
+		fmt.Sprintf("Received log from block #%v for address %v", le.Log.BlockNumber, friendlyAddress),
+		le.ForLogger()...,
+	)
 }
 
 // BlockNumber returns the block number for the given InitiatorSubscriptionLogEvent.

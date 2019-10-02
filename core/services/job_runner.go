@@ -76,10 +76,6 @@ func (jr *jobRunner) Stop() {
 
 // Run tells the job runner to start executing a job
 func (jr *jobRunner) Run(run *models.JobRun) error {
-	if run.Status.PendingSleep() {
-		return jr.queueSleepingTask(run)
-	}
-
 	jr.runChannel <- run.ID.String()
 	return nil
 }

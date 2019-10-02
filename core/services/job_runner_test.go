@@ -33,5 +33,7 @@ func TestJobRunner(t *testing.T) {
 		<-executeJobChannel
 	})
 
+	je.AssertExpectations(t)
+
 	//assert.Equal(t, 0, jr.workerCount())
 }

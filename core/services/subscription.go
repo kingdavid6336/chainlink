@@ -121,13 +121,8 @@ func (sub InitiatorSubscription) dispatchLog(log models.Log) {
 }
 
 func loggerLogListening(initr models.Initiator, blockNumber *big.Int) {
-	msg := fmt.Sprintf(
-		"Listening for %v from block %v for address %v for job %s",
-		initr.Type,
-		presenters.FriendlyBigInt(blockNumber),
-		utils.LogListeningAddress(initr.Address),
-		initr.JobSpecID.String())
-	logger.Infow(msg)
+	msg := fmt.Sprintf("Listening for %v from block %v", initr.Type, presenters.FriendlyBigInt(blockNumber))
+	logger.Infow(msg, "address", utils.LogListeningAddress(initr.Address), "jobID", initr.JobSpecID.String())
 }
 
 // ReceiveLogRequest parses the log and runs the job indicated by a RunLog or
