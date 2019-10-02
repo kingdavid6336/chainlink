@@ -370,15 +370,10 @@ func ResumePendingTask(run *models.JobRun, input models.RunResult) error {
 // ie. tries to run a job.
 // https://github.com/smartcontractkit/chainlink/pull/807
 func (jm *jobManager) ResumeInProgressTasks() error {
-	// Do all querying of run statuses since last shutdown before enqueuing
-	// runs in progress and asleep, to prevent the following race condition:
-	// 1. resume sleep, 2. awake from sleep, 3. in progress, 4. resume in progress (double enqueued).
 	return jm.orm.UnscopedJobRunsWithStatus(func(run *models.JobRun) {
-
 		if err := jm.jobRunner.Run(run); err != nil {
 			logger.Errorw("Error resuming job run", "error", err, "run", run.ID.String())
 		}
-
 	}, models.RunStatusInProgress, models.RunStatusPendingSleep)
 }
 

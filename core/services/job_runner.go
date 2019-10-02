@@ -17,7 +17,7 @@ type JobRunner interface {
 	Stop()
 	Run(*models.JobRun) error
 
-	workerCount() int
+	WorkerCount() int
 }
 
 type jobRunner struct {
@@ -139,7 +139,7 @@ func (jr *jobRunner) workerLoop(runID *models.ID, workerChannel chan struct{}) {
 	}
 }
 
-func (jr *jobRunner) workerCount() int {
+func (jr *jobRunner) WorkerCount() int {
 	jr.workerMutex.RLock()
 	defer jr.workerMutex.RUnlock()
 

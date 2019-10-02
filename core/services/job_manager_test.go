@@ -1,7 +1,6 @@
 package services_test
 
 import (
-	"fmt"
 	"math/big"
 	"testing"
 	"time"
@@ -9,13 +8,15 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/smartcontractkit/chainlink/core/adapters"
 	"github.com/smartcontractkit/chainlink/core/internal/cltest"
+	"github.com/smartcontractkit/chainlink/core/internal/mocks"
 	clnull "github.com/smartcontractkit/chainlink/core/null"
 	"github.com/smartcontractkit/chainlink/core/services"
 	"github.com/smartcontractkit/chainlink/core/store/models"
-	"github.com/smartcontractkit/chainlink/core/utils"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 	"github.com/tidwall/gjson"
+	"gopkg.in/guregu/null.v3"
 )
 
 func TestJobManager_ResumePendingTask(t *testing.T) {
@@ -344,38 +345,140 @@ func TestJobManager_ExecuteJobWithRunRequest_fromRunLog_ConnectToLaggingEthNode(
 }
 
 func TestJobManager_ResumeInProgressTasks(t *testing.T) {
-	store, cleanup := cltest.NewStore(t)
-	defer cleanup()
+	t.Parallel()
 
-	//jr := new(mocks.JobRunner)
+	tests := []struct {
+		status models.RunStatus
+	}{
+		{models.RunStatusInProgress},
+		{models.RunStatusPendingSleep},
+	}
 
-	j := models.NewJob()
-	i := models.Initiator{Type: models.InitiatorWeb}
-	j.Initiators = []models.Initiator{i}
-	json := fmt.Sprintf(`{"until":"%v"}`, utils.ISO8601UTC(time.Now().Add(time.Second)))
-	j.Tasks = []models.TaskSpec{cltest.NewTask(t, "sleep", json)}
-	assert.NoError(t, store.CreateJob(&j))
+	for _, test := range tests {
+		t.Run(string(test.status), func(t *testing.T) {
+			store, cleanup := cltest.NewStore(t)
+			defer cleanup()
 
-	sleepingRun := j.NewRun(i)
-	sleepingRun.Status = models.RunStatusPendingSleep
-	sleepingRun.TaskRuns[0].Status = models.RunStatusPendingSleep
-	assert.NoError(t, store.CreateJobRun(&sleepingRun))
+			job := cltest.NewJobWithWebInitiator()
+			require.NoError(t, store.CreateJob(&job))
+			initr := job.Initiators[0]
+			run := job.NewRun(initr)
+			run.ApplyResult(models.RunResult{Status: test.status})
+			require.NoError(t, store.CreateJobRun(&run))
 
-	inProgressRun := j.NewRun(i)
-	inProgressRun.Status = models.RunStatusInProgress
-	assert.NoError(t, store.CreateJobRun(&inProgressRun))
+			jobRunner := new(mocks.JobRunner)
+			jobRunner.On("Run", mock.Anything).Return(nil)
 
-	//assert.NoError(t, services.ExportedResumeRunsSinceLastShutdown(rm))
-	//messages := []*models.ID{}
+			jobManager := services.NewJobManager(jobRunner, store.Config, store.ORM, store.TxManager, store.Clock)
+			jobManager.ResumeInProgressTasks()
 
-	//rr, open := <-store.RunChannel.Receive()
-	//assert.True(t, open)
-	//messages = append(messages, rr.ID)
+			jobRunner.AssertExpectations(t)
+		})
+	}
+}
 
-	//rr, open = <-store.RunChannel.Receive()
-	//assert.True(t, open)
-	//messages = append(messages, rr.ID)
+// XXX: In progress tasks that are archived should still be run as they have been paid for
+func TestJobManager_ResumeInProgressTasks_Archived(t *testing.T) {
+	t.Parallel()
 
-	//expectedMessages := []*models.ID{sleepingRun.ID, inProgressRun.ID}
-	//assert.ElementsMatch(t, expectedMessages, messages)
+	tests := []struct {
+		status models.RunStatus
+	}{
+		{models.RunStatusInProgress},
+		{models.RunStatusPendingSleep},
+	}
+
+	for _, test := range tests {
+		t.Run(string(test.status), func(t *testing.T) {
+			store, cleanup := cltest.NewStore(t)
+			defer cleanup()
+
+			job := cltest.NewJobWithWebInitiator()
+			require.NoError(t, store.CreateJob(&job))
+			initr := job.Initiators[0]
+			run := job.NewRun(initr)
+			run.ApplyResult(models.RunResult{Status: test.status})
+			run.DeletedAt = null.TimeFrom(time.Now())
+			require.NoError(t, store.CreateJobRun(&run))
+
+			jobRunner := new(mocks.JobRunner)
+			jobRunner.On("Run", mock.Anything).Return(nil)
+
+			jobManager := services.NewJobManager(jobRunner, store.Config, store.ORM, store.TxManager, store.Clock)
+			jobManager.ResumeInProgressTasks()
+
+			jobRunner.AssertExpectations(t)
+		})
+	}
+}
+
+func TestJobManager_ResumeInProgressTasks_NotInProgress(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		status models.RunStatus
+	}{
+		{models.RunStatusPendingConnection},
+		{models.RunStatusPendingConfirmations},
+		{models.RunStatusPendingBridge},
+		{models.RunStatusCompleted},
+		{models.RunStatusCancelled},
+	}
+
+	for _, test := range tests {
+		t.Run(string(test.status), func(t *testing.T) {
+			store, cleanup := cltest.NewStore(t)
+			defer cleanup()
+
+			job := cltest.NewJobWithWebInitiator()
+			require.NoError(t, store.CreateJob(&job))
+			initr := job.Initiators[0]
+			run := job.NewRun(initr)
+			run.ApplyResult(models.RunResult{Status: test.status})
+			require.NoError(t, store.CreateJobRun(&run))
+
+			jobRunner := new(mocks.JobRunner)
+
+			jobManager := services.NewJobManager(jobRunner, store.Config, store.ORM, store.TxManager, store.Clock)
+			jobManager.ResumeInProgressTasks()
+
+			jobRunner.AssertExpectations(t)
+		})
+	}
+}
+
+func TestJobManager_ResumeInProgressTasks_NotInProgressAndArchived(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		status models.RunStatus
+	}{
+		{models.RunStatusPendingConnection},
+		{models.RunStatusPendingConfirmations},
+		{models.RunStatusPendingBridge},
+		{models.RunStatusCompleted},
+		{models.RunStatusCancelled},
+	}
+
+	for _, test := range tests {
+		t.Run(string(test.status), func(t *testing.T) {
+			store, cleanup := cltest.NewStore(t)
+			defer cleanup()
+
+			job := cltest.NewJobWithWebInitiator()
+			require.NoError(t, store.CreateJob(&job))
+			initr := job.Initiators[0]
+			run := job.NewRun(initr)
+			run.ApplyResult(models.RunResult{Status: test.status})
+			run.DeletedAt = null.TimeFrom(time.Now())
+			require.NoError(t, store.CreateJobRun(&run))
+
+			jobRunner := new(mocks.JobRunner)
+
+			jobManager := services.NewJobManager(jobRunner, store.Config, store.ORM, store.TxManager, store.Clock)
+			jobManager.ResumeInProgressTasks()
+
+			jobRunner.AssertExpectations(t)
+		})
+	}
 }
