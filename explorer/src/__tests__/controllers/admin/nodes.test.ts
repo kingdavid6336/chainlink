@@ -1,4 +1,3 @@
-import request from 'supertest'
 import http from 'http'
 import httpStatus from 'http-status-codes'
 import { Connection } from 'typeorm'
@@ -11,9 +10,9 @@ import {
 } from '../../../entity/ChainlinkNode'
 import { start as testServer } from '../../../support/server'
 import {
-  ADMIN_USERNAME_HEADER,
-  ADMIN_PASSWORD_HEADER,
-} from '../../../utils/constants'
+  sendAdminAuthPost,
+  sendAdminAuthDelete,
+} from '../../../support/supertest'
 
 const USERNAME = 'myadmin'
 const PASSWORD = 'validpassword'
@@ -38,34 +37,11 @@ beforeEach(async () => {
   await createAdmin(db, USERNAME, PASSWORD)
 })
 
-function sendPost(
-  path: string,
-  data: object,
-  username: string,
-  password: string,
-) {
-  return request(server)
-    .post(adminNodesPath)
-    .send(data)
-    .set('Accept', 'application/json')
-    .set('Content-Type', 'application/json')
-    .set(ADMIN_USERNAME_HEADER, username)
-    .set(ADMIN_PASSWORD_HEADER, password)
-}
-
-function sendDelete(path: string, username: string, password: string) {
-  return request(server)
-    .delete(path)
-    .set('Content-Type', 'application/json')
-    .set(ADMIN_USERNAME_HEADER, username)
-    .set(ADMIN_PASSWORD_HEADER, password)
-}
-
 describe('POST /nodes', () => {
   it('can create a node and returns the generated information', done => {
     const data = { name: 'nodeA', url: 'http://nodea.com' }
 
-    sendPost(adminNodesPath, data, USERNAME, PASSWORD)
+    sendAdminAuthPost(server, adminNodesPath, data, USERNAME, PASSWORD)
       .expect(httpStatus.CREATED)
       .expect(res => {
         expect(res.body.id).toBeDefined()
@@ -78,7 +54,7 @@ describe('POST /nodes', () => {
   it('returns an error with invalid params', done => {
     const data = { url: 'http://nodea.com' }
 
-    sendPost(adminNodesPath, data, USERNAME, PASSWORD)
+    sendAdminAuthPost(server, adminNodesPath, data, USERNAME, PASSWORD)
       .expect(httpStatus.UNPROCESSABLE_ENTITY)
       .expect(res => {
         const errors = res.body.errors
@@ -95,13 +71,13 @@ describe('POST /nodes', () => {
     const [node] = await createChainlinkNode(db, 'nodeA')
     const data = { name: node.name }
 
-    sendPost(adminNodesPath, data, USERNAME, PASSWORD)
+    sendAdminAuthPost(server, adminNodesPath, data, USERNAME, PASSWORD)
       .expect(httpStatus.CONFLICT)
       .end(done)
   })
 
   it('returns a 401 unauthorized with invalid admin credentials', done => {
-    sendPost(adminNodesPath, {}, USERNAME, 'invalidpassword')
+    sendAdminAuthPost(server, adminNodesPath, {}, USERNAME, 'invalidpassword')
       .expect(httpStatus.UNAUTHORIZED)
       .end(done)
   })
@@ -115,7 +91,7 @@ describe('DELETE /nodes/:name', () => {
   it('can delete a node', async done => {
     const [node] = await createChainlinkNode(db, 'nodeA')
 
-    sendDelete(path(node.name), USERNAME, PASSWORD)
+    sendAdminAuthDelete(server, path(node.name), {}, USERNAME, PASSWORD)
       .expect(httpStatus.OK)
       .expect(async () => {
         const nodeAfter = await findNode(db, node.id)
@@ -125,7 +101,13 @@ describe('DELETE /nodes/:name', () => {
   })
 
   it('returns a 401 unauthorized with invalid admin credentials', done => {
-    sendDelete(path('idontexist'), USERNAME, 'invalidpassword')
+    sendAdminAuthDelete(
+      server,
+      path('idontexist'),
+      {},
+      USERNAME,
+      'invalidpassword',
+    )
       .expect(httpStatus.UNAUTHORIZED)
       .end(done)
   })
