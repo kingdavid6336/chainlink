@@ -119,3 +119,7 @@ export function hashCredentials(
 export async function find(db: Connection, id: number): Promise<ChainlinkNode> {
   return db.getRepository(ChainlinkNode).findOne({ id })
 }
+
+export async function all(db: Connection): Promise<ChainlinkNode[]> {
+  return db.getRepository(ChainlinkNode).find()
+}
