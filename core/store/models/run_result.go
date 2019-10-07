@@ -67,19 +67,14 @@ func (rr *RunResult) SetError(err error) {
 	rr.Status = RunStatusErrored
 }
 
-// MarkPendingBridge sets the status to pending_bridge
-func (rr *RunResult) MarkPendingBridge() {
-	rr.Status = RunStatusPendingBridge
-}
-
 // MarkPendingConfirmations sets the status to pending_confirmations.
 func (rr *RunResult) MarkPendingConfirmations() {
 	rr.Status = RunStatusPendingConfirmations
 }
 
-// MarkPendingConnection sets the status to pending_connection.
-func (rr *RunResult) MarkPendingConnection() {
-	rr.Status = RunStatusPendingConnection
+// RunResultPendingConnection returns a run result with pending connection status
+func RunResultPendingConnection() RunResult {
+	return RunResult{Status: RunStatusPendingConnection}
 }
 
 // Get searches for and returns the JSON at the given path.

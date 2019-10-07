@@ -39,10 +39,7 @@ type EthTx struct {
 // the blockchain.
 func (etx *EthTx) Perform(input models.RunResult, store *strpkg.Store) models.RunResult {
 	if !store.TxManager.Connected() {
-		var output models.RunResult
-		// output.Data = input.Data
-		output.MarkPendingConnection()
-		return output
+		return models.RunResultPendingConnection()
 	}
 
 	if !input.Status.PendingConfirmations() {
@@ -97,9 +94,7 @@ func createTxRunResult(
 		gasLimit,
 	)
 	if IsClientRetriable(err) {
-		var output models.RunResult
-		output.MarkPendingConnection()
-		return output
+		return models.RunResultPendingConnection()
 	} else if err != nil {
 		return models.RunResultError(err)
 	}
@@ -111,8 +106,7 @@ func createTxRunResult(
 
 	receipt, state, err := store.TxManager.CheckAttempt(txAttempt, tx.SentAt)
 	if IsClientRetriable(err) {
-		output.MarkPendingConnection()
-		return output
+		return models.RunResultPendingConnection()
 	} else if IsClientEmptyError(err) {
 		output.MarkPendingConfirmations()
 		return output

@@ -66,9 +66,9 @@ func (etx *EthTxABIEncode) UnmarshalJSON(data []byte) error {
 func (etx *EthTxABIEncode) Perform(
 	input models.RunResult, store *strpkg.Store) models.RunResult {
 	if !store.TxManager.Connected() {
-		input.MarkPendingConnection()
-		return input
+		return models.RunResultPendingConnection()
 	}
+
 	if !input.Status.PendingConfirmations() {
 		data, err := etx.abiEncode(&input)
 		if err != nil {
