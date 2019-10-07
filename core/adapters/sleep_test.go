@@ -13,7 +13,7 @@ import (
 func TestSleep_Perform(t *testing.T) {
 	store, cleanup := cltest.NewStore(t)
 	defer cleanup()
-	clock := cltest.NewTriggerClock()
+	clock := cltest.NewTriggerClock(t)
 	store.Clock = clock
 
 	adapter := adapters.Sleep{}

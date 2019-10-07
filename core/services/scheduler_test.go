@@ -91,7 +91,7 @@ func TestOneTime_AddJob(t *testing.T) {
 			executeJobChannel <- struct{}{}
 		})
 
-	clock := cltest.NewTriggerClock()
+	clock := cltest.NewTriggerClock(t)
 
 	ot := services.OneTime{
 		Clock:      clock,

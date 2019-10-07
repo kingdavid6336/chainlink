@@ -2,6 +2,7 @@ package services_test
 
 import (
 	"testing"
+	"time"
 
 	"github.com/smartcontractkit/chainlink/core/internal/cltest"
 	"github.com/smartcontractkit/chainlink/core/internal/mocks"
@@ -89,7 +90,7 @@ func TestJobExecutor_Execute_CancelActivelyRunningTask(t *testing.T) {
 
 	store, cleanup := cltest.NewStore(t)
 	defer cleanup()
-	clock := cltest.NewTriggerClock()
+	clock := cltest.NewTriggerClock(t)
 	store.Clock = clock
 
 	je := services.NewJobExecutor(store)
