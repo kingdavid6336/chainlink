@@ -18,7 +18,7 @@ type Sleep struct {
 func (adapter *Sleep) Perform(input models.RunResult, str *store.Store) models.RunResult {
 	duration := adapter.Duration()
 	if duration > 0 {
-		logger.Debugw("Task sleeping...")
+		logger.Debugw("Task sleeping...", "duration", duration)
 		<-str.Clock.After(duration)
 	}
 
