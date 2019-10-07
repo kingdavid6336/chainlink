@@ -113,6 +113,10 @@ func TestJobExecutor_Execute_CancelActivelyRunningTask(t *testing.T) {
 		require.NoError(t, err)
 	}()
 
+	// FIXME: Can't think of a better way to do this
+	// Make sure Execute has some time to start the sleep task
+	time.Sleep(300 * time.Millisecond)
+
 	jobRunner := new(mocks.JobRunner)
 	jobManager := services.NewJobManager(jobRunner, store.Config, store.ORM, store.TxManager, clock)
 	jobManager.CancelTask(run.ID)
