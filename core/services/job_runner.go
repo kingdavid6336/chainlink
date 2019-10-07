@@ -61,7 +61,7 @@ func (jr *jobRunner) Run(run *models.JobRun) error {
 	jr.workersWg.Add(1)
 	go func() {
 		if err := jr.jobExecutor.Execute(run.ID); err != nil {
-			logger.Errorw(fmt.Sprint("Error executing run ", runID))
+			logger.Errorw(fmt.Sprint("Error executing run ", runID), "error", err)
 		}
 
 		jr.workersMutex.Lock()
