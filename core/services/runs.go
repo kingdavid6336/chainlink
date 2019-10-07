@@ -50,7 +50,6 @@ func validateMinimumConfirmations(run *models.JobRun, taskRun *models.TaskRun, c
 	} else if err := validateOnMainChain(run, taskRun, txManager); err != nil {
 		run.SetError(err)
 	} else {
-		logger.Debugw("Adding next task to job run queue", []interface{}{"run", run.ID.String(), "nextTask", taskRun.TaskSpec.Type}...)
 		run.Status = models.RunStatusInProgress
 	}
 }
@@ -128,38 +127,4 @@ func prepareTaskInput(run *models.JobRun, input models.JSON) (models.JSON, error
 		return models.JSON{}, err
 	}
 	return input, nil
-}
-
-func performTaskSleep(run *models.JobRun, task *models.TaskRun, adapter *adapters.Sleep, clock utils.AfterNower, jobExecutor *jobExecutor) error {
-	//duration := adapter.Duration()
-	//if duration <= 0 {
-	//logger.Debugw("Sleep duration has already elapsed, completing task", run.ForLogger()...)
-	//task.Status = models.RunStatusCompleted
-	//run.Status = models.RunStatusInProgress
-	//return jobRunner.Run(run)
-	//}
-
-	//// XXX: This is to eliminate data race that occurs because slices share their
-	//// underlying array even in copies
-	//runCopy := *run
-	//runCopy.TaskRuns = make([]models.TaskRun, len(run.TaskRuns))
-	//copy(runCopy.TaskRuns, run.TaskRuns)
-
-	//go func(run models.JobRun) {
-	//logger.Debugw("Task sleeping...", run.ForLogger()...)
-
-	//<-clock.After(duration)
-
-	//task := run.NextTaskRun()
-	//task.Status = models.RunStatusCompleted
-	//run.Status = models.RunStatusInProgress
-
-	//logger.Debugw("Waking job up after sleep", run.ForLogger()...)
-
-	//if err := jobRunner.updateAndTrigger(&run); err != nil {
-	//logger.Errorw("Error resuming sleeping job:", "error", err)
-	//}
-	//}(runCopy)
-
-	return nil
 }

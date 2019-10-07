@@ -111,7 +111,6 @@ func TestJobRunner_OneWorkerForSameRunTriggeredMultipleTimes(t *testing.T) {
 
 	cltest.CallbackOrTimeout(t, "Execute", func() {
 		<-executeJobChannel
-		<-executeJobChannel
 	})
 
 	je.AssertExpectations(t)

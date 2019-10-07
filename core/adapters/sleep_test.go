@@ -19,5 +19,5 @@ func TestSleep_Perform(t *testing.T) {
 	assert.NoError(t, err)
 
 	result := adapter.Perform(models.RunResult{}, store)
-	assert.Equal(t, string(models.RunStatusPendingSleep), string(result.Status))
+	assert.Equal(t, string(models.RunStatusCompleted), string(result.Status))
 }

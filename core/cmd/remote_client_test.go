@@ -99,18 +99,20 @@ func TestClient_IndexJobRuns(t *testing.T) {
 	j := cltest.NewJobWithWebInitiator()
 	assert.NoError(t, app.Store.CreateJob(&j))
 
-	jr0 := cltest.CreateJobRunViaWeb(t, app, j, `{"result":"100"}`)
-	jr1 := cltest.CreateJobRunViaWeb(t, app, j, `{"result":"105"}`)
-	jr2 := cltest.CreateJobRunViaWeb(t, app, j, `{"result":"110"}`)
+	jr0 := j.NewRun(j.Initiators[0])
+	jr0.Result.Data = cltest.JSONFromString(t, `{"a":"b"}`)
+	require.NoError(t, app.Store.CreateJobRun(&jr0))
+	jr1 := j.NewRun(j.Initiators[0])
+	jr1.Result.Data = cltest.JSONFromString(t, `{"x":"y"}`)
+	require.NoError(t, app.Store.CreateJobRun(&jr1))
 
 	client, r := app.NewClientAndRenderer()
 
 	require.Nil(t, client.IndexJobRuns(cltest.EmptyCLIContext()))
 	runs := *r.Renders[0].(*[]presenters.JobRun)
-	require.Equal(t, 3, len(runs))
-	assert.Equal(t, jr0.Result, runs[0].Result)
-	assert.Equal(t, jr1.Result, runs[1].Result)
-	assert.Equal(t, jr2.Result, runs[2].Result)
+	require.Len(t, runs, 2)
+	assert.Equal(t, jr0.Result.Data, runs[0].Result.Data)
+	assert.Equal(t, jr1.Result.Data, runs[1].Result.Data)
 }
 
 func TestClient_ShowJobSpec_Exists(t *testing.T) {

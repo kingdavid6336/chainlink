@@ -34,6 +34,14 @@ type JobRun struct {
 	Payment        *assets.Link `json:"payment,omitempty"`
 }
 
+// String implements Stringer for JobRun
+func (jr JobRun) String() string {
+	return fmt.Sprintf("JobRun(ID: %s, Result: %s, Overrides: %s)",
+		jr.ID,
+		jr.Result,
+		jr.Overrides)
+}
+
 // GetID returns the ID of this structure for jsonapi serialization.
 func (jr JobRun) GetID() string {
 	return jr.ID.String()

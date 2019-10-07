@@ -32,6 +32,14 @@ func RunResultError(err error) RunResult {
 	return result
 }
 
+// String satisfies the Stringer interface for RunResult
+func (rr RunResult) String() string {
+	return fmt.Sprintf(`RunResult(ID: %d, Status: "%s", Data: "%s")`,
+		rr.ID,
+		rr.Status,
+		rr.Data)
+}
+
 // CompleteWithResult saves a value to a RunResult and marks it as completed
 func (rr *RunResult) CompleteWithResult(val interface{}) {
 	rr.Status = RunStatusCompleted

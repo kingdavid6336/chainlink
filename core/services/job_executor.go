@@ -2,6 +2,7 @@ package services
 
 import (
 	"fmt"
+	"time"
 
 	"github.com/pkg/errors"
 	"github.com/smartcontractkit/chainlink/core/adapters"
@@ -30,44 +31,41 @@ func NewJobExecutor(store *store.Store) JobExecutor {
 
 // Execute performs the work associate with a job run
 func (je *jobExecutor) Execute(runID *models.ID) error {
-	run, err := je.store.FindJobRun(runID)
+	run, err := je.store.Unscoped().FindJobRun(runID)
 	if err != nil {
 		return fmt.Errorf("Error finding run %s", runID.String())
 	}
-
-	logger.Infow("Processing run", run.ForLogger()...)
 
 	if !run.Status.Runnable() {
 		return fmt.Errorf("Run triggered in non runnable state %s", run.Status)
 	}
 
-	currentTaskRun := run.NextTaskRun()
-	if currentTaskRun == nil {
-		return errors.New("Run triggered with no remaining tasks")
-	}
+	for run.Status.Runnable() {
+		currentTaskRun := run.NextTaskRun()
+		if currentTaskRun == nil {
+			return errors.New("Run triggered with no remaining tasks")
+		}
 
-	result := je.executeTask(&run, currentTaskRun)
+		result := je.executeTask(&run, currentTaskRun)
 
-	currentTaskRun.ApplyResult(result)
-	run.ApplyResult(result)
+		currentTaskRun.ApplyResult(result)
+		run.ApplyResult(result)
 
-	if currentTaskRun.Status.PendingSleep() {
-		logger.Debugw("Task is sleeping", []interface{}{"run", run.ID}...)
-	} else if !currentTaskRun.Status.Runnable() {
-		logger.Debugw("Task execution blocked", []interface{}{"run", run.ID, "task", currentTaskRun.ID, "state", currentTaskRun.Result.Status}...)
-	} else if currentTaskRun.Status.Unstarted() {
-		return fmt.Errorf("run %s task %s cannot return a status of empty string or Unstarted", run.ID, currentTaskRun.TaskSpec.Type)
-	} else if futureTaskRun := run.NextTaskRun(); futureTaskRun != nil {
-		validateMinimumConfirmations(&run, futureTaskRun, run.ObservedHeight, je.store.TxManager)
-	}
+		if !currentTaskRun.Status.Runnable() {
+			logger.Debugw("Task execution blocked", []interface{}{"run", run.ID, "task", currentTaskRun.ID, "state", currentTaskRun.Result.Status}...)
+		} else if currentTaskRun.Status.Unstarted() {
+			return fmt.Errorf("run %s task %s cannot return a status of empty string or Unstarted", run.ID, currentTaskRun.TaskSpec.Type)
+		} else if futureTaskRun := run.NextTaskRun(); futureTaskRun != nil {
+			validateMinimumConfirmations(&run, futureTaskRun, run.ObservedHeight, je.store.TxManager)
+		}
 
-	if err := je.store.ORM.SaveJobRun(&run); err != nil {
-		return err
-	}
-	logger.Infow("Run finished processing", run.ForLogger()...)
+		if err := je.store.ORM.SaveJobRun(&run); err != nil {
+			return err
+		}
 
-	if run.Status.Finished() {
-		logger.Debugw("All tasks complete for run", run.ForLogger()...)
+		if run.Status.Finished() {
+			logger.Debugw("All tasks complete for run", run.ForLogger()...)
+		}
 	}
 
 	return nil
@@ -88,8 +86,7 @@ func (je *jobExecutor) executeTask(run *models.JobRun, currentTaskRun *models.Ta
 		return currentTaskRun.Result
 	}
 
-	logger.Infow(fmt.Sprintf("Processing task %s", taskCopy.Type), []interface{}{"task", currentTaskRun.ID}...)
-
+	start := time.Now()
 	data, err := prepareTaskInput(run, currentTaskRun.Result.Data)
 	if err != nil {
 		currentTaskRun.Result.SetError(err)
@@ -98,39 +95,15 @@ func (je *jobExecutor) executeTask(run *models.JobRun, currentTaskRun *models.Ta
 
 	currentTaskRun.Result.CachedJobRunID = run.ID
 	currentTaskRun.Result.Data = data
+
 	result := adapter.Perform(currentTaskRun.Result, je.store)
 
-	logger.Infow(fmt.Sprintf("Finished processing task %s", taskCopy.Type), []interface{}{
+	logger.Debugw(fmt.Sprintf("Executed task %s", taskCopy.Type), []interface{}{
 		"task", currentTaskRun.ID,
 		"result", result.Status,
 		"result_data", result.Data,
+		"elapsed", time.Since(start).Seconds(),
 	}...)
 
 	return result
-}
-
-// QueueSleepingTask creates a go routine which will wake up the job runner
-// once the sleep's time has elapsed
-func (je *jobExecutor) queueSleepingTask(run *models.JobRun) error {
-	currentTaskRun := run.NextTaskRun()
-	if currentTaskRun == nil {
-		return fmt.Errorf("Attempting to resume sleeping run with no remaining tasks %s", run.ID)
-	}
-
-	if !currentTaskRun.Status.PendingSleep() {
-		return fmt.Errorf("Attempting to resume sleeping run with non sleeping task %s", run.ID)
-	}
-
-	//adapter, err := prepareAdapter(currentTaskRun, run.Overrides.Data, je.store.Config, je.store.ORM)
-	//if err != nil {
-	//currentTaskRun.SetError(err)
-	//run.SetError(err)
-	//return je.store.SaveJobRun(run)
-	//}
-
-	//if sleepAdapter, ok := adapter.BaseAdapter.(*adapters.Sleep); ok {
-	//return performTaskSleep(run, currentTaskRun, sleepAdapter, je.store.Clock, je)
-	//}
-
-	return fmt.Errorf("Attempting to resume non sleeping task for run %s (%s)", run.ID, currentTaskRun.TaskSpec.Type)
 }

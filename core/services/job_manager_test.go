@@ -84,7 +84,11 @@ func TestJobManager_ResumeConfirmingTask(t *testing.T) {
 	defer cleanup()
 
 	// reject a run with no tasks
-	run := &models.JobRun{Status: models.RunStatusPendingConfirmations}
+	run := &models.JobRun{
+		ID:        models.NewID(),
+		JobSpecID: models.NewID(),
+		Status:    models.RunStatusPendingConfirmations,
+	}
 	err := services.ResumeConfirmingTask(run, nil, store.TxManager)
 	assert.Error(t, err)
 
@@ -92,6 +96,7 @@ func TestJobManager_ResumeConfirmingTask(t *testing.T) {
 	creationHeight := models.NewBig(big.NewInt(0))
 	run = &models.JobRun{
 		ID:             models.NewID(),
+		JobSpecID:      models.NewID(),
 		CreationHeight: creationHeight,
 		Status:         models.RunStatusPendingConfirmations,
 		TaskRuns: []models.TaskRun{models.TaskRun{
@@ -110,6 +115,7 @@ func TestJobManager_ResumeConfirmingTask(t *testing.T) {
 	// input, should go from pending -> in progress and save the input
 	run = &models.JobRun{
 		ID:             models.NewID(),
+		JobSpecID:      models.NewID(),
 		CreationHeight: creationHeight,
 		Status:         models.RunStatusPendingConfirmations,
 		TaskRuns: []models.TaskRun{models.TaskRun{

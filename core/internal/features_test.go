@@ -755,8 +755,8 @@ func TestIntegration_SleepAdapter(t *testing.T) {
 	runInput := fmt.Sprintf("{\"until\": \"%s\"}", time.Now().Local().Add(time.Second*time.Duration(sleepSeconds)))
 	jr := cltest.CreateJobRunViaWeb(t, app, j, runInput)
 
-	cltest.WaitForJobRunToPendSleep(t, app.Store, jr)
-	cltest.JobRunStays(t, app.Store, jr, models.RunStatusPendingSleep, time.Second)
+	cltest.WaitForJobRunStatus(t, app.Store, jr, models.RunStatusInProgress)
+	cltest.JobRunStays(t, app.Store, jr, models.RunStatusInProgress, time.Second)
 	cltest.WaitForJobRunToComplete(t, app.Store, jr)
 }
 

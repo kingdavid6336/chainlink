@@ -35,10 +35,10 @@ func TestJobExecutor_Execute(t *testing.T) {
 
 	run, err = store.FindJobRun(run.ID)
 	require.NoError(t, err)
-	assert.Equal(t, models.RunStatusInProgress, run.Status)
+	assert.Equal(t, models.RunStatusPendingConfirmations, run.Status)
 	require.Len(t, run.TaskRuns, 2)
 	assert.Equal(t, models.RunStatusCompleted, run.TaskRuns[0].Status)
-	assert.Equal(t, models.RunStatusUnstarted, run.TaskRuns[1].Status)
+	assert.Equal(t, models.RunStatusPendingConfirmations, run.TaskRuns[1].Status)
 }
 
 func TestJobExecutor_Execute_RunNotFoundError(t *testing.T) {

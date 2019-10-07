@@ -58,12 +58,6 @@ type jobManager struct {
 	txManager store.TxManager
 	config    orm.ConfigReader
 	clock     utils.AfterNower
-	updates   chan *runUpdate
-}
-
-type runUpdate struct {
-	run    *models.JobRun
-	result chan error
 }
 
 // NewRun returns a run from an input job, in an initial state ready for
@@ -173,16 +167,13 @@ func NewRun(
 
 // NewJobManager returns a new job manager
 func NewJobManager(jobRunner JobRunner, config orm.ConfigReader, orm *orm.ORM, txManager store.TxManager, clock utils.AfterNower) JobManager {
-	jm := &jobManager{
+	return &jobManager{
 		orm:       orm,
 		jobRunner: jobRunner,
 		txManager: txManager,
 		config:    config,
 		clock:     clock,
-		updates:   make(chan *runUpdate),
 	}
-	go jm.run()
-	return jm
 }
 
 // ExecuteJob immediately sends a new job to the JobRunner for execution
@@ -253,18 +244,18 @@ func (jm *jobManager) ExecuteJobWithRunRequest(
 // waiting for block confirmations.
 func (jm *jobManager) ResumeConfirmingTasks(currentBlockHeight *big.Int) error {
 	return jm.orm.UnscopedJobRunsWithStatus(func(run *models.JobRun) {
-		logger.Debugw("New head resuming run", run.ForLogger()...)
 		err := ResumeConfirmingTask(run, currentBlockHeight, jm.txManager)
 		if err != nil {
 			logger.Error(err)
+			return
 		}
 
 		jm.updateAndTrigger(run)
 	}, models.RunStatusPendingConnection, models.RunStatusPendingConfirmations)
 }
 
-// ResumeConfirmingTasks wakes up a task that was sleeping because it is
-// waiting for block confirmations.
+// ResumeConfirmingTask wakes up a task that was sleeping because it is waiting
+// for block confirmations.
 func ResumeConfirmingTask(run *models.JobRun, currentBlockHeight *big.Int, txManager store.TxManager) error {
 	currentTaskRun := run.NextTaskRun()
 	if currentTaskRun == nil {
@@ -272,6 +263,7 @@ func ResumeConfirmingTask(run *models.JobRun, currentBlockHeight *big.Int, txMan
 	}
 
 	run.ObservedHeight = models.NewBig(currentBlockHeight)
+	logger.Debugw(fmt.Sprintf("New head #%s resuming run", currentBlockHeight), run.ForLogger()...)
 
 	validateMinimumConfirmations(run, currentTaskRun, run.ObservedHeight, txManager)
 	return nil
@@ -398,24 +390,12 @@ func (jm *jobManager) CancelTask(runID *models.ID) error {
 	return jm.orm.SaveJobRun(&run)
 }
 
-func (jm *jobManager) run() {
-	for {
-		select {
-		case update := <-jm.updates:
-			if err := jm.orm.SaveJobRun(update.run); err != nil {
-				update.result <- err
-				continue
-			}
-			update.result <- jm.jobRunner.Run(update.run)
-		}
-	}
-}
-
 func (jm *jobManager) updateAndTrigger(run *models.JobRun) error {
-	update := &runUpdate{
-		run:    run,
-		result: make(chan error),
+	if err := jm.orm.SaveJobRun(run); err != nil {
+		return err
 	}
-	jm.updates <- update
-	return <-update.result
+	if run.Status == models.RunStatusInProgress {
+		return jm.jobRunner.Run(run)
+	}
+	return nil
 }
