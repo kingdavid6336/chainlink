@@ -9,6 +9,7 @@ import (
 	"github.com/smartcontractkit/chainlink/core/logger"
 	"github.com/smartcontractkit/chainlink/core/store"
 	"github.com/smartcontractkit/chainlink/core/store/models"
+	"github.com/smartcontractkit/chainlink/core/store/orm"
 )
 
 //go:generate mockery -name JobExecutor -output ../internal/mocks/ -case=underscore
@@ -59,7 +60,9 @@ func (je *jobExecutor) Execute(runID *models.ID) error {
 			validateMinimumConfirmations(&run, futureTaskRun, run.ObservedHeight, je.store.TxManager)
 		}
 
-		if err := je.store.ORM.SaveJobRun(&run); err != nil {
+		if err := je.store.ORM.SaveJobRun(&run); errors.Cause(err) == orm.OptimisticUpdateConflictError {
+			return nil
+		} else if err != nil {
 			return err
 		}
 

@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"github.com/smartcontractkit/chainlink/core/internal/cltest"
+	"github.com/smartcontractkit/chainlink/core/internal/mocks"
 	"github.com/smartcontractkit/chainlink/core/services"
 	"github.com/smartcontractkit/chainlink/core/store/assets"
 	"github.com/smartcontractkit/chainlink/core/store/models"
@@ -81,4 +82,51 @@ func TestJobExecutor_Execute_RunNotRunnableError(t *testing.T) {
 
 	err := je.Execute(run.ID)
 	require.Error(t, err)
+}
+
+func TestJobExecutor_Execute_CancelActivelyRunningTask(t *testing.T) {
+	t.Parallel()
+
+	store, cleanup := cltest.NewStore(t)
+	defer cleanup()
+	clock := cltest.NewTriggerClock()
+	store.Clock = clock
+
+	je := services.NewJobExecutor(store)
+
+	j := models.NewJob()
+	i := models.Initiator{Type: models.InitiatorWeb}
+	j.Initiators = []models.Initiator{i}
+	j.Tasks = []models.TaskSpec{
+		cltest.NewTask(t, "sleep", `{"until": 2147483647}`),
+		cltest.NewTask(t, "noop"),
+	}
+	assert.NoError(t, store.CreateJob(&j))
+
+	run := j.NewRun(i)
+	run.Payment = assets.NewLink(19238)
+	require.NoError(t, store.CreateJobRun(&run))
+
+	go func() {
+		err := je.Execute(run.ID)
+		require.NoError(t, err)
+	}()
+
+	jobRunner := new(mocks.JobRunner)
+	jobManager := services.NewJobManager(jobRunner, store.Config, store.ORM, store.TxManager, clock)
+	jobManager.CancelTask(run.ID)
+
+	clock.Trigger()
+
+	run, err := store.FindJobRun(run.ID)
+	require.NoError(t, err)
+	assert.Equal(t, models.RunStatusCancelled, run.Status)
+
+	require.Len(t, run.TaskRuns, 2)
+	assert.Equal(t, models.RunStatusCancelled, run.TaskRuns[0].Status)
+	assert.Equal(t, models.RunStatusUnstarted, run.TaskRuns[1].Status)
+
+	actual, err := store.LinkEarnedFor(&j)
+	require.NoError(t, err)
+	assert.Nil(t, actual)
 }
