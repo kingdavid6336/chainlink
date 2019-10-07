@@ -67,6 +67,11 @@ func (rr *RunResult) SetError(err error) {
 	rr.Status = RunStatusErrored
 }
 
+// RunResultPendingConfirmation returns a run result with pending confirmation status
+func RunResultPendingConfirmation() RunResult {
+	return RunResult{Status: RunStatusPendingConfirmations}
+}
+
 // MarkPendingConfirmations sets the status to pending_confirmations.
 func (rr *RunResult) MarkPendingConfirmations() {
 	rr.Status = RunStatusPendingConfirmations

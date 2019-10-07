@@ -65,6 +65,7 @@ func (je *jobExecutor) Execute(runID *models.ID) error {
 
 		if run.Status.Finished() {
 			logger.Debugw("All tasks complete for run", run.ForLogger()...)
+			break
 		}
 	}
 

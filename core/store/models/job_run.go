@@ -218,9 +218,3 @@ func (tr *TaskRun) ApplyResult(result RunResult) {
 	tr.Result = result
 	tr.Status = result.Status
 }
-
-// MarkPendingConfirmations marks the task's status as blocked.
-func (tr *TaskRun) MarkPendingConfirmations() {
-	tr.Status = RunStatusPendingConfirmations
-	tr.Result.Status = RunStatusPendingConfirmations
-}
