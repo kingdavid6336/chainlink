@@ -45,7 +45,7 @@ func prepareAdapter(
 func validateMinimumConfirmations(run *models.JobRun, taskRun *models.TaskRun, currentHeight *models.Big, txManager store.TxManager) {
 	updateTaskRunConfirmations(currentHeight, run, taskRun)
 	if !meetsMinimumConfirmations(run, taskRun, run.ObservedHeight) {
-		logger.Debugw("Run cannot continue because it lacks sufficient confirmations", []interface{}{"run", run.ID.String(), "required_height", taskRun.MinimumConfirmations}...)
+		logger.Debugw("Pausing run pending confirmations", []interface{}{"run", run.ID.String(), "required_height", taskRun.MinimumConfirmations}...)
 		run.Status = models.RunStatusPendingConfirmations
 	} else if err := validateOnMainChain(run, taskRun, txManager); err != nil {
 		run.SetError(err)
