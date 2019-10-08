@@ -7,7 +7,7 @@
   "license": "MIT",
   "private": true,
   "scripts": {
-    "generate-typings": "typechain --target ethers --outDir src/generated \"build/contracts/*\"",
+    "generate-typings": "typechain --target ethers --outDir src/generated \"{build/contracts/*,../evm/v0.5/test/support/LinkTokenV05.json,../evm/v0.5/build/contracts/Coordinator.json}\"",
     "build:contracts": "truffle compile",
     "postbuild:contracts": "yarn generate-typings",
     "prebuild": "yarn build:contracts",
@@ -20,6 +20,7 @@
     "send-ethlog-transaction": "node ./dist/sendEthlogTransaction",
     "fund-address": "node ./dist/fundAddress",
     "deploy-contracts": "node ./dist/deployContracts",
+    "deploy-v0.5-contracts": "node ./dist/deployV0.5Contracts",
     "start-echo-server": "node ./dist/echoServer"
   },
   "devDependencies": {
@@ -34,13 +35,13 @@
   },
   "dependencies": {
     "body-parser": "^1.18.3",
-    "link_token": "^1.0.6",
-    "ethers": "^4.0.37",
-    "express": "^4.16.2",
-    "truffle": "^5.0.39",
     "chainlink": "0.7.5",
     "chalk": "^2.4.2",
-    "request-promise": "4.2.4"
+    "ethers": "^4.0.37",
+    "express": "^4.16.2",
+    "link_token": "^1.0.6",
+    "request-promise": "4.2.4",
+    "truffle": "^5.0.39"
   },
   "prettier": "@chainlink/prettier-config"
 }
