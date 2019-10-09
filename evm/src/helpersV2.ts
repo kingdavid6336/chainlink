@@ -346,12 +346,14 @@ export async function increaseTime5Minutes(
 function getSAABI(): FunctionFragment['outputs'] {
   const coordinatorFactory = new CoordinatorFactory()
   const { abi } = coordinatorFactory.interface
-  const saABI = abi.filter(o => o.name === 'ServiceAgreements')
+  const saABI = abi.filter(o => o.name === 'serviceAgreements')
+  if (saABI.length != 1) {
+    throw Error('Should be only one serviceAgreements attribute')
+  }
   if (!saABI) {
     throw Error('service agreement abi not found')
   }
-
-  return (saABI as any).outputs // XXX: Fix type
+  return (saABI as any)[0].outputs // XXX: Fix type
 }
 
 type Hash = ReturnType<typeof ethers.utils.keccak256>
@@ -367,8 +369,9 @@ export const calculateSAID2 = ({
   aggInitiateJobSelector,
   aggFulfillSelector,
 }: ServiceAgreement): Hash => {
+  const abi = getSAABI()
   const serviceAgreementIDInput = ethers.utils.defaultAbiCoder.encode(
-    getSAABI(),
+    abi,
     [
       payment,
       expiration,
