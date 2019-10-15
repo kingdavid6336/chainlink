@@ -28,7 +28,7 @@ func (err RecurringScheduleJobError) Error() string {
 //go:generate mockery -name JobManager -output ../internal/mocks/ -case=underscore
 
 // JobManager supplies methods for queueing, resuming and cancelling jobs in
-// the JobRunner
+// the JobRunner.
 type JobManager interface {
 	ExecuteJob(
 		jobSpecID *models.ID,
