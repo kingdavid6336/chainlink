@@ -2,46 +2,47 @@ package fluxmonitorv2
 
 import (
 	"github.com/pkg/errors"
-	"github.com/smartcontractkit/chainlink/core/services/eth"
+	"github.com/smartcontractkit/sqlx"
+
+	"github.com/smartcontractkit/chainlink/core/chains/evm"
+	"github.com/smartcontractkit/chainlink/core/chains/evm/txmgr"
+	"github.com/smartcontractkit/chainlink/core/logger"
 	"github.com/smartcontractkit/chainlink/core/services/job"
-	"github.com/smartcontractkit/chainlink/core/services/log"
+	"github.com/smartcontractkit/chainlink/core/services/keystore"
 	"github.com/smartcontractkit/chainlink/core/services/pipeline"
-	corestore "github.com/smartcontractkit/chainlink/core/store"
-	"gorm.io/gorm"
 )
 
 // Delegate represents a Flux Monitor delegate
 type Delegate struct {
-	db             *gorm.DB
-	store          *corestore.Store
+	db             *sqlx.DB
+	ethKeyStore    keystore.Eth
 	jobORM         job.ORM
 	pipelineORM    pipeline.ORM
 	pipelineRunner pipeline.Runner
-	ethClient      eth.Client
-	logBroadcaster log.Broadcaster
-	cfg            Config
+	chainSet       evm.ChainSet
+	lggr           logger.Logger
 }
+
+var _ job.Delegate = (*Delegate)(nil)
 
 // NewDelegate constructs a new delegate
 func NewDelegate(
-	store *corestore.Store,
+	ethKeyStore keystore.Eth,
 	jobORM job.ORM,
 	pipelineORM pipeline.ORM,
 	pipelineRunner pipeline.Runner,
-	db *gorm.DB,
-	ethClient eth.Client,
-	logBroadcaster log.Broadcaster,
-	cfg Config,
+	db *sqlx.DB,
+	chainSet evm.ChainSet,
+	lggr logger.Logger,
 ) *Delegate {
 	return &Delegate{
 		db,
-		store,
+		ethKeyStore,
 		jobORM,
 		pipelineORM,
 		pipelineRunner,
-		ethClient,
-		logBroadcaster,
-		cfg,
+		chainSet,
+		lggr.Named("FluxMonitor"),
 	}
 }
 
@@ -50,26 +51,40 @@ func (d *Delegate) JobType() job.Type {
 	return job.FluxMonitor
 }
 
+func (Delegate) AfterJobCreated(spec job.Job)  {}
+func (Delegate) BeforeJobDeleted(spec job.Job) {}
+
 // ServicesForSpec returns the flux monitor service for the job spec
-func (d *Delegate) ServicesForSpec(spec job.Job) (services []job.Service, err error) {
-	if spec.FluxMonitorSpec == nil {
-		return nil, errors.Errorf("Delegate expects a *job.FluxMonitorSpec to be present, got %v", spec)
+func (d *Delegate) ServicesForSpec(jb job.Job) (services []job.ServiceCtx, err error) {
+	if jb.FluxMonitorSpec == nil {
+		return nil, errors.Errorf("Delegate expects a *job.FluxMonitorSpec to be present, got %v", jb)
+	}
+	chain, err := d.chainSet.Get(jb.FluxMonitorSpec.EVMChainID.ToInt())
+	if err != nil {
+		return nil, err
+	}
+	strategy := txmgr.NewQueueingTxStrategy(jb.ExternalJobID, chain.Config().FMDefaultTransactionQueueDepth())
+	var checker txmgr.TransmitCheckerSpec
+	if chain.Config().FMSimulateTransactions() {
+		checker.CheckerType = txmgr.TransmitCheckerTypeSimulate
 	}
 
 	fm, err := NewFromJobSpec(
-		spec,
-		NewORM(d.store.DB),
+		jb,
+		d.db,
+		NewORM(d.db, d.lggr, chain.Config(), chain.TxManager(), strategy, checker),
 		d.jobORM,
 		d.pipelineORM,
-		NewKeyStore(d.store),
-		d.ethClient,
-		d.logBroadcaster,
+		NewKeyStore(d.ethKeyStore),
+		chain.Client(),
+		chain.LogBroadcaster(),
 		d.pipelineRunner,
-		d.cfg,
+		chain.Config(),
+		d.lggr,
 	)
 	if err != nil {
 		return nil, err
 	}
 
-	return []job.Service{fm}, nil
+	return []job.ServiceCtx{fm}, nil
 }

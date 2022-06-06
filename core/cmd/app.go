@@ -2,11 +2,17 @@ package cmd
 
 import (
 	"fmt"
+	"net/url"
 	"os"
+	"path/filepath"
 	"regexp"
 
-	"github.com/smartcontractkit/chainlink/core/static"
+	"github.com/pkg/errors"
 	"github.com/urfave/cli"
+
+	"github.com/smartcontractkit/chainlink/core/logger"
+	"github.com/smartcontractkit/chainlink/core/sessions"
+	"github.com/smartcontractkit/chainlink/core/static"
 )
 
 func removeHidden(cmds ...cli.Command) []cli.Command {
@@ -30,11 +36,56 @@ func NewApp(client *Client) *cli.App {
 			Name:  "json, j",
 			Usage: "json output as opposed to table",
 		},
+		cli.StringFlag{
+			Name:  "admin-credentials-file",
+			Usage: "optional, applies only in client mode when making remote API calls. If provided, `FILE` containing admin credentials will be used for logging in, allowing to avoid an additional login step. If `FILE` is missing, it will be ignored",
+			Value: filepath.Join(client.Config.RootDir(), "apicredentials"),
+		},
+		cli.StringFlag{
+			Name:  "remote-node-url",
+			Usage: "optional, applies only in client mode when making remote API calls. If provided, `URL` will be used as the remote Chainlink API endpoint",
+			Value: "http://localhost:6688",
+		},
+		cli.BoolFlag{
+			Name:  "insecure-skip-verify",
+			Usage: "optional, applies only in client mode when making remote API calls. If turned on, SSL certificate verification will be disabled. This is mostly useful for people who want to use Chainlink with a self-signed TLS certificate",
+		},
 	}
 	app.Before = func(c *cli.Context) error {
+		logDeprecatedClientEnvWarnings(client.Logger)
 		if c.Bool("json") {
 			client.Renderer = RendererJSON{Writer: os.Stdout}
 		}
+		urlStr := c.String("remote-node-url")
+		if envUrlStr := os.Getenv("CLIENT_NODE_URL"); envUrlStr != "" {
+			urlStr = envUrlStr
+		}
+		remoteNodeURL, err := url.Parse(urlStr)
+		if err != nil {
+			return errors.Wrapf(err, "%s is not a valid URL", urlStr)
+		}
+		insecureSkipVerify := c.Bool("insecure-skip-verify")
+		if envInsecureSkipVerify := os.Getenv("INSECURE_SKIP_VERIFY"); envInsecureSkipVerify == "true" {
+			insecureSkipVerify = true
+		}
+		clientOpts := ClientOpts{RemoteNodeURL: *remoteNodeURL, InsecureSkipVerify: insecureSkipVerify}
+		cookieAuth := NewSessionCookieAuthenticator(clientOpts, DiskCookieStore{Config: client.Config}, client.Logger)
+		sr := sessions.SessionRequest{}
+		sessionRequestBuilder := NewFileSessionRequestBuilder(client.Logger)
+		{
+			credentialsFile := c.String("admin-credentials-file")
+			if envCredentialsFile := os.Getenv("ADMIN_CREDENTIALS_FILE"); envCredentialsFile != "" {
+				credentialsFile = envCredentialsFile
+			}
+			var err error
+			sr, err = sessionRequestBuilder.Build(credentialsFile)
+			if err != nil && !errors.Is(errors.Cause(err), ErrNoCredentialFile) && !os.IsNotExist(err) {
+				return errors.Wrapf(err, "failed to load API credentials from file %s", credentialsFile)
+			}
+		}
+		client.HTTP = NewAuthenticatedHTTPClient(client.Logger, clientOpts, cookieAuth, sr)
+		client.CookieAuthenticator = cookieAuth
+		client.FileSessionRequestBuilder = sessionRequestBuilder
 		return nil
 	}
 	app.Commands = removeHidden([]cli.Command{
@@ -56,21 +107,11 @@ func NewApp(client *Client) *cli.App {
 							Name:  "file, f",
 							Usage: "text file holding the API email and password needed to create a session cookie",
 						},
+						cli.BoolFlag{
+							Name:  "bypass-version-check",
+							Usage: "Bypass versioning check for compatibility of remote node",
+						},
 					},
-				},
-			},
-		},
-
-		{
-			Name:    "agreements",
-			Aliases: []string{"agree"},
-			Usage:   "Commands for handling service agreements",
-			Hidden:  !client.Config.Dev(),
-			Subcommands: []cli.Command{
-				{
-					Name:   "create",
-					Usage:  "Creates a Service Agreement",
-					Action: client.CreateServiceAgreement,
 				},
 			},
 		},
@@ -88,6 +129,30 @@ func NewApp(client *Client) *cli.App {
 						cli.IntFlag{
 							Name:  "page",
 							Usage: "page of results to display",
+						},
+					},
+				},
+			},
+		},
+
+		{
+			Name:    "blocks",
+			Aliases: []string{},
+			Usage:   "Commands for managing blocks",
+			Subcommands: []cli.Command{
+				{
+					Name:   "replay",
+					Usage:  "Replays block data from the given number",
+					Action: client.ReplayFromBlock,
+					Flags: []cli.Flag{
+						cli.IntFlag{
+							Name:     "block-number",
+							Usage:    "Block number to replay from",
+							Required: true,
+						},
+						cli.BoolFlag{
+							Name:  "force",
+							Usage: "Whether to force broadcasting logs which were already consumed and that would otherwise be skipped",
 						},
 					},
 				},
@@ -121,7 +186,7 @@ func NewApp(client *Client) *cli.App {
 				},
 				{
 					Name:   "show",
-					Usage:  "Show an Bridge's details",
+					Usage:  "Show a Bridge's details",
 					Action: client.ShowBridge,
 				},
 			},
@@ -138,12 +203,16 @@ func NewApp(client *Client) *cli.App {
 				},
 				{
 					Name:   "setgasprice",
-					Usage:  "Set the minimum gas price to use for outgoing transactions",
-					Action: client.SetMinimumGasPrice,
+					Usage:  "Set the default gas price to use for outgoing transactions",
+					Action: client.SetEvmGasPriceDefault,
 					Flags: []cli.Flag{
 						cli.BoolFlag{
 							Name:  "gwei",
 							Usage: "Specify amount in gwei",
+						},
+						cli.StringFlag{
+							Name:  "evmChainID",
+							Usage: "(optional) specify the chain ID for which to make the update",
 						},
 					},
 				},
@@ -177,13 +246,13 @@ func NewApp(client *Client) *cli.App {
 		},
 
 		{
-			Name:  "job_specs",
-			Usage: "Commands for managing Job Specs (jobs V1)",
+			Name:  "jobs",
+			Usage: "Commands for managing Jobs",
 			Subcommands: []cli.Command{
 				{
 					Name:   "list",
 					Usage:  "List all jobs",
-					Action: client.IndexJobSpecs,
+					Action: client.ListJobs,
 					Flags: []cli.Flag{
 						cli.IntFlag{
 							Name:  "page",
@@ -193,49 +262,22 @@ func NewApp(client *Client) *cli.App {
 				},
 				{
 					Name:   "show",
-					Usage:  "Show a specific Job's details",
-					Action: client.ShowJobSpec,
+					Usage:  "Show a job",
+					Action: client.ShowJob,
 				},
 				{
 					Name:   "create",
-					Usage:  "Create Job from a Job Specification JSON",
-					Action: client.CreateJobSpec,
-				},
-				{
-					Name:   "archive",
-					Usage:  "Archive a Job and all its associated Runs",
-					Action: client.ArchiveJobSpec,
-				},
-			},
-		},
-		{
-			Name:  "jobs",
-			Usage: "Commands for managing Jobs (V2)",
-			Subcommands: []cli.Command{
-				{
-					Name:   "list",
-					Usage:  "List all V2 jobs",
-					Action: client.ListJobsV2,
-					Flags: []cli.Flag{
-						cli.IntFlag{
-							Name:  "page",
-							Usage: "page of results to display",
-						},
-					},
-				},
-				{
-					Name:   "create",
-					Usage:  "Create a V2 job",
-					Action: client.CreateJobV2,
+					Usage:  "Create a job",
+					Action: client.CreateJob,
 				},
 				{
 					Name:   "delete",
-					Usage:  "Delete a V2 job",
-					Action: client.DeleteJobV2,
+					Usage:  "Delete a job",
+					Action: client.DeleteJob,
 				},
 				{
 					Name:   "run",
-					Usage:  "Trigger a V2 job run",
+					Usage:  "Trigger a job run",
 					Action: client.TriggerPipelineRun,
 				},
 			},
@@ -246,12 +288,33 @@ func NewApp(client *Client) *cli.App {
 			Subcommands: []cli.Command{
 				{
 					Name:  "eth",
-					Usage: "Local commands for administering the node's Ethereum keys",
+					Usage: "Remote commands for administering the node's Ethereum keys",
 					Subcommands: cli.Commands{
 						{
 							Name:   "create",
-							Usage:  "Create an key in the node's keystore alongside the existing key; to create an original key, just run the node",
+							Usage:  "Create a key in the node's keystore alongside the existing key; to create an original key, just run the node",
 							Action: client.CreateETHKey,
+							Flags: []cli.Flag{
+								cli.StringFlag{
+									Name:  "evmChainID",
+									Usage: "Chain ID for the key. If left blank, default chain will be used.",
+								},
+								cli.Uint64Flag{
+									Name:  "maxGasPriceGWei",
+									Usage: "Optional maximum gas price (GWei) for the creating key.",
+								},
+							},
+						},
+						{
+							Name:   "update",
+							Usage:  "Update the existing key's parameters",
+							Action: client.UpdateETHKey,
+							Flags: []cli.Flag{
+								cli.Uint64Flag{
+									Name:  "maxGasPriceGWei",
+									Usage: "Maximum gas price (GWei) for the specified key.",
+								},
+							},
 						},
 						{
 							Name:   "list",
@@ -280,6 +343,10 @@ func NewApp(client *Client) *cli.App {
 								cli.StringFlag{
 									Name:  "oldpassword, p",
 									Usage: "`FILE` containing the password used to encrypt the key in the JSON file",
+								},
+								cli.StringFlag{
+									Name:  "evmChainID",
+									Usage: "Chain ID for the key. If left blank, default chain will be used.",
 								},
 							},
 							Action: client.ImportETHKey,
@@ -361,8 +428,51 @@ func NewApp(client *Client) *cli.App {
 				},
 
 				{
+					Name:  "csa",
+					Usage: "Remote commands for administering the node's CSA keys",
+					Subcommands: cli.Commands{
+						{
+							Name:   "create",
+							Usage:  format(`Create a CSA key, encrypted with password from the password file, and store it in the database.`),
+							Action: client.CreateCSAKey,
+						},
+						{
+							Name:   "list",
+							Usage:  format(`List available CSA keys`),
+							Action: client.ListCSAKeys,
+						},
+						{
+							Name:  "import",
+							Usage: format(`Imports a CSA key from a JSON file.`),
+							Flags: []cli.Flag{
+								cli.StringFlag{
+									Name:  "oldpassword, p",
+									Usage: "`FILE` containing the password used to encrypt the key in the JSON file",
+								},
+							},
+							Action: client.ImportCSAKey,
+						},
+						{
+							Name:  "export",
+							Usage: format(`Exports an existing CSA key by its ID.`),
+							Flags: []cli.Flag{
+								cli.StringFlag{
+									Name:  "newpassword, p",
+									Usage: "`FILE` containing the password to encrypt the key (required)",
+								},
+								cli.StringFlag{
+									Name:  "output, o",
+									Usage: "`FILE` where the JSON file will be saved (required)",
+								},
+							},
+							Action: client.ExportCSAKey,
+						},
+					},
+				},
+
+				{
 					Name:  "ocr",
-					Usage: "Remote commands for administering the node's off chain reporting keys",
+					Usage: "Remote commands for administering the node's legacy off chain reporting keys",
 					Subcommands: cli.Commands{
 						{
 							Name:   "create",
@@ -419,33 +529,105 @@ func NewApp(client *Client) *cli.App {
 				},
 
 				{
-					Name: "vrf",
-					Usage: format(`Local commands for administering the database of VRF proof
-           keys. These commands will not affect the extant in-memory keys of
-           any live node.`),
+					Name:  "ocr2",
+					Usage: "Remote commands for administering the node's off chain reporting keys",
 					Subcommands: cli.Commands{
 						{
-							Name: "create",
-							Usage: format(`Create a VRF key, encrypted with password from the
-               password file, and store it in the database.`),
-							Flags:  flags("password, p"),
-							Action: client.CreateVRFKey,
-						},
-						{
-							Name:   "import",
-							Usage:  "Import key from keyfile.",
-							Flags:  append(flags("password, p"), flags("file, f")...),
-							Action: client.ImportVRFKey,
-						},
-						{
-							Name:   "export",
-							Usage:  "Export key to keyfile.",
-							Flags:  append(flags("file, f"), flags("publicKey, pk")...),
-							Action: client.ExportVRFKey,
+							Name:   "create",
+							Usage:  format(`Create an OCR2 key bundle, encrypted with password from the password file, and store it in the database`),
+							Action: client.CreateOCR2KeyBundle,
 						},
 						{
 							Name:  "delete",
-							Usage: "Remove key from database, if present",
+							Usage: format(`Deletes the encrypted OCR2 key bundle matching the given ID`),
+							Flags: []cli.Flag{
+								cli.BoolFlag{
+									Name:  "yes, y",
+									Usage: "skip the confirmation prompt",
+								},
+								cli.BoolFlag{
+									Name:  "hard",
+									Usage: "hard-delete the key instead of archiving (irreversible!)",
+								},
+							},
+							Action: client.DeleteOCR2KeyBundle,
+						},
+						{
+							Name:   "list",
+							Usage:  format(`List available OCR2 key bundles`),
+							Action: client.ListOCR2KeyBundles,
+						},
+						{
+							Name:  "import",
+							Usage: format(`Imports an OCR2 key bundle from a JSON file`),
+							Flags: []cli.Flag{
+								cli.StringFlag{
+									Name:  "oldpassword, p",
+									Usage: "`FILE` containing the password used to encrypt the key in the JSON file",
+								},
+							},
+							Action: client.ImportOCR2Key,
+						},
+						{
+							Name:  "export",
+							Usage: format(`Exports an OCR2 key bundle to a JSON file`),
+							Flags: []cli.Flag{
+								cli.StringFlag{
+									Name:  "newpassword, p",
+									Usage: "`FILE` containing the password to encrypt the key (required)",
+								},
+								cli.StringFlag{
+									Name:  "output, o",
+									Usage: "`FILE` where the JSON file will be saved (required)",
+								},
+							},
+							Action: client.ExportOCR2Key,
+						},
+					},
+				},
+
+				keysCommand("Solana", NewSolanaKeysClient(client)),
+				keysCommand("Terra", NewTerraKeysClient(client)),
+
+				{
+					Name:  "vrf",
+					Usage: "Remote commands for administering the node's vrf keys",
+					Subcommands: cli.Commands{
+						{
+							Name:   "create",
+							Usage:  "Create a VRF key",
+							Action: client.CreateVRFKey,
+						},
+						{
+							Name:  "import",
+							Usage: "Import VRF key from keyfile",
+							Flags: []cli.Flag{
+								cli.StringFlag{
+									Name:  "oldpassword, p",
+									Usage: "`FILE` containing the password used to encrypt the key in the JSON file",
+								},
+							},
+							Action: client.ImportVRFKey,
+						},
+						{
+							Name:  "export",
+							Usage: "Export VRF key to keyfile",
+							Flags: []cli.Flag{
+								cli.StringFlag{
+									Name:  "newpassword, p",
+									Usage: "`FILE` containing the password to encrypt the key (required)",
+								},
+								cli.StringFlag{
+									Name:  "output, o",
+									Usage: "`FILE` where the JSON file will be saved (required)",
+								},
+							},
+							Action: client.ExportVRFKey,
+						},
+						{
+							Name: "delete",
+							Usage: "Archive or delete VRF key from memory and the database, if present. " +
+								"Note that jobs referencing the removed key will also be removed.",
 							Flags: []cli.Flag{
 								cli.StringFlag{Name: "publicKey, pk"},
 								cli.BoolFlag{
@@ -460,24 +642,8 @@ func NewApp(client *Client) *cli.App {
 							Action: client.DeleteVRFKey,
 						},
 						{
-							Name: "list", Usage: "List the public keys in the db",
+							Name: "list", Usage: "List the VRF keys",
 							Action: client.ListVRFKeys,
-						},
-						{
-							Name: "",
-						},
-						{
-							Name: "xxxCreateWeakKeyPeriodYesIReallyKnowWhatIAmDoingAndDoNotCareAboutThisKeyMaterialFallingIntoTheWrongHandsExclamationPointExclamationPointExclamationPointExclamationPointIAmAMasochistExclamationPointExclamationPointExclamationPointExclamationPointExclamationPoint",
-							Usage: format(`
-                               For testing purposes ONLY! DO NOT USE FOR ANY OTHER PURPOSE!
-
-                               Creates a key with weak key-derivation-function parameters, so that it can be
-                               decrypted quickly during tests. As a result, it would be cheap to brute-force
-                               the encryption password for the key, if the ciphertext fell into the wrong
-                               hands!`),
-							Flags:  append(flags("password, p"), flags("file, f")...),
-							Action: client.CreateAndExportWeakVRFKey,
-							Hidden: !client.Config.Dev(), // For when this suite gets promoted out of dev mode
 						},
 					},
 				},
@@ -489,18 +655,6 @@ func NewApp(client *Client) *cli.App {
 			Usage:       "Commands for admin actions that must be run locally",
 			Description: "Commands can only be run from on the same machine as the Chainlink node.",
 			Subcommands: []cli.Command{
-				{
-					Name:        "deleteuser",
-					Usage:       "Erase the *local node's* user and corresponding session to force recreation on next node launch.",
-					Description: "Does not work remotely over API.",
-					Action:      client.DeleteUser,
-				},
-				{
-					Name:    "import",
-					Aliases: []string{"i"},
-					Usage:   "Import a key file to use with the node",
-					Action:  client.ImportKey,
-				},
 				{
 					Name:   "setnextnonce",
 					Usage:  "Manually set the next nonce for a key. This should NEVER be necessary during normal operation. USE WITH CAUTION: Setting this incorrectly can break your node.",
@@ -534,15 +688,10 @@ func NewApp(client *Client) *cli.App {
 						},
 						cli.StringFlag{
 							Name:  "vrfpassword, vp",
-							Usage: "textfile holding the password for the vrf keys; enables chainlink VRF oracle",
-						},
-						cli.Int64Flag{
-							Name:  "replay-from-block, r",
-							Usage: "historical block height from which to replay log-initiated jobs",
-							Value: -1,
+							Usage: "text file holding the password for the vrf keys; enables Chainlink VRF oracle",
 						},
 					},
-					Usage:  "Run the chainlink node",
+					Usage:  "Run the Chainlink node",
 					Action: client.RunNode,
 				},
 				{
@@ -570,6 +719,10 @@ func NewApp(client *Client) *cli.App {
 							Name:  "address, a",
 							Usage: "The address (in hex format) for the key which we want to rebroadcast transactions",
 						},
+						cli.StringFlag{
+							Name:  "evmChainID",
+							Usage: "Chain ID for which to rebroadcast transactions. If left blank, ETH_CHAIN_ID will be used.",
+						},
 						cli.Uint64Flag{
 							Name:  "gasLimit",
 							Usage: "OPTIONAL: gas limit to use for each transaction ",
@@ -577,16 +730,32 @@ func NewApp(client *Client) *cli.App {
 					},
 				},
 				{
-					Name:   "hard-reset",
-					Usage:  "Removes unstarted transactions, cancels pending transactions as well as deletes job runs. Use with caution, this command cannot be reverted! Only execute when the node is not started!",
-					Action: client.HardReset,
+					Name:   "status",
+					Usage:  "Displays the health of various services running inside the node.",
+					Action: client.Status,
 					Flags:  []cli.Flag{},
+				},
+				{
+					Name:   "profile",
+					Usage:  "Collects profile metrics from the node.",
+					Action: client.Profile,
+					Flags: []cli.Flag{
+						cli.Uint64Flag{
+							Name:  "seconds, s",
+							Usage: "duration of profile capture",
+							Value: 8,
+						},
+						cli.StringFlag{
+							Name:  "output_dir, o",
+							Usage: "output directory of the captured profile",
+							Value: "/tmp/",
+						},
+					},
 				},
 				{
 					Name:        "db",
 					Usage:       "Commands for managing the database.",
-					Description: "Potentially destructive commands for managing the database, only intended for dev/testing purposes.",
-					Hidden:      !client.Config.Dev(),
+					Description: "Potentially destructive commands for managing the database.",
 					Subcommands: []cli.Command{
 						{
 							Name:   "reset",
@@ -605,13 +774,53 @@ func NewApp(client *Client) *cli.App {
 							Usage:  "Reset database and load fixtures.",
 							Hidden: !client.Config.Dev(),
 							Action: client.PrepareTestDatabase,
+							Flags: []cli.Flag{
+								cli.BoolFlag{
+									Name:  "user-only",
+									Usage: "only include test user fixture",
+								},
+							},
+						},
+						{
+							Name:   "version",
+							Usage:  "Display the current database version.",
+							Action: client.VersionDatabase,
 							Flags:  []cli.Flag{},
+						},
+						{
+							Name:   "status",
+							Usage:  "Display the current database migration status.",
+							Action: client.StatusDatabase,
+							Flags:  []cli.Flag{},
+						},
+						{
+							Name:   "migrate",
+							Usage:  "Migrate the database to the latest version.",
+							Action: client.MigrateDatabase,
+							Flags:  []cli.Flag{},
+						},
+						{
+							Name:   "rollback",
+							Usage:  "Roll back the database to a previous <version>. Rolls back a single migration if no version specified.",
+							Action: client.RollbackDatabase,
+							Flags:  []cli.Flag{},
+						},
+						{
+							Name:   "create-migration",
+							Usage:  "Create a new migration.",
+							Hidden: !client.Config.Dev(),
+							Action: client.CreateMigration,
+							Flags: []cli.Flag{
+								cli.StringFlag{
+									Name:  "type",
+									Usage: "set to `go` to generate a .go migration (instead of .sql)",
+								},
+							},
 						},
 					},
 				},
 			},
 		},
-
 		{
 			Name:   "initiators",
 			Usage:  "Commands for managing External Initiators",
@@ -624,76 +833,189 @@ func NewApp(client *Client) *cli.App {
 				},
 				{
 					Name:   "destroy",
-					Usage:  "Remove an authentication key by name",
+					Usage:  "Remove an external initiator by name",
 					Action: client.DeleteExternalInitiator,
-				},
-			},
-		},
-
-		{
-			Name:  "runs",
-			Usage: "Commands for managing Runs",
-			Subcommands: []cli.Command{
-				{
-					Name:        "create",
-					Aliases:     []string{"r"},
-					Usage:       "Create a new Run for a Job given an Job ID and optional JSON body",
-					Description: "Takes a Job ID and a JSON string or path to a JSON file",
-					Action:      client.CreateJobRun,
 				},
 				{
 					Name:   "list",
-					Usage:  "List all Runs",
-					Action: client.IndexJobRuns,
-					Flags: []cli.Flag{
-						cli.IntFlag{
-							Name:  "page",
-							Usage: "page of results to display",
-						},
-						cli.StringFlag{
-							Name:  "jobid",
-							Usage: "filter all Runs to match the given jobid",
-						},
-					},
-				},
-				{
-					Name:    "show",
-					Aliases: []string{"sr"},
-					Usage:   "Show a Run for a specific ID",
-					Action:  client.ShowJobRun,
-				},
-				{
-					Name:   "cancel",
-					Usage:  "Cancel a Run with a specified ID",
-					Action: client.CancelJobRun,
+					Usage:  "List all external initiators",
+					Action: client.IndexExternalInitiators,
 				},
 			},
 		},
 
 		{
 			Name:  "txs",
-			Usage: "Commands for handling Ethereum transactions",
+			Usage: "Commands for handling transactions",
 			Subcommands: []cli.Command{
 				{
-					Name:   "create",
-					Usage:  "Send <amount> Eth from node ETH account <fromAddress> to destination <toAddress>.",
-					Action: client.SendEther,
-				},
-				{
-					Name:   "list",
-					Usage:  "List the Ethereum Transactions in descending order",
-					Action: client.IndexTransactions,
-					Flags: []cli.Flag{
-						cli.IntFlag{
-							Name:  "page",
-							Usage: "page of results to display",
+					Name:  "evm",
+					Usage: "Commands for handling EVM transactions",
+					Subcommands: []cli.Command{
+						{
+							Name:   "create",
+							Usage:  "Send <amount> ETH (or wei) from node ETH account <fromAddress> to destination <toAddress>.",
+							Action: client.SendEther,
+							Flags: []cli.Flag{
+								cli.BoolFlag{
+									Name:  "force",
+									Usage: "allows to send a higher amount than the account's balance",
+								},
+								cli.BoolFlag{
+									Name:  "eth",
+									Usage: "allows to send ETH amounts (Default behavior)",
+								},
+								cli.BoolFlag{
+									Name:  "wei",
+									Usage: "allows to send WEI amounts",
+								},
+								cli.Int64Flag{
+									Name:  "id",
+									Usage: "chain ID",
+								},
+							},
+						},
+						{
+							Name:   "list",
+							Usage:  "List the Ethereum Transactions in descending order",
+							Action: client.IndexTransactions,
+							Flags: []cli.Flag{
+								cli.IntFlag{
+									Name:  "page",
+									Usage: "page of results to display",
+								},
+							},
+						},
+						{
+							Name:   "show",
+							Usage:  "get information on a specific Ethereum Transaction",
+							Action: client.ShowTransaction,
 						},
 					},
 				},
 				{
-					Name:   "show",
-					Usage:  "get information on a specific Ethereum Transaction",
-					Action: client.ShowTransaction,
+					Name:  "solana",
+					Usage: "Commands for handling Solana transactions",
+					Subcommands: []cli.Command{
+						{
+							Name:   "create",
+							Usage:  "Send <amount> lamports from node Solana account <fromAddress> to destination <toAddress>.",
+							Action: client.SolanaSendSol,
+							Flags: []cli.Flag{
+								cli.BoolFlag{
+									Name:  "force",
+									Usage: "allows to send a higher amount than the account's balance",
+								},
+								cli.StringFlag{
+									Name:  "id",
+									Usage: "chain ID, options: [mainnet, testnet, devnet, localnet]",
+								},
+							},
+						},
+					},
+				},
+				{
+					Name:  "terra",
+					Usage: "Commands for handling Terra transactions",
+					Subcommands: []cli.Command{
+						{
+							Name:   "create",
+							Usage:  "Send <amount> Luna from node Terra account <fromAddress> to destination <toAddress>.",
+							Action: client.TerraSendLuna,
+							Flags: []cli.Flag{
+								cli.BoolFlag{
+									Name:  "force",
+									Usage: "allows to send a higher amount than the account's balance",
+								},
+								cli.StringFlag{
+									Name:  "id",
+									Usage: "chain ID",
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+		{
+			Name:  "chains",
+			Usage: "Commands for handling chain configuration",
+			Subcommands: cli.Commands{
+				chainCommand("EVM", EVMChainClient(client), cli.Int64Flag{Name: "id", Usage: "chain ID"}),
+				chainCommand("Solana", SolanaChainClient(client),
+					cli.StringFlag{Name: "id", Usage: "chain ID, options: [mainnet, testnet, devnet, localnet]"}),
+				chainCommand("Terra", TerraChainClient(client), cli.StringFlag{Name: "id", Usage: "chain ID"}),
+			},
+		},
+		{
+			Name:  "nodes",
+			Usage: "Commands for handling node configuration",
+			Subcommands: cli.Commands{
+				nodeCommand("EVM", NewEVMNodeClient(client),
+					cli.StringFlag{
+						Name:  "ws-url",
+						Usage: "Websocket URL",
+					},
+					cli.StringFlag{
+						Name:  "http-url",
+						Usage: "HTTP URL, optional",
+					},
+					cli.Int64Flag{
+						Name:  "chain-id",
+						Usage: "chain ID",
+					},
+					cli.StringFlag{
+						Name:  "type",
+						Usage: "primary|secondary",
+					}),
+				nodeCommand("Solana", NewSolanaNodeClient(client),
+					cli.StringFlag{
+						Name:  "chain-id",
+						Usage: "chain ID, options: [mainnet, testnet, devnet, localnet]",
+					},
+					cli.StringFlag{
+						Name:  "url",
+						Usage: "URL",
+					}),
+				nodeCommand("Terra", NewTerraNodeClient(client),
+					cli.StringFlag{
+						Name:  "chain-id",
+						Usage: "chain ID",
+					},
+					cli.StringFlag{
+						Name:  "tendermint-url",
+						Usage: "Tendermint URL",
+					}),
+			},
+		},
+		{
+			Name:  "forwarders",
+			Usage: "Commands for managing forwarder addresses.",
+			Subcommands: []cli.Command{
+				{
+					Name:   "list",
+					Usage:  "List all stored forwarders addresses",
+					Action: client.ListForwarders,
+				},
+				{
+					Name:   "create",
+					Usage:  "Create a new forwarder",
+					Action: client.CreateForwarder,
+					Flags: []cli.Flag{
+						cli.Int64Flag{
+							Name:  "evmChainID, c",
+							Usage: "chain ID, if left empty, ETH_CHAIN_ID will be used",
+						},
+						cli.StringFlag{
+							Name:  "address, a",
+							Usage: "The forwarding address (in hex format)",
+						},
+					},
+				},
+				{
+					Name:   "delete",
+					Usage:  "Delete a forwarder address",
+					Action: client.DeleteForwarder,
 				},
 			},
 		},
@@ -708,5 +1030,14 @@ func format(s string) string {
 	return string(whitespace.ReplaceAll([]byte(s), []byte(" ")))
 }
 
-// flags is an abbreviated way to express a CLI flag
-func flags(s string) []cli.Flag { return []cli.Flag{cli.StringFlag{Name: s}} }
+func logDeprecatedClientEnvWarnings(lggr logger.Logger) {
+	if s := os.Getenv("INSECURE_SKIP_VERIFY"); s != "" {
+		lggr.Error("INSECURE_SKIP_VERIFY env var has been deprecated and will be removed in a future release. Use flag instead: --insecure-skip-verify")
+	}
+	if s := os.Getenv("CLIENT_NODE_URL"); s != "" {
+		lggr.Errorf("CLIENT_NODE_URL env var has been deprecated and will be removed in a future release. Use flag instead: --remote-node-url=%s", s)
+	}
+	if s := os.Getenv("ADMIN_CREDENTIALS_FILE"); s != "" {
+		lggr.Errorf("ADMIN_CREDENTIALS_FILE env var has been deprecated and will be removed in a future release. Use flag instead: --admin-credentials-file=%s", s)
+	}
+}

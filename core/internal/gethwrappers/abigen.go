@@ -60,7 +60,7 @@ func Abigen(a AbigenArgs) {
 		"-type", a.Type,
 		"-pkg", a.Pkg,
 	}
-	if a.Bin != "" {
+	if a.Bin != "-" {
 		args = append(args, "-bin", a.Bin)
 	}
 	buildCommand := exec.Command(abigenExecutablePath, args...)
@@ -134,15 +134,24 @@ func generateCode(fset *token.FileSet, fileNode *ast.File) []byte {
 }
 
 func getContractName(fileNode *ast.File) string {
-	// Grab the contract name. It's always the first type in the file.
+	// Search for the ABI const e.g. VRFCoordinatorV2ABI = "0x..."
 	var contractName string
 	astutil.Apply(fileNode, func(cursor *astutil.Cursor) bool {
-		x, is := cursor.Node().(*ast.TypeSpec)
+		x, is := cursor.Node().(*ast.ValueSpec)
 		if !is {
 			return true
 		}
-		if contractName == "" {
-			contractName = x.Name.Name
+		if len(x.Names) > 0 {
+			for _, n := range x.Names {
+				if len(n.Name) < 3 {
+					return true
+				}
+				if n.Name[len(n.Name)-3:] == "ABI" {
+					contractName = n.Name[:len(n.Name)-3]
+				} else {
+					return true
+				}
+			}
 		}
 		return false
 	}, nil)
@@ -355,7 +364,7 @@ func (%v%v) Topic() common.Hash {
 `, contractName, logName, abi.Events[logName].ID.Hex()))...)
 	}
 
-	// Write the the Address method to the bottom of the file
+	// Write the Address method to the bottom of the file
 	bs = append(bs, []byte(fmt.Sprintf(`
 func (_%v *%v) Address() common.Address {
     return _%v.address

@@ -3,12 +3,13 @@ package web
 import (
 	"fmt"
 	"net/http"
+	"strconv"
 
 	"github.com/gin-gonic/gin"
-	"github.com/smartcontractkit/chainlink/core/logger"
+	"go.uber.org/zap/zapcore"
+
 	"github.com/smartcontractkit/chainlink/core/services/chainlink"
 	"github.com/smartcontractkit/chainlink/core/web/presenters"
-	"go.uber.org/zap/zapcore"
 )
 
 // LogController manages the logger config
@@ -23,12 +24,20 @@ type LogPatchRequest struct {
 
 // Get retrieves the current log config settings
 func (cc *LogController) Get(c *gin.Context) {
-	response := &presenters.LogResource{
+	var svcs, lvls []string
+	svcs = append(svcs, "Global")
+	lvls = append(lvls, cc.App.GetConfig().LogLevel().String())
+
+	svcs = append(svcs, "IsSqlEnabled")
+	lvls = append(lvls, strconv.FormatBool(cc.App.GetConfig().LogSQL()))
+
+	response := &presenters.ServiceLogConfigResource{
 		JAID: presenters.JAID{
 			ID: "log",
 		},
-		Level:      cc.App.GetStore().Config.LogLevel().String(),
-		SqlEnabled: cc.App.GetStore().Config.LogSQLStatements(),
+		ServiceName:     svcs,
+		LogLevel:        lvls,
+		DefaultLogLevel: cc.App.GetConfig().DefaultLogLevel().String(),
 	}
 
 	jsonAPIResponse(c, response, "log")
@@ -42,8 +51,12 @@ func (cc *LogController) Patch(c *gin.Context) {
 		return
 	}
 
+	// Build log config response
+	var svcs, lvls []string
+
+	// Validate request params
 	if request.Level == "" && request.SqlEnabled == nil {
-		jsonAPIError(c, http.StatusBadRequest, fmt.Errorf("please set either logLevel or logSql as params in order to set the log level"))
+		jsonAPIError(c, http.StatusBadRequest, fmt.Errorf("please check request params, no params configured"))
 		return
 	}
 
@@ -54,29 +67,27 @@ func (cc *LogController) Patch(c *gin.Context) {
 			jsonAPIError(c, http.StatusBadRequest, err)
 			return
 		}
-		if err = cc.App.GetStore().Config.SetLogLevel(c.Request.Context(), ll.String()); err != nil {
+		if err := cc.App.SetLogLevel(ll); err != nil {
 			jsonAPIError(c, http.StatusInternalServerError, err)
 			return
 		}
 	}
+	svcs = append(svcs, "Global")
+	lvls = append(lvls, cc.App.GetConfig().LogLevel().String())
 
 	if request.SqlEnabled != nil {
-		if err := cc.App.GetStore().Config.SetLogSQLStatements(c.Request.Context(), *request.SqlEnabled); err != nil {
-			jsonAPIError(c, http.StatusInternalServerError, err)
-			return
-		}
-		cc.App.GetStore().SetLogging(*request.SqlEnabled)
+		cc.App.GetConfig().SetLogSQL(*request.SqlEnabled)
 	}
 
-	// Set default logger with new configurations
-	logger.SetLogger(cc.App.GetStore().Config.CreateProductionLogger())
+	svcs = append(svcs, "IsSqlEnabled")
+	lvls = append(lvls, strconv.FormatBool(cc.App.GetConfig().LogSQL()))
 
-	response := &presenters.LogResource{
+	response := &presenters.ServiceLogConfigResource{
 		JAID: presenters.JAID{
 			ID: "log",
 		},
-		Level:      cc.App.GetStore().Config.LogLevel().String(),
-		SqlEnabled: cc.App.GetStore().Config.LogSQLStatements(),
+		ServiceName: svcs,
+		LogLevel:    lvls,
 	}
 
 	jsonAPIResponse(c, response, "log")

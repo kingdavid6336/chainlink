@@ -4,10 +4,14 @@ import (
 	"database/sql/driver"
 	"encoding/json"
 	"fmt"
+	"math/big"
 	"strconv"
 	"time"
 
 	"github.com/pkg/errors"
+	uuid "github.com/satori/go.uuid"
+	"github.com/shopspring/decimal"
+	"go.uber.org/multierr"
 
 	"github.com/smartcontractkit/chainlink/core/store/models"
 
@@ -15,50 +19,40 @@ import (
 )
 
 type Spec struct {
-	ID              int32           `gorm:"primary_key"`
+	ID              int32
 	DotDagSource    string          `json:"dotDagSource"`
 	CreatedAt       time.Time       `json:"-"`
 	MaxTaskDuration models.Interval `json:"-"`
 
-	JobID   int32  `gorm:"-" json:"-"`
-	JobName string `gorm:"-" json:"-"`
+	JobID   int32  `json:"-"`
+	JobName string `json:"-"`
 }
 
-func (Spec) TableName() string {
-	return "pipeline_specs"
-}
-
-func (s Spec) TasksInDependencyOrder() ([]Task, error) {
-	d := TaskDAG{}
-	err := d.UnmarshalText([]byte(s.DotDagSource))
-	if err != nil {
-		return nil, err
-	}
-	tasks, err := d.TasksInDependencyOrder()
-	if err != nil {
-		return nil, err
-	}
-	return tasks, nil
+func (s Spec) Pipeline() (*Pipeline, error) {
+	return Parse(s.DotDagSource)
 }
 
 type Run struct {
-	ID             int64            `json:"-" gorm:"primary_key"`
+	ID             int64            `json:"-"`
 	PipelineSpecID int32            `json:"-"`
 	PipelineSpec   Spec             `json:"pipelineSpec"`
 	Meta           JSONSerializable `json:"meta"`
 	// The errors are only ever strings
 	// DB example: [null, null, "my error"]
-	Errors RunErrors `json:"errors" gorm:"type:jsonb"`
-	// The outputs can be anything.
+	AllErrors   RunErrors        `json:"all_errors"`
+	FatalErrors RunErrors        `json:"fatal_errors"`
+	Inputs      JSONSerializable `json:"inputs"`
+	// Its expected that Output.Val is of type []interface{}.
 	// DB example: [1234, {"a": 10}, null]
-	Outputs          JSONSerializable `json:"outputs" gorm:"type:jsonb"`
+	Outputs          JSONSerializable `json:"outputs"`
 	CreatedAt        time.Time        `json:"createdAt"`
-	FinishedAt       *time.Time       `json:"finishedAt"`
-	PipelineTaskRuns []TaskRun        `json:"taskRuns" gorm:"foreignkey:PipelineRunID;->"`
-}
+	FinishedAt       null.Time        `json:"finishedAt"`
+	PipelineTaskRuns []TaskRun        `json:"taskRuns"`
+	State            RunStatus        `json:"state"`
 
-func (Run) TableName() string {
-	return "pipeline_runs"
+	Pending bool
+	// FailSilently is used to signal that a task with the failEarly flag has failed, and we want to not put this in the db
+	FailSilently bool
 }
 
 func (r Run) GetID() string {
@@ -74,8 +68,17 @@ func (r *Run) SetID(value string) error {
 	return nil
 }
 
+func (r Run) HasFatalErrors() bool {
+	for _, err := range r.FatalErrors {
+		if !err.IsZero() {
+			return true
+		}
+	}
+	return false
+}
+
 func (r Run) HasErrors() bool {
-	for _, err := range r.Errors {
+	for _, err := range r.AllErrors {
 		if !err.IsZero() {
 			return true
 		}
@@ -85,13 +88,93 @@ func (r Run) HasErrors() bool {
 
 // Status determines the status of the run.
 func (r *Run) Status() RunStatus {
-	if r.HasErrors() {
+	if r.HasFatalErrors() {
 		return RunStatusErrored
-	} else if r.FinishedAt != nil {
+	} else if r.FinishedAt.Valid {
 		return RunStatusCompleted
 	}
 
-	return RunStatusInProgress
+	return RunStatusRunning
+}
+
+func (r *Run) ByDotID(id string) *TaskRun {
+	for i, run := range r.PipelineTaskRuns {
+		if run.DotID == id {
+			return &r.PipelineTaskRuns[i]
+		}
+	}
+	return nil
+}
+
+func (r *Run) StringOutputs() ([]*string, error) {
+	// The UI expects all outputs to be strings.
+	var outputs []*string
+	// Note for async jobs, Outputs can be nil/invalid
+	if r.Outputs.Valid {
+		outs, ok := r.Outputs.Val.([]interface{})
+		if !ok {
+			return nil, fmt.Errorf("unable to process output type %T", r.Outputs.Val)
+		}
+
+		if r.Outputs.Valid && r.Outputs.Val != nil {
+			for _, out := range outs {
+				switch v := out.(type) {
+				case string:
+					s := v
+					outputs = append(outputs, &s)
+				case map[string]interface{}:
+					b, _ := json.Marshal(v)
+					bs := string(b)
+					outputs = append(outputs, &bs)
+				case decimal.Decimal:
+					s := v.String()
+					outputs = append(outputs, &s)
+				case *big.Int:
+					s := v.String()
+					outputs = append(outputs, &s)
+				case float64:
+					s := fmt.Sprintf("%f", v)
+					outputs = append(outputs, &s)
+				case nil:
+					outputs = append(outputs, nil)
+				default:
+					return nil, fmt.Errorf("unable to process output type %T", out)
+				}
+			}
+		}
+	}
+
+	return outputs, nil
+}
+
+func (r *Run) StringFatalErrors() []*string {
+	var fatalErrors []*string
+
+	for _, err := range r.FatalErrors {
+		if err.Valid {
+			s := err.String
+			fatalErrors = append(fatalErrors, &s)
+		} else {
+			fatalErrors = append(fatalErrors, nil)
+		}
+	}
+
+	return fatalErrors
+}
+
+func (r *Run) StringAllErrors() []*string {
+	var allErrors []*string
+
+	for _, err := range r.AllErrors {
+		if err.Valid {
+			s := err.String
+			allErrors = append(allErrors, &s)
+		} else {
+			allErrors = append(allErrors, nil)
+		}
+	}
+
+	return allErrors
 }
 
 type RunErrors []null.String
@@ -123,21 +206,54 @@ func (re RunErrors) HasError() bool {
 	return false
 }
 
-type TaskRun struct {
-	ID            int64             `json:"-" gorm:"primary_key"`
-	Type          TaskType          `json:"type"`
-	PipelineRun   Run               `json:"-"`
-	PipelineRunID int64             `json:"-"`
-	Output        *JSONSerializable `json:"output" gorm:"type:jsonb"`
-	Error         null.String       `json:"error"`
-	CreatedAt     time.Time         `json:"createdAt"`
-	FinishedAt    *time.Time        `json:"finishedAt"`
-	Index         int32             `json:"index"`
-	DotID         string            `json:"dotId"`
+// ToError coalesces all non-nil errors into a single error object.
+// This is useful for logging.
+func (re RunErrors) ToError() error {
+	toErr := func(ns null.String) error {
+		if !ns.IsZero() {
+			return errors.New(ns.String)
+		}
+		return nil
+	}
+	errs := []error{}
+	for _, e := range re {
+		errs = append(errs, toErr(e))
+	}
+	return multierr.Combine(errs...)
 }
 
-func (TaskRun) TableName() string {
-	return "pipeline_task_runs"
+type ResumeRequest struct {
+	Error null.String     `json:"error"`
+	Value json.RawMessage `json:"value"`
+}
+
+func (rr ResumeRequest) ToResult() (Result, error) {
+	var res Result
+	if rr.Error.Valid && rr.Value == nil {
+		res.Error = errors.New(rr.Error.ValueOrZero())
+		return res, nil
+	}
+	if !rr.Error.Valid && rr.Value != nil {
+		res.Value = []byte(rr.Value)
+		return res, nil
+	}
+	return Result{}, errors.New("must provide only one of either 'value' or 'error' key")
+}
+
+type TaskRun struct {
+	ID            uuid.UUID        `json:"id"`
+	Type          TaskType         `json:"type"`
+	PipelineRun   Run              `json:"-"`
+	PipelineRunID int64            `json:"-"`
+	Output        JSONSerializable `json:"output"`
+	Error         null.String      `json:"error"`
+	CreatedAt     time.Time        `json:"createdAt"`
+	FinishedAt    null.Time        `json:"finishedAt"`
+	Index         int32            `json:"index"`
+	DotID         string           `json:"dotId"`
+
+	// Used internally for sorting completed results
+	task Task
 }
 
 func (tr TaskRun) GetID() string {
@@ -145,11 +261,11 @@ func (tr TaskRun) GetID() string {
 }
 
 func (tr *TaskRun) SetID(value string) error {
-	ID, err := strconv.ParseInt(value, 10, 32)
+	ID, err := uuid.FromString(value)
 	if err != nil {
 		return err
 	}
-	tr.ID = int64(ID)
+	tr.ID = ID
 	return nil
 }
 
@@ -161,24 +277,30 @@ func (tr TaskRun) Result() Result {
 	var result Result
 	if !tr.Error.IsZero() {
 		result.Error = errors.New(tr.Error.ValueOrZero())
-	} else if tr.Output != nil && tr.Output.Val != nil {
+	} else if tr.Output.Valid && tr.Output.Val != nil {
 		result.Value = tr.Output.Val
 	}
 	return result
 }
 
+func (tr *TaskRun) IsPending() bool {
+	return !tr.FinishedAt.Valid && tr.Output.Empty() && tr.Error.IsZero()
+}
+
 // RunStatus represents the status of a run
-type RunStatus int
+type RunStatus string
 
 const (
 	// RunStatusUnknown is the when the run status cannot be determined.
-	RunStatusUnknown RunStatus = iota
-	// RunStatusInProgress is used for when a run is actively being executed.
-	RunStatusInProgress
+	RunStatusUnknown RunStatus = "unknown"
+	// RunStatusRunning is used for when a run is actively being executed.
+	RunStatusRunning RunStatus = "running"
+	// RunStatusSuspended is used when a run is paused and awaiting further results.
+	RunStatusSuspended RunStatus = "suspended"
 	// RunStatusErrored is used for when a run has errored and will not complete.
-	RunStatusErrored
+	RunStatusErrored RunStatus = "errored"
 	// RunStatusCompleted is used for when a run has successfully completed execution.
-	RunStatusCompleted
+	RunStatusCompleted RunStatus = "completed"
 )
 
 // Completed returns true if the status is RunStatusCompleted.

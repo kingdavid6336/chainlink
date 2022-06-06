@@ -1,47 +1,48 @@
 {
   "private": true,
   "license": "MIT",
-  "workspaces": [
-    "evm-test-helpers",
-    "evm-contracts",
-    "integration",
-    "integration-scripts",
-    "operator_ui",
-    "tools",
-    "tools/ci-ts",
-    "tools/cypress-job-server",
-    "tools/echo-server",
-    "tools/external-adapter",
-    "belt"
-  ],
+  "workspaces": {
+    "packages": [
+      "contracts",
+      "operator_ui",
+      "tools",
+      "tools/external-adapter"
+    ],
+    "nohoist": [
+      "**/typechain",
+      "**/typechain/**",
+      "**/@typechain/ethers-v5",
+      "**/@typechain/ethers-v5/**",
+      "**/@graphql-codegen",
+      "**/@graphql-codegen/**"
+    ]
+  },
   "engines": {
-    "node": "^12.0.0"
+    "node": "^16.0.0"
   },
   "scripts": {
     "lint": "eslint --ext js,jsx,ts,tsx .",
-    "lint:evm": "eslint --ext js,jsx,ts,tsx evm-contracts/ evm-test-helpers/",
-    "prettier:check": "yarn prettier '**/*' --check --ignore-unknown",
-    "prettier:run": "yarn prettier '**/*' --check --ignore-unknown --write",
+    "prettier:check": "yarn prettier . --check --ignore-unknown",
+    "prettier:write": "yarn prettier . --write --ignore-unknown",
     "setup": "wsrun -me -t setup",
     "setup:chainlink": "yarn wsrun -mre -p @chainlink/contracts -p @chainlink/operator-ui -t setup",
     "setup:contracts": "yarn wsrun -mre -p @chainlink/contracts -t setup",
-    "setup:integration": "yarn wsrun -mre -p @chainlink/integration* -t setup",
-    "clean": "wsrun -me clean",
-    "postinstall": "patch-package"
+    "clean": "wsrun -me clean"
   },
   "devDependencies": {
-    "@typescript-eslint/eslint-plugin": "^2.15.0",
+    "@nomiclabs/hardhat-etherscan": "^2.1.8",
+    "@typescript-eslint/eslint-plugin": "^2.34.0",
     "@typescript-eslint/parser": "^2.34.0",
     "eslint": "^6.8.0",
     "eslint-config-prettier": "^6.15.0",
-    "eslint-plugin-prettier": "^3.3.1",
-    "eslint-plugin-react": "^7.22.0",
+    "eslint-plugin-prettier": "^3.4.1",
+    "eslint-plugin-react": "^7.23.2",
     "eslint-plugin-react-hooks": "^4.0.0",
-    "patch-package": "^6.2.1",
     "postinstall-postinstall": "^2.1.0",
-    "prettier": "^2.1.2",
+    "prettier": "2.4.1",
+    "ts-node": "^10.0.0",
     "typescript": "^3.7.4",
-    "wsrun": "^5.2.0"
+    "wsrun": "^5.2.4"
   },
   "resolutions": {
     "**/decompress": "^4.2.1 ",
@@ -55,7 +56,6 @@
     "**/sha3": "^2.0.7",
     "**/solc": "^0.6.4",
     "**/source-map-support": "0.5.16",
-    "**/yargs-parser": "^15.0.1",
     "**/bl": "^3.0.1",
     "**/y18n": "^5.0.5"
   },

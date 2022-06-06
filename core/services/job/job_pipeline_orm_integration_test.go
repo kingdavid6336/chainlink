@@ -2,132 +2,177 @@ package job_test
 
 import (
 	"context"
-	"net/url"
 	"testing"
+	"time"
 
+	"github.com/smartcontractkit/sqlx"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"github.com/smartcontractkit/chainlink/core/internal/cltest"
+	"github.com/smartcontractkit/chainlink/core/internal/testutils/evmtest"
+	"github.com/smartcontractkit/chainlink/core/internal/testutils/pgtest"
 	"github.com/smartcontractkit/chainlink/core/logger"
-
 	"github.com/smartcontractkit/chainlink/core/services/job"
 	"github.com/smartcontractkit/chainlink/core/services/pipeline"
-
-	"github.com/shopspring/decimal"
-	"github.com/smartcontractkit/chainlink/core/internal/cltest"
-	"github.com/smartcontractkit/chainlink/core/services/postgres"
 	"github.com/smartcontractkit/chainlink/core/store/models"
-	"github.com/stretchr/testify/require"
-	"gorm.io/gorm"
 )
 
-func clearJobsDb(t *testing.T, db *gorm.DB) {
-	err := db.Exec(`TRUNCATE jobs, pipeline_runs, pipeline_specs, pipeline_task_runs CASCADE`).Error
-	require.NoError(t, err)
+func clearJobsDb(t *testing.T, db *sqlx.DB) {
+	cltest.ClearDBTables(t, db, "flux_monitor_round_stats_v2", "jobs", "pipeline_runs", "pipeline_specs", "pipeline_task_runs")
 }
 
 func TestPipelineORM_Integration(t *testing.T) {
-	config, oldORM, cleanupDB := cltest.BootstrapThrowawayORM(t, "pipeline_orm", true, true)
-	config.Set("DEFAULT_HTTP_TIMEOUT", "30ms")
-	config.Set("MAX_HTTP_ATTEMPTS", "1")
-	defer cleanupDB()
-	db := oldORM.DB
+	const DotStr = `
+        // data source 1
+        ds1          [type=bridge name=voter_turnout];
+        ds1_parse    [type=jsonparse path="one,two"];
+        ds1_multiply [type=multiply times=1.23];
 
-	key := cltest.MustInsertRandomKey(t, db)
-	transmitterAddress := key.Address.Address()
+        // data source 2
+        ds2          [type=http method=GET url="https://chain.link/voter_turnout/USA-2020" requestData=<{"hi": "hello"}>];
+        ds2_parse    [type=jsonparse path="three.four" separator="."];
+        ds2_multiply [type=multiply times=4.56];
+
+        ds1 -> ds1_parse -> ds1_multiply -> answer1;
+        ds2 -> ds2_parse -> ds2_multiply -> answer1;
+
+        answer1 [type=median                      index=0];
+        answer2 [type=bridge name=election_winner index=1];
+    `
+
+	config := cltest.NewTestGeneralConfig(t)
+	db := pgtest.NewSqlxDB(t)
+	config.Overrides.SetDefaultHTTPTimeout(30 * time.Millisecond)
+	keyStore := cltest.NewKeyStore(t, db, config)
+	ethKeyStore := keyStore.Eth()
+
+	_, transmitterAddress := cltest.MustInsertRandomKey(t, ethKeyStore)
+	keyStore.OCR().Add(cltest.DefaultOCRKey)
 
 	var specID int32
 
-	u, err := url.Parse("https://chain.link/voter_turnout/USA-2020")
-	require.NoError(t, err)
-
 	answer1 := &pipeline.MedianTask{
-		BaseTask: pipeline.NewBaseTask("answer1", nil, 0, 0),
+		AllowedFaults: "",
 	}
 	answer2 := &pipeline.BridgeTask{
-		Name:     "election_winner",
-		BaseTask: pipeline.NewBaseTask("answer2", nil, 1, 0),
+		Name: "election_winner",
 	}
 	ds1_multiply := &pipeline.MultiplyTask{
-		Times:    decimal.NewFromFloat(1.23),
-		BaseTask: pipeline.NewBaseTask("ds1_multiply", answer1, 0, 0),
+		Times: "1.23",
 	}
 	ds1_parse := &pipeline.JSONParseTask{
-		Path:     []string{"one", "two"},
-		BaseTask: pipeline.NewBaseTask("ds1_parse", ds1_multiply, 0, 0),
+		Path: "one,two",
 	}
 	ds1 := &pipeline.BridgeTask{
-		Name:     "voter_turnout",
-		BaseTask: pipeline.NewBaseTask("ds1", ds1_parse, 0, 0),
+		Name: "voter_turnout",
 	}
 	ds2_multiply := &pipeline.MultiplyTask{
-		Times:    decimal.NewFromFloat(4.56),
-		BaseTask: pipeline.NewBaseTask("ds2_multiply", answer1, 0, 0),
+		Times: "4.56",
 	}
 	ds2_parse := &pipeline.JSONParseTask{
-		Path:     []string{"three", "four"},
-		BaseTask: pipeline.NewBaseTask("ds2_parse", ds2_multiply, 0, 0),
+		Path: "three,four",
 	}
 	ds2 := &pipeline.HTTPTask{
-		URL:         models.WebURL(*u),
+		URL:         "https://chain.link/voter_turnout/USA-2020",
 		Method:      "GET",
-		RequestData: pipeline.HttpRequestData{"hi": "hello"},
-		BaseTask:    pipeline.NewBaseTask("ds2", ds2_parse, 0, 0),
+		RequestData: `{"hi": "hello"}`,
 	}
-	expectedTasks := []pipeline.Task{answer1, answer2, ds1_multiply, ds1_parse, ds1, ds2_multiply, ds2_parse, ds2}
-	_, bridge := cltest.NewBridgeType(t, "voter_turnout", "http://blah.com")
-	require.NoError(t, db.Create(bridge).Error)
-	_, bridge2 := cltest.NewBridgeType(t, "election_winner", "http://blah.com")
-	require.NoError(t, db.Create(bridge2).Error)
+
+	answer1.BaseTask = pipeline.NewBaseTask(
+		6,
+		"answer1",
+		[]pipeline.TaskDependency{
+			{PropagateResult: true, InputTask: pipeline.Task(ds1_multiply)},
+			{PropagateResult: true, InputTask: pipeline.Task(ds2_multiply)}},
+		nil,
+		0)
+	answer2.BaseTask = pipeline.NewBaseTask(7, "answer2", nil, nil, 1)
+	ds1_multiply.BaseTask = pipeline.NewBaseTask(
+		2,
+		"ds1_multiply",
+		[]pipeline.TaskDependency{{PropagateResult: true, InputTask: pipeline.Task(ds1_parse)}},
+		[]pipeline.Task{answer1},
+		0)
+	ds2_multiply.BaseTask = pipeline.NewBaseTask(
+		5,
+		"ds2_multiply",
+		[]pipeline.TaskDependency{{PropagateResult: true, InputTask: pipeline.Task(ds2_parse)}},
+		[]pipeline.Task{answer1},
+		0)
+	ds1_parse.BaseTask = pipeline.NewBaseTask(
+		1,
+		"ds1_parse",
+		[]pipeline.TaskDependency{{PropagateResult: true, InputTask: pipeline.Task(ds1)}},
+		[]pipeline.Task{ds1_multiply},
+		0)
+	ds2_parse.BaseTask = pipeline.NewBaseTask(
+		4,
+		"ds2_parse",
+		[]pipeline.TaskDependency{{PropagateResult: true, InputTask: pipeline.Task(ds2)}},
+		[]pipeline.Task{ds2_multiply},
+		0)
+	ds1.BaseTask = pipeline.NewBaseTask(0, "ds1", nil, []pipeline.Task{ds1_parse}, 0)
+	ds2.BaseTask = pipeline.NewBaseTask(3, "ds2", nil, []pipeline.Task{ds2_parse}, 0)
+	expectedTasks := []pipeline.Task{ds1, ds1_parse, ds1_multiply, ds2, ds2_parse, ds2_multiply, answer1, answer2}
+	_, bridge := cltest.MustCreateBridge(t, db, cltest.BridgeOpts{}, config)
+	_, bridge2 := cltest.MustCreateBridge(t, db, cltest.BridgeOpts{}, config)
 
 	t.Run("creates task DAGs", func(t *testing.T) {
 		clearJobsDb(t, db)
-		orm, _, cleanup := cltest.NewPipelineORM(t, config, db)
-		defer cleanup()
 
-		g := pipeline.NewTaskDAG()
-		err := g.UnmarshalText([]byte(pipeline.DotStr))
+		orm := pipeline.NewORM(db, logger.TestLogger(t), config)
+
+		p, err := pipeline.Parse(DotStr)
 		require.NoError(t, err)
 
-		specID, err = orm.CreateSpec(context.Background(), db, *g, models.Interval(0))
-		require.NoError(t, err)
-
-		var specs []pipeline.Spec
-		err = db.Find(&specs).Error
-		require.NoError(t, err)
-		require.Len(t, specs, 1)
-		require.Equal(t, specID, specs[0].ID)
-		require.Equal(t, pipeline.DotStr, specs[0].DotDagSource)
-
-		require.NoError(t, db.Exec(`DELETE FROM pipeline_specs`).Error)
-	})
-
-	t.Run("creates runs", func(t *testing.T) {
-		clearJobsDb(t, db)
-		orm, eventBroadcaster, cleanup := cltest.NewPipelineORM(t, config, db)
-		defer cleanup()
-		runner := pipeline.NewRunner(orm, config)
-		defer runner.Close()
-		jobORM := job.NewORM(db, config.Config, orm, eventBroadcaster, &postgres.NullAdvisoryLocker{})
-		defer jobORM.Close()
-
-		dbSpec := makeVoterTurnoutOCRJobSpec(t, db, transmitterAddress)
-
-		// Need a job in order to create a run
-		err := jobORM.CreateJob(context.Background(), dbSpec, dbSpec.Pipeline)
+		specID, err = orm.CreateSpec(*p, models.Interval(0))
 		require.NoError(t, err)
 
 		var pipelineSpecs []pipeline.Spec
-		err = db.Find(&pipelineSpecs).Error
+		sql := `SELECT * FROM pipeline_specs;`
+		err = db.Select(&pipelineSpecs, sql)
+		require.NoError(t, err)
+		require.Len(t, pipelineSpecs, 1)
+		require.Equal(t, specID, pipelineSpecs[0].ID)
+		require.Equal(t, DotStr, pipelineSpecs[0].DotDagSource)
+
+		_, err = db.Exec(`DELETE FROM pipeline_specs`)
+		require.NoError(t, err)
+	})
+
+	t.Run("creates runs", func(t *testing.T) {
+		lggr := logger.TestLogger(t)
+		cfg := cltest.NewTestGeneralConfig(t)
+		clearJobsDb(t, db)
+		orm := pipeline.NewORM(db, logger.TestLogger(t), cfg)
+		cc := evmtest.NewChainSet(t, evmtest.TestChainOpts{Client: cltest.NewEthClientMockWithDefaultChain(t), DB: db, GeneralConfig: config})
+		runner := pipeline.NewRunner(orm, config, cc, nil, nil, lggr, nil, nil)
+		defer runner.Close()
+		jobORM := job.NewTestORM(t, db, cc, orm, keyStore, cfg)
+
+		dbSpec := makeVoterTurnoutOCRJobSpec(t, transmitterAddress, bridge.Name.String(), bridge2.Name.String())
+
+		// Need a job in order to create a run
+		err := jobORM.CreateJob(dbSpec)
+		require.NoError(t, err)
+
+		var pipelineSpecs []pipeline.Spec
+		sql := `SELECT * FROM pipeline_specs;`
+		err = db.Select(&pipelineSpecs, sql)
 		require.NoError(t, err)
 		require.Len(t, pipelineSpecs, 1)
 		require.Equal(t, dbSpec.PipelineSpecID, pipelineSpecs[0].ID)
 		pipelineSpecID := pipelineSpecs[0].ID
 
 		// Create the run
-		runID, _, err := runner.ExecuteAndInsertNewRun(context.Background(), pipelineSpecs[0], pipeline.JSONSerializable{}, *logger.Default, true)
+		runID, _, err := runner.ExecuteAndInsertFinishedRun(context.Background(), pipelineSpecs[0], pipeline.NewVarsFrom(nil), lggr, true)
 		require.NoError(t, err)
 
 		// Check the DB for the pipeline.Run
 		var pipelineRuns []pipeline.Run
-		err = db.Where("id = ?", runID).Find(&pipelineRuns).Error
+		sql = `SELECT * FROM pipeline_runs WHERE id = $1;`
+		err = db.Select(&pipelineRuns, sql, runID)
 		require.NoError(t, err)
 		require.Len(t, pipelineRuns, 1)
 		require.Equal(t, pipelineSpecID, pipelineRuns[0].PipelineSpecID)
@@ -135,14 +180,15 @@ func TestPipelineORM_Integration(t *testing.T) {
 
 		// Check the DB for the pipeline.TaskRuns
 		var taskRuns []pipeline.TaskRun
-		err = db.Where("pipeline_run_id = ?", runID).Find(&taskRuns).Error
+		sql = `SELECT * FROM pipeline_task_runs WHERE pipeline_run_id = $1;`
+		err = db.Select(&taskRuns, sql, runID)
 		require.NoError(t, err)
 		require.Len(t, taskRuns, len(expectedTasks))
 
 		for _, taskRun := range taskRuns {
-			require.Equal(t, runID, taskRun.PipelineRunID)
-			require.Nil(t, taskRun.Output)
-			require.False(t, taskRun.Error.IsZero())
+			assert.Equal(t, runID, taskRun.PipelineRunID)
+			assert.False(t, taskRun.Output.Valid)
+			assert.False(t, taskRun.Error.IsZero())
 		}
 	})
 }

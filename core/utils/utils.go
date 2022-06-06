@@ -10,67 +10,73 @@ import (
 	"fmt"
 	"math/big"
 	mrand "math/rand"
-	"reflect"
-	"runtime"
 	"sort"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/smartcontractkit/chainlink/core/logger"
+	cryptop2p "github.com/libp2p/go-libp2p-core/crypto"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/common/hexutil"
-	"github.com/ethereum/go-ethereum/core/types"
-	"github.com/ethereum/go-ethereum/rlp"
 	"github.com/jpillora/backoff"
+	"github.com/libp2p/go-libp2p-core/peer"
 	"github.com/pkg/errors"
+	"github.com/robfig/cron/v3"
 	uuid "github.com/satori/go.uuid"
-	"github.com/shopspring/decimal"
-	"github.com/tevino/abool"
+	"go.uber.org/atomic"
 	"golang.org/x/crypto/bcrypt"
 	"golang.org/x/crypto/sha3"
-	null "gopkg.in/guregu/null.v4"
 )
 
 const (
-	// DefaultSecretSize is the entroy in bytes to generate a base64 string of 64 characters.
+	// DefaultSecretSize is the entropy in bytes to generate a base64 string of 64 characters.
 	DefaultSecretSize = 48
 	// EVMWordByteLen the length of an EVM Word Byte
 	EVMWordByteLen = 32
-	// EVMWordHexLen the length of an EVM Word Hex
-	EVMWordHexLen = EVMWordByteLen * 2
 )
 
 // ZeroAddress is an address of all zeroes, otherwise in Ethereum as
 // 0x0000000000000000000000000000000000000000
 var ZeroAddress = common.Address{}
 
+func RandomAddress() common.Address {
+	b := make([]byte, 20)
+	_, _ = rand.Read(b) // Assignment for errcheck. Only used in tests so we can ignore.
+	return common.BytesToAddress(b)
+}
+
+func RandomBytes32() (r [32]byte) {
+	b := make([]byte, 32)
+	_, _ = rand.Read(b[:]) // Assignment for errcheck. Only used in tests so we can ignore.
+	copy(r[:], b)
+	return
+}
+
+func Bytes32ToSlice(a [32]byte) (r []byte) {
+	r = append(r, a[:]...)
+	return
+}
+
+func MustNewPeerID() string {
+	_, pubKey, err := cryptop2p.GenerateEd25519Key(rand.Reader)
+	if err != nil {
+		panic(err)
+	}
+	peerID, err := peer.IDFromPublicKey(pubKey)
+	if err != nil {
+		panic(err)
+	}
+	return peerID.String()
+}
+
 // EmptyHash is a hash of all zeroes, otherwise in Ethereum as
 // 0x0000000000000000000000000000000000000000000000000000000000000000
 var EmptyHash = common.Hash{}
 
-// WithoutZeroAddresses returns a list of addresses excluding the zero address.
-func WithoutZeroAddresses(addresses []common.Address) []common.Address {
-	var withoutZeros []common.Address
-	for _, address := range addresses {
-		if address != ZeroAddress {
-			withoutZeros = append(withoutZeros, address)
-		}
-	}
-	return withoutZeros
-}
-
-// Uint64ToHex converts the given uint64 value to a hex-value string.
-func Uint64ToHex(i uint64) string {
-	return fmt.Sprintf("0x%x", i)
-}
-
-var maxUint256 = common.HexToHash("0x" + strings.Repeat("f", 64)).Big()
-
 // Uint256ToBytes is x represented as the bytes of a uint256
 func Uint256ToBytes(x *big.Int) (uint256 []byte, err error) {
-	if x.Cmp(maxUint256) > 0 {
+	if x.Cmp(MaxUint256) > 0 {
 		return nil, fmt.Errorf("too large to convert to uint256")
 	}
 	uint256 = common.LeftPadBytes(x.Bytes(), EVMWordByteLen)
@@ -83,14 +89,6 @@ func Uint256ToBytes(x *big.Int) (uint256 []byte, err error) {
 // ISO8601UTC formats given time to ISO8601.
 func ISO8601UTC(t time.Time) string {
 	return t.UTC().Format(time.RFC3339)
-}
-
-// NullISO8601UTC returns formatted time if valid, empty string otherwise.
-func NullISO8601UTC(t null.Time) string {
-	if t.Valid {
-		return ISO8601UTC(t.Time)
-	}
-	return ""
 }
 
 // DurationFromNow returns the amount of time since the Time
@@ -107,7 +105,7 @@ func FormatJSON(v interface{}) ([]byte, error) {
 // NewBytes32ID returns a randomly generated UUID that conforms to
 // Ethereum bytes32.
 func NewBytes32ID() string {
-	return strings.Replace(uuid.NewV4().String(), "-", "", -1)
+	return strings.ReplaceAll(uuid.NewV4().String(), "-", "")
 }
 
 // NewSecret returns a new securely random sequence of n bytes of entropy.  The
@@ -136,17 +134,6 @@ func HasHexPrefix(str string) bool {
 	return len(str) >= 2 && str[0] == '0' && (str[1] == 'x' || str[1] == 'X')
 }
 
-// DecodeEthereumTx takes an RLP hex encoded Ethereum transaction and
-// returns a Transaction struct with all the fields accessible.
-func DecodeEthereumTx(hex string) (types.Transaction, error) {
-	var tx types.Transaction
-	b, err := hexutil.Decode(hex)
-	if err != nil {
-		return tx, err
-	}
-	return tx, rlp.DecodeBytes(b, &tx)
-}
-
 // IsEmptyAddress checks that the address is empty, synonymous with the zero
 // account/address. No logs can come from this address, as there is no contract
 // present there.
@@ -162,7 +149,7 @@ func StringToHex(in string) string {
 	return AddHexPrefix(hex.EncodeToString([]byte(in)))
 }
 
-// AddHexPrefix adds the previx (0x) to a given hex string.
+// AddHexPrefix adds the prefix (0x) to a given hex string.
 func AddHexPrefix(str string) string {
 	if len(str) < 2 || len(str) > 1 && strings.ToLower(str[0:2]) != "0x" {
 		str = "0x" + str
@@ -170,6 +157,7 @@ func AddHexPrefix(str string) string {
 	return str
 }
 
+// IsEmpty returns true if bytes contains only zero values, or has len 0.
 func IsEmpty(bytes []byte) bool {
 	for _, b := range bytes {
 		if b != 0 {
@@ -191,7 +179,7 @@ type Sleeper interface {
 // BackoffSleeper is a sleeper that backs off on subsequent attempts.
 type BackoffSleeper struct {
 	backoff.Backoff
-	beenRun *abool.AtomicBool
+	beenRun *atomic.Bool
 }
 
 // NewBackoffSleeper returns a BackoffSleeper that is configured to
@@ -203,13 +191,13 @@ func NewBackoffSleeper() *BackoffSleeper {
 			Min: 1 * time.Second,
 			Max: 10 * time.Second,
 		},
-		beenRun: abool.New(),
+		beenRun: atomic.NewBool(false),
 	}
 }
 
 // Sleep waits for the given duration, incrementing the back off.
 func (bs *BackoffSleeper) Sleep() {
-	if bs.beenRun.SetToIf(false, true) {
+	if bs.beenRun.CAS(false, true) {
 		return
 	}
 	time.Sleep(bs.Backoff.Duration())
@@ -217,7 +205,7 @@ func (bs *BackoffSleeper) Sleep() {
 
 // After returns the duration for the next stop, and increments the backoff.
 func (bs *BackoffSleeper) After() time.Duration {
-	if bs.beenRun.SetToIf(false, true) {
+	if bs.beenRun.CAS(false, true) {
 		return 0
 	}
 	return bs.Backoff.Duration()
@@ -225,7 +213,7 @@ func (bs *BackoffSleeper) After() time.Duration {
 
 // Duration returns the current duration value.
 func (bs *BackoffSleeper) Duration() time.Duration {
-	if !bs.beenRun.IsSet() {
+	if !bs.beenRun.Load() {
 		return 0
 	}
 	return bs.ForAttempt(bs.Attempt())
@@ -233,7 +221,7 @@ func (bs *BackoffSleeper) Duration() time.Duration {
 
 // Reset resets the backoff intervals.
 func (bs *BackoffSleeper) Reset() {
-	bs.beenRun.UnSet()
+	bs.beenRun.Store(false)
 	bs.Backoff.Reset()
 }
 
@@ -254,17 +242,6 @@ func RetryWithBackoff(ctx context.Context, fn func() (retry bool)) {
 			continue
 		}
 	}
-}
-
-// MaxBigs finds the maximum value of a list of big.Ints.
-func MaxBigs(first *big.Int, bigs ...*big.Int) *big.Int {
-	max := first
-	for _, n := range bigs {
-		if max.Cmp(n) < 0 {
-			max = n
-		}
-	}
-	return max
 }
 
 // MaxUint32 finds the maximum value of a list of uint32s.
@@ -336,6 +313,16 @@ func Keccak256(in []byte) ([]byte, error) {
 	return hash.Sum(nil), err
 }
 
+func Keccak256Fixed(in []byte) [32]byte {
+	hash := sha3.NewLegacyKeccak256()
+	// Note this Keccak256 cannot error https://github.com/golang/crypto/blob/master/sha3/sha3.go#L126
+	// if we start supporting hashing algos which do, we can change this API to include an error.
+	hash.Write(in)
+	var h [32]byte
+	copy(h[:], hash.Sum(nil))
+	return h
+}
+
 // Sha256 returns a hexadecimal encoded string of a hashed input
 func Sha256(in string) (string, error) {
 	hasher := sha3.New256()
@@ -344,11 +331,6 @@ func Sha256(in string) (string, error) {
 		return "", errors.Wrap(err, "sha256 write error")
 	}
 	return hex.EncodeToString(hasher.Sum(nil)), nil
-}
-
-// StripBearer removes the 'Bearer: ' prefix from the HTTP Authorization header.
-func StripBearer(authorizationStr string) string {
-	return strings.TrimPrefix(strings.TrimSpace(authorizationStr), "Bearer ")
 }
 
 // IsQuoted checks if the first and last characters are either " or '.
@@ -404,14 +386,6 @@ func MustHash(in string) common.Hash {
 	return common.BytesToHash(out)
 }
 
-// LogListeningAddress returns the LogListeningAddress
-func LogListeningAddress(address common.Address) string {
-	if address == ZeroAddress {
-		return "[all]"
-	}
-	return address.String()
-}
-
 // JustError takes a tuple and returns the last entry, the error.
 func JustError(_ interface{}, err error) error {
 	return err
@@ -421,7 +395,7 @@ var zero = big.NewInt(0)
 
 // CheckUint256 returns an error if n is out of bounds for a uint256
 func CheckUint256(n *big.Int) error {
-	if n.Cmp(zero) < 0 || n.Cmp(maxUint256) >= 0 {
+	if n.Cmp(zero) < 0 || n.Cmp(MaxUint256) >= 0 {
 		return fmt.Errorf("number out of range for uint256")
 	}
 	return nil
@@ -441,52 +415,21 @@ func HexToUint256(s string) (*big.Int, error) {
 	return rv, nil
 }
 
-// Uint256ToHex returns the hex representation of n, or error if out of bounds
-func Uint256ToHex(n *big.Int) (string, error) {
-	if err := CheckUint256(n); err != nil {
-		return "", err
+// HexToBig parses the given hex string or panics if it is invalid.
+func HexToBig(s string) *big.Int {
+	n, ok := new(big.Int).SetString(s, 16)
+	if !ok {
+		panic(fmt.Errorf(`failed to convert "%s" as hex to big.Int`, s))
 	}
-	return common.BigToHash(n).Hex(), nil
+	return n
 }
 
-// ToDecimal converts an input to a decimal
-func ToDecimal(input interface{}) (decimal.Decimal, error) {
-	switch v := input.(type) {
-	case string:
-		return decimal.NewFromString(v)
-	case int:
-		return decimal.New(int64(v), 0), nil
-	case int8:
-		return decimal.New(int64(v), 0), nil
-	case int16:
-		return decimal.New(int64(v), 0), nil
-	case int32:
-		return decimal.New(int64(v), 0), nil
-	case int64:
-		return decimal.New(v, 0), nil
-	case uint:
-		return decimal.New(int64(v), 0), nil
-	case uint8:
-		return decimal.New(int64(v), 0), nil
-	case uint16:
-		return decimal.New(int64(v), 0), nil
-	case uint32:
-		return decimal.New(int64(v), 0), nil
-	case uint64:
-		return decimal.New(int64(v), 0), nil
-	case float64:
-		return decimal.NewFromFloat(v), nil
-	case float32:
-		return decimal.NewFromFloat32(v), nil
-	case *big.Int:
-		return decimal.NewFromBigInt(v, 0), nil
-	case decimal.Decimal:
-		return v, nil
-	case *decimal.Decimal:
-		return *v, nil
-	default:
-		return decimal.Decimal{}, errors.Errorf("type %T cannot be converted to decimal.Decimal", input)
+// Uint256ToBytes32 returns the bytes32 encoding of the big int provided
+func Uint256ToBytes32(n *big.Int) []byte {
+	if n.BitLen() > 256 {
+		panic("vrf.uint256ToBytes32: too big to marshal to uint256")
 	}
+	return common.LeftPadBytes(n.Bytes(), 32)
 }
 
 // WaitGroupChan creates a channel that closes when the provided sync.WaitGroup is done.
@@ -499,8 +442,29 @@ func WaitGroupChan(wg *sync.WaitGroup) <-chan struct{} {
 	return chAwait
 }
 
+// WithCloseChan wraps a context so that it is canceled if the passed in
+// channel is closed.
+// NOTE: Spins up a goroutine that exits on cancellation.
+// REMEMBER TO CALL CANCEL OTHERWISE IT CAN LEAD TO MEMORY LEAKS
+func WithCloseChan(parentCtx context.Context, chStop <-chan struct{}) (ctx context.Context, cancel context.CancelFunc) {
+	ctx, cancel = context.WithCancel(parentCtx)
+
+	go func() {
+		select {
+		case <-chStop:
+		case <-ctx.Done():
+		}
+		cancel()
+	}()
+
+	return ctx, cancel
+}
+
 // ContextFromChan creates a context that finishes when the provided channel
 // receives or is closed.
+// When channel closes, the ctx.Err() will always be context.Canceled
+// NOTE: Spins up a goroutine that exits on cancellation.
+// REMEMBER TO CALL CANCEL OTHERWISE IT CAN LEAD TO MEMORY LEAKS
 func ContextFromChan(chStop <-chan struct{}) (context.Context, context.CancelFunc) {
 	ctx, cancel := context.WithCancel(context.Background())
 	go func() {
@@ -513,47 +477,19 @@ func ContextFromChan(chStop <-chan struct{}) (context.Context, context.CancelFun
 	return ctx, cancel
 }
 
-// CombinedContext creates a context that finishes when any of the provided
-// signals finish.  A signal can be a `context.Context`, a `chan struct{}`, or
-// a `time.Duration` (which is transformed into a `context.WithTimeout`).
-func CombinedContext(signals ...interface{}) (context.Context, context.CancelFunc) {
-	ctx, cancel := context.WithCancel(context.Background())
-	if len(signals) == 0 {
-		return ctx, cancel
-	}
-	signals = append(signals, ctx)
-
-	var cases []reflect.SelectCase
-	var cancel2 context.CancelFunc
-	for _, signal := range signals {
-		var ch reflect.Value
-
-		switch sig := signal.(type) {
-		case context.Context:
-			ch = reflect.ValueOf(sig.Done())
-		case <-chan struct{}:
-			ch = reflect.ValueOf(sig)
-		case chan struct{}:
-			ch = reflect.ValueOf(sig)
-		case time.Duration:
-			var ctxTimeout context.Context
-			ctxTimeout, cancel2 = context.WithTimeout(ctx, sig)
-			ch = reflect.ValueOf(ctxTimeout.Done())
-		default:
-			logger.Errorf("utils.CombinedContext cannot accept a value of type %T, skipping", sig)
-			continue
-		}
-		cases = append(cases, reflect.SelectCase{Chan: ch, Dir: reflect.SelectRecv})
-	}
-
+// ContextFromChanWithDeadline creates a context with a deadline that finishes when the provided channel
+// receives or is closed.
+// NOTE: Spins up a goroutine that exits on cancellation.
+// REMEMBER TO CALL CANCEL OTHERWISE IT CAN LEAD TO MEMORY LEAKS
+func ContextFromChanWithDeadline(chStop <-chan struct{}, timeout time.Duration) (context.Context, context.CancelFunc) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	go func() {
-		defer cancel()
-		if cancel2 != nil {
-			defer cancel2()
+		select {
+		case <-chStop:
+			cancel()
+		case <-ctx.Done():
 		}
-		_, _, _ = reflect.Select(cases)
 	}()
-
 	return ctx, cancel
 }
 
@@ -592,85 +528,84 @@ func (da *dependentAwaiter) DependentReady() {
 }
 
 // BoundedQueue is a FIFO queue that discards older items when it reaches its capacity.
-type BoundedQueue struct {
-	capacity uint
-	items    []interface{}
-	mu       *sync.RWMutex
+type BoundedQueue[T any] struct {
+	capacity int
+	items    []T
+	mu       sync.RWMutex
 }
 
 // NewBoundedQueue creates a new BoundedQueue instance
-func NewBoundedQueue(capacity uint) *BoundedQueue {
-	return &BoundedQueue{
-		capacity: capacity,
-		mu:       &sync.RWMutex{},
-	}
+func NewBoundedQueue[T any](capacity int) *BoundedQueue[T] {
+	var bq BoundedQueue[T]
+	bq.capacity = capacity
+	return &bq
 }
 
 // Add appends items to a BoundedQueue
-func (q *BoundedQueue) Add(x interface{}) {
+func (q *BoundedQueue[T]) Add(x T) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	q.items = append(q.items, x)
-	if uint(len(q.items)) > q.capacity {
-		excess := uint(len(q.items)) - q.capacity
+	if len(q.items) > q.capacity {
+		excess := len(q.items) - q.capacity
 		q.items = q.items[excess:]
 	}
 }
 
 // Take pulls the first item from the array and removes it
-func (q *BoundedQueue) Take() interface{} {
+func (q *BoundedQueue[T]) Take() (t T) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	if len(q.items) == 0 {
-		return nil
+		return
 	}
-	x := q.items[0]
+	t = q.items[0]
 	q.items = q.items[1:]
-	return x
+	return
 }
 
 // Empty check is a BoundedQueue is empty
-func (q *BoundedQueue) Empty() bool {
+func (q *BoundedQueue[T]) Empty() bool {
 	q.mu.RLock()
 	defer q.mu.RUnlock()
 	return len(q.items) == 0
 }
 
 // Full checks if a BoundedQueue is over capacity.
-func (q *BoundedQueue) Full() bool {
+func (q *BoundedQueue[T]) Full() bool {
 	q.mu.RLock()
 	defer q.mu.RUnlock()
-	return uint(len(q.items)) >= q.capacity
+	return len(q.items) >= q.capacity
 }
 
 // BoundedPriorityQueue stores a series of BoundedQueues
 // with associated priorities and capacities
-type BoundedPriorityQueue struct {
-	queues     map[uint]*BoundedQueue
+type BoundedPriorityQueue[T any] struct {
+	queues     map[uint]*BoundedQueue[T]
 	priorities []uint
-	capacities map[uint]uint
-	mu         *sync.RWMutex
+	capacities map[uint]int
+	mu         sync.RWMutex
 }
 
 // NewBoundedPriorityQueue creates a new BoundedPriorityQueue
-func NewBoundedPriorityQueue(capacities map[uint]uint) *BoundedPriorityQueue {
-	queues := make(map[uint]*BoundedQueue)
+func NewBoundedPriorityQueue[T any](capacities map[uint]int) *BoundedPriorityQueue[T] {
+	queues := make(map[uint]*BoundedQueue[T])
 	var priorities []uint
 	for priority, capacity := range capacities {
 		priorities = append(priorities, priority)
-		queues[priority] = NewBoundedQueue(capacity)
+		queues[priority] = NewBoundedQueue[T](capacity)
 	}
 	sort.Slice(priorities, func(i, j int) bool { return priorities[i] < priorities[j] })
-	return &BoundedPriorityQueue{
+	bpq := BoundedPriorityQueue[T]{
 		queues:     queues,
 		priorities: priorities,
 		capacities: capacities,
-		mu:         &sync.RWMutex{},
 	}
+	return &bpq
 }
 
 // Add pushes an item into a subque within a BoundedPriorityQueue
-func (q *BoundedPriorityQueue) Add(priority uint, x interface{}) {
+func (q *BoundedPriorityQueue[T]) Add(priority uint, x T) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 
@@ -683,7 +618,7 @@ func (q *BoundedPriorityQueue) Add(priority uint, x interface{}) {
 }
 
 // Take takes from the BoundedPriorityQueue's subque
-func (q *BoundedPriorityQueue) Take() interface{} {
+func (q *BoundedPriorityQueue[T]) Take() (t T) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 
@@ -694,12 +629,12 @@ func (q *BoundedPriorityQueue) Take() interface{} {
 		}
 		return queue.Take()
 	}
-	return nil
+	return
 }
 
 // Empty checks the BoundedPriorityQueue
 // if all subqueues are empty
-func (q *BoundedPriorityQueue) Empty() bool {
+func (q *BoundedPriorityQueue[T]) Empty() bool {
 	q.mu.RLock()
 	defer q.mu.RUnlock()
 
@@ -726,23 +661,12 @@ func WrapIfError(err *error, msg string) {
 	}
 }
 
-// LogIfError logs an error if not nil
-func LogIfError(err *error, msg string) {
-	if *err != nil {
-		logger.Errorf(msg+": %+v", *err)
-	}
-}
-
-// DebugPanic logs a panic exception being called
-func DebugPanic() {
-	if err := recover(); err != nil {
-		pc := make([]uintptr, 10) // at least 1 entry needed
-		runtime.Callers(5, pc)
-		f := runtime.FuncForPC(pc[0])
-		file, line := f.FileLine(pc[0])
-		logger.Errorf("Caught panic in %v (%v#%v): %v", f.Name(), file, line, err)
-		panic(err)
-	}
+// TickerBase is an interface for pausable tickers.
+type TickerBase interface {
+	Resume()
+	Pause()
+	Destroy()
+	Ticks() <-chan time.Time
 }
 
 // PausableTicker stores a ticker with a duration
@@ -761,7 +685,7 @@ func NewPausableTicker(duration time.Duration) PausableTicker {
 }
 
 // Ticks retrieves the ticks from a PausableTicker
-func (t PausableTicker) Ticks() <-chan time.Time {
+func (t *PausableTicker) Ticks() <-chan time.Time {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
 	if t.ticker == nil {
@@ -795,6 +719,66 @@ func (t *PausableTicker) Destroy() {
 	t.Pause()
 }
 
+// CronTicker is like a time.Ticker but for a cron schedule.
+type CronTicker struct {
+	*cron.Cron
+	ch      chan time.Time
+	beenRun *atomic.Bool
+}
+
+// NewCronTicker returns a new CrontTicker for the given schedule.
+func NewCronTicker(schedule string) (CronTicker, error) {
+	cron := cron.New(cron.WithSeconds())
+	ch := make(chan time.Time, 1)
+	_, err := cron.AddFunc(schedule, func() {
+		select {
+		case ch <- time.Now():
+		default:
+		}
+	})
+	if err != nil {
+		return CronTicker{beenRun: atomic.NewBool(false)}, err
+	}
+	return CronTicker{Cron: cron, ch: ch, beenRun: atomic.NewBool(false)}, nil
+}
+
+// Start - returns true if the CronTicker was actually started, false otherwise
+func (t *CronTicker) Start() bool {
+	if t.Cron != nil {
+		if t.beenRun.CAS(false, true) {
+			t.Cron.Start()
+			return true
+		}
+	}
+	return false
+}
+
+// Stop - returns true if the CronTicker was actually stopped, false otherwise
+func (t *CronTicker) Stop() bool {
+	if t.Cron != nil {
+		if t.beenRun.CAS(true, false) {
+			t.Cron.Stop()
+			return true
+		}
+	}
+	return false
+}
+
+// Ticks returns the underlying chanel.
+func (t *CronTicker) Ticks() <-chan time.Time {
+	return t.ch
+}
+
+// ValidateCronSchedule returns an error if the given schedule is invalid.
+func ValidateCronSchedule(schedule string) error {
+	if !(strings.HasPrefix(schedule, "CRON_TZ=") || strings.HasPrefix(schedule, "@every ")) {
+		return errors.New("cron schedule must specify a time zone using CRON_TZ, e.g. 'CRON_TZ=UTC 5 * * * *', or use the @every syntax, e.g. '@every 1h30m'")
+	}
+	parser := cron.NewParser(cron.SecondOptional | cron.Minute | cron.Hour | cron.Dom | cron.Month | cron.Dow | cron.Descriptor)
+	_, err := parser.Parse(schedule)
+	return errors.Wrapf(err, "invalid cron schedule '%v'", schedule)
+}
+
 // ResettableTimer stores a timer
 type ResettableTimer struct {
 	timer *time.Timer
@@ -809,7 +793,7 @@ func NewResettableTimer() ResettableTimer {
 }
 
 // Ticks retrieves the ticks from a ResettableTimer
-func (t ResettableTimer) Ticks() <-chan time.Time {
+func (t *ResettableTimer) Ticks() <-chan time.Time {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
 	if t.timer == nil {
@@ -849,89 +833,257 @@ func EVMBytesToUint64(buf []byte) uint64 {
 	return result
 }
 
-// StartStopOnce contains a StartStopOnceState integer
-type StartStopOnce struct {
+type errNotStarted struct {
 	state StartStopOnceState
-	sync.RWMutex
 }
 
-// StartStopOnceState manages the state for StartStopOnce
-type StartStopOnceState int
+func (e *errNotStarted) Error() string {
+	return fmt.Sprintf("service is %q, not started", e.state)
+}
 
+// StartStopOnce contains a StartStopOnceState integer
+type StartStopOnce struct {
+	state        atomic.Int32
+	sync.RWMutex // lock is held during startup/shutdown, RLock is held while executing functions dependent on a particular state
+}
+
+// StartStopOnceState holds the state for StartStopOnce
+type StartStopOnceState int32
+
+//nolint
 const (
 	StartStopOnce_Unstarted StartStopOnceState = iota
 	StartStopOnce_Started
+	StartStopOnce_Starting
+	StartStopOnce_Stopping
 	StartStopOnce_Stopped
 )
 
+func (s StartStopOnceState) String() string {
+	switch s {
+	case StartStopOnce_Unstarted:
+		return "Unstarted"
+	case StartStopOnce_Started:
+		return "Started"
+	case StartStopOnce_Starting:
+		return "Starting"
+	case StartStopOnce_Stopping:
+		return "Stopping"
+	case StartStopOnce_Stopped:
+		return "Stopped"
+	default:
+		return fmt.Sprintf("unrecognized state: %d", s)
+	}
+}
+
 // StartOnce sets the state to Started
 func (once *StartStopOnce) StartOnce(name string, fn func() error) error {
+	// SAFETY: We do this compare-and-swap outside of the lock so that
+	// concurrent StartOnce() calls return immediately.
+	success := once.state.CAS(int32(StartStopOnce_Unstarted), int32(StartStopOnce_Starting))
+
+	if !success {
+		return errors.Errorf("%v has already started once", name)
+	}
+
 	once.Lock()
 	defer once.Unlock()
 
-	if once.state != StartStopOnce_Unstarted {
-		return errors.Errorf("%v has already started once", name)
-	}
-	once.state = StartStopOnce_Started
+	err := fn()
 
-	return fn()
+	success = once.state.CAS(int32(StartStopOnce_Starting), int32(StartStopOnce_Started))
+
+	if !success {
+		// SAFETY: If this is reached, something must be very wrong: once.state
+		// was tampered with outside of the lock.
+		panic(fmt.Sprintf("%v entered unreachable state, unable to set state to started", name))
+	}
+
+	return err
 }
 
 // StopOnce sets the state to Stopped
 func (once *StartStopOnce) StopOnce(name string, fn func() error) error {
+	// SAFETY: We hold the lock here so that Stop blocks until StartOnce
+	// executes. This ensures that a very fast call to Stop will wait for the
+	// code to finish starting up before teardown.
 	once.Lock()
 	defer once.Unlock()
 
-	if once.state != StartStopOnce_Started {
-		return errors.Errorf("%v has already stopped once", name)
+	success := once.state.CAS(int32(StartStopOnce_Started), int32(StartStopOnce_Stopping))
+
+	if !success {
+		return errors.Errorf("%v is unstarted or has already stopped once", name)
 	}
-	once.state = StartStopOnce_Stopped
 
-	return fn()
-}
+	err := fn()
 
-// OkayToStart checks if the state may be started
-func (once *StartStopOnce) OkayToStart() (ok bool) {
-	once.Lock()
-	defer once.Unlock()
+	success = once.state.CAS(int32(StartStopOnce_Stopping), int32(StartStopOnce_Stopped))
 
-	if once.state != StartStopOnce_Unstarted {
-		return false
+	if !success {
+		// SAFETY: If this is reached, something must be very wrong: once.state
+		// was tampered with outside of the lock.
+		panic(fmt.Sprintf("%v entered unreachable state, unable to set state to stopped", name))
 	}
-	once.state = StartStopOnce_Started
-	return true
-}
 
-// OkayToStop checks if the state may be stopped
-func (once *StartStopOnce) OkayToStop() (ok bool) {
-	once.Lock()
-	defer once.Unlock()
-
-	if once.state != StartStopOnce_Started {
-		return false
-	}
-	once.state = StartStopOnce_Stopped
-	return true
+	return err
 }
 
 // State retrieves the current state
 func (once *StartStopOnce) State() StartStopOnceState {
-	once.RLock()
-	defer once.RUnlock()
-	return once.state
+	state := once.state.Load()
+	return StartStopOnceState(state)
 }
 
-func (once *StartStopOnce) IfStarted(f func()) {
+// IfStarted runs the func and returns true only if started, otherwise returns false
+func (once *StartStopOnce) IfStarted(f func()) (ok bool) {
 	once.RLock()
 	defer once.RUnlock()
-	if once.state == StartStopOnce_Started {
+
+	state := once.state.Load()
+
+	if StartStopOnceState(state) == StartStopOnce_Started {
 		f()
+		return true
 	}
+	return false
+}
+
+// IfNotStopped runs the func and returns true if in any state other than Stopped
+func (once *StartStopOnce) IfNotStopped(f func()) (ok bool) {
+	once.RLock()
+	defer once.RUnlock()
+
+	state := once.state.Load()
+
+	if StartStopOnceState(state) == StartStopOnce_Stopped {
+		return false
+	}
+	f()
+	return true
+}
+
+// Ready returns ErrNotStarted if the state is not started.
+func (once *StartStopOnce) Ready() error {
+	state := once.State()
+	if state == StartStopOnce_Started {
+		return nil
+	}
+	return &errNotStarted{state: state}
+}
+
+// Healthy returns ErrNotStarted if the state is not started.
+// Override this per-service with more specific implementations.
+func (once *StartStopOnce) Healthy() error {
+	state := once.State()
+	if state == StartStopOnce_Started {
+		return nil
+	}
+	return &errNotStarted{state: state}
 }
 
 // WithJitter adds +/- 10% to a duration
 func WithJitter(d time.Duration) time.Duration {
+	// #nosec
+	if d == 0 {
+		return 0
+	}
 	jitter := mrand.Intn(int(d) / 5)
 	jitter = jitter - (jitter / 2)
 	return time.Duration(int(d) + jitter)
+}
+
+// NewRedialBackoff is a standard backoff to use for redialling or reconnecting to
+// unreachable network endpoints
+func NewRedialBackoff() backoff.Backoff {
+	return backoff.Backoff{
+		Min:    1 * time.Second,
+		Max:    15 * time.Second,
+		Jitter: true,
+	}
+
+}
+
+// KeyedMutex allows to lock based on particular values
+type KeyedMutex struct {
+	mutexes sync.Map
+}
+
+// LockInt64 locks the value for read/write
+func (m *KeyedMutex) LockInt64(key int64) func() {
+	value, _ := m.mutexes.LoadOrStore(key, new(sync.Mutex))
+	mtx := value.(*sync.Mutex)
+	mtx.Lock()
+
+	return func() { mtx.Unlock() }
+}
+
+// BoxOutput formats its arguments as fmt.Printf, and encloses them in a box of
+// arrows pointing at their content, in order to better highlight it. See
+// ExampleBoxOutput
+func BoxOutput(errorMsgTemplate string, errorMsgValues ...interface{}) string {
+	errorMsgTemplate = fmt.Sprintf(errorMsgTemplate, errorMsgValues...)
+	lines := strings.Split(errorMsgTemplate, "\n")
+	maxlen := 0
+	for _, line := range lines {
+		if len(line) > maxlen {
+			maxlen = len(line)
+		}
+	}
+	internalLength := maxlen + 4
+	output := "↘" + strings.Repeat("↓", internalLength) + "↙\n" // top line
+	output += "→  " + strings.Repeat(" ", maxlen) + "  ←\n"
+	readme := strings.Repeat("README ", maxlen/7)
+	output += "→  " + readme + strings.Repeat(" ", maxlen-len(readme)) + "  ←\n"
+	output += "→  " + strings.Repeat(" ", maxlen) + "  ←\n"
+	for _, line := range lines {
+		output += "→  " + line + strings.Repeat(" ", maxlen-len(line)) + "  ←\n"
+	}
+	output += "→  " + strings.Repeat(" ", maxlen) + "  ←\n"
+	output += "→  " + readme + strings.Repeat(" ", maxlen-len(readme)) + "  ←\n"
+	output += "→  " + strings.Repeat(" ", maxlen) + "  ←\n"
+	return "\n" + output + "↗" + strings.Repeat("↑", internalLength) + "↖" + // bottom line
+		"\n\n"
+}
+
+// AllEqual returns true iff all the provided elements are equal to each other.
+func AllEqual[T comparable](elems ...T) bool {
+	for i := 1; i < len(elems); i++ {
+		if elems[i] != elems[0] {
+			return false
+		}
+	}
+	return true
+}
+
+// RandUint256 generates a random bigNum up to 2 ** 256 - 1
+func RandUint256() *big.Int {
+	n, err := rand.Int(rand.Reader, MaxUint256)
+	if err != nil {
+		panic(err)
+	}
+	return n
+}
+
+func LeftPadBitString(input string, length int) string {
+	if len(input) >= length {
+		return input
+	}
+	return strings.Repeat("0", length-len(input)) + input
+}
+
+// TryParseHex parses the given hex string to bytes,
+// it can return error if the hex string is invalid.
+// Follows the semantic of ethereum's FromHex.
+func TryParseHex(s string) (b []byte, err error) {
+	if !HasHexPrefix(s) {
+		err = errors.New("hex string must have 0x prefix")
+	} else {
+		s = s[2:]
+		if len(s)%2 == 1 {
+			s = "0" + s
+		}
+		b, err = hex.DecodeString(s)
+	}
+	return
 }

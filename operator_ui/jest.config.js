@@ -6,7 +6,7 @@ module.exports = {
     '<rootDir>/support/',
     '<rootDir>/__tests__',
   ],
-  setupFiles: ['<rootDir>/jest.setup.js'],
+  setupFilesAfterEnv: ['<rootDir>/jest.setup.js'],
   globalSetup: './jest.globalSetup.js',
   testPathIgnorePatterns: [
     '<rootDir>/dist/',
@@ -21,4 +21,8 @@ module.exports = {
       '<rootDir>/__mocks__/fileMock.js',
     '\\.(css|less|sass|scss)$': '<rootDir>/__mocks__/styleMock.js',
   },
+  transformIgnorePatterns: ['/node_modules/(?!(react-syntax-highlighter)/)'],
+  testEnvironment: 'jsdom',
+  testTimeout: 20000,
+  collectCoverage: true,
 }

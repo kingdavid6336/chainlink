@@ -1,5 +1,10 @@
 package utils
 
+import (
+	"fmt"
+	"time"
+)
+
 // SleeperTask represents a task that waits in the background to process some work.
 type SleeperTask interface {
 	Stop() error
@@ -10,6 +15,7 @@ type SleeperTask interface {
 // Worker is a simple interface that represents some work to do repeatedly
 type Worker interface {
 	Work()
+	Name() string
 }
 
 type sleeperTask struct {
@@ -36,21 +42,26 @@ func NewSleeperTask(worker Worker) SleeperTask {
 		chStop:  make(chan struct{}),
 		chDone:  make(chan struct{}),
 	}
-	_ = s.OkayToStart()
-	go s.workerLoop()
+
+	_ = s.StartOnce("SleeperTask-"+worker.Name(), func() error {
+		go s.workerLoop()
+		return nil
+	})
 
 	return s
 }
 
 // Stop stops the SleeperTask
-// It never returns an error, this is simply to comply with the interface
 func (s *sleeperTask) Stop() error {
-	if !s.OkayToStop() {
-		panic("already stopped")
-	}
-	close(s.chStop)
-	<-s.chDone
-	return nil
+	return s.StopOnce("SleeperTask-"+s.worker.Name(), func() error {
+		close(s.chStop)
+		select {
+		case <-s.chDone:
+		case <-time.After(15 * time.Second):
+			return fmt.Errorf("SleeperTask-%s took too long to stop", s.worker.Name())
+		}
+		return nil
+	})
 }
 
 func (s *sleeperTask) WakeUpIfStarted() {
@@ -86,6 +97,15 @@ func (s *sleeperTask) workerLoop() {
 	}
 }
 
-type SleeperTaskFuncWorker func()
+type sleeperTaskWorker struct {
+	name string
+	work func()
+}
 
-func (fn SleeperTaskFuncWorker) Work() { fn() }
+// SleeperFuncTask returns a Worker to execute the given work function.
+func SleeperFuncTask(work func(), name string) Worker {
+	return &sleeperTaskWorker{name: name, work: work}
+}
+
+func (w *sleeperTaskWorker) Name() string { return w.name }
+func (w *sleeperTaskWorker) Work()        { w.work() }

@@ -6,14 +6,60 @@ import (
 	"io/ioutil"
 	"net/http"
 	"os"
-	"strconv"
 
 	"github.com/pkg/errors"
-	"github.com/smartcontractkit/chainlink/core/store/models/p2pkey"
 	"github.com/smartcontractkit/chainlink/core/utils"
+	"github.com/smartcontractkit/chainlink/core/web/presenters"
 	"github.com/urfave/cli"
 	"go.uber.org/multierr"
 )
+
+type P2PKeyPresenter struct {
+	JAID
+	presenters.P2PKeyResource
+}
+
+// RenderTable implements TableRenderer
+func (p *P2PKeyPresenter) RenderTable(rt RendererTable) error {
+	headers := []string{"ID", "Peer ID", "Public key"}
+	rows := [][]string{p.ToRow()}
+
+	if _, err := rt.Write([]byte("🔑 P2P Keys\n")); err != nil {
+		return err
+	}
+	renderList(headers, rows, rt.Writer)
+
+	return utils.JustError(rt.Write([]byte("\n")))
+}
+
+func (p *P2PKeyPresenter) ToRow() []string {
+	row := []string{
+		p.ID,
+		p.PeerID,
+		p.PubKey,
+	}
+
+	return row
+}
+
+type P2PKeyPresenters []P2PKeyPresenter
+
+// RenderTable implements TableRenderer
+func (ps P2PKeyPresenters) RenderTable(rt RendererTable) error {
+	headers := []string{"ID", "Peer ID", "Public key"}
+	rows := [][]string{}
+
+	for _, p := range ps {
+		rows = append(rows, p.ToRow())
+	}
+
+	if _, err := rt.Write([]byte("🔑 P2P Keys\n")); err != nil {
+		return err
+	}
+	renderList(headers, rows, rt.Writer)
+
+	return utils.JustError(rt.Write([]byte("\n")))
+}
 
 // ListP2PKeys retrieves a list of all P2P keys
 func (cli *Client) ListP2PKeys(c *cli.Context) (err error) {
@@ -27,8 +73,7 @@ func (cli *Client) ListP2PKeys(c *cli.Context) (err error) {
 		}
 	}()
 
-	var keys []p2pkey.EncryptedP2PKey
-	return cli.renderAPIResponse(resp, &keys)
+	return cli.renderAPIResponse(resp, &P2PKeyPresenters{})
 }
 
 // CreateP2PKey creates a new P2P key
@@ -43,8 +88,7 @@ func (cli *Client) CreateP2PKey(c *cli.Context) (err error) {
 		}
 	}()
 
-	var key p2pkey.EncryptedP2PKey
-	return cli.renderAPIResponse(resp, &key, "Created P2P keypair")
+	return cli.renderAPIResponse(resp, &P2PKeyPresenter{}, "Created P2P keypair")
 }
 
 // DeleteP2PKey deletes a P2P key,
@@ -53,10 +97,7 @@ func (cli *Client) DeleteP2PKey(c *cli.Context) (err error) {
 	if !c.Args().Present() {
 		return cli.errorOut(errors.New("Must pass the key ID to be deleted"))
 	}
-	id, err := strconv.ParseUint(c.Args().Get(0), 10, 32)
-	if err != nil {
-		return cli.errorOut(err)
-	}
+	id := c.Args().Get(0)
 
 	if !confirmAction(c) {
 		return nil
@@ -67,7 +108,7 @@ func (cli *Client) DeleteP2PKey(c *cli.Context) (err error) {
 		queryStr = "?hard=true"
 	}
 
-	resp, err := cli.HTTP.Delete(fmt.Sprintf("/v2/keys/p2p/%d%s", id, queryStr))
+	resp, err := cli.HTTP.Delete(fmt.Sprintf("/v2/keys/p2p/%s%s", id, queryStr))
 	if err != nil {
 		return cli.errorOut(err)
 	}
@@ -77,8 +118,7 @@ func (cli *Client) DeleteP2PKey(c *cli.Context) (err error) {
 		}
 	}()
 
-	var key p2pkey.EncryptedP2PKey
-	return cli.renderAPIResponse(resp, &key, "P2P key deleted")
+	return cli.renderAPIResponse(resp, &P2PKeyPresenter{}, "P2P key deleted")
 }
 
 // ImportP2PKey imports and stores a P2P key,
@@ -114,8 +154,7 @@ func (cli *Client) ImportP2PKey(c *cli.Context) (err error) {
 		}
 	}()
 
-	var key p2pkey.EncryptedP2PKey
-	return cli.renderAPIResponse(resp, &key, "🔑 Imported P2P key")
+	return cli.renderAPIResponse(resp, &P2PKeyPresenter{}, "🔑 Imported P2P key")
 }
 
 // ExportP2PKey exports a P2P key,

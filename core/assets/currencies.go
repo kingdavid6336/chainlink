@@ -28,13 +28,21 @@ func format(i *big.Int, precision int) string {
 // Link contains a field to represent the smallest units of LINK
 type Link big.Int
 
-// NewLink returns a new struct to represent LINK from it's smallest unit
-func NewLink(w int64) *Link {
+// NewLinkFromJuels returns a new struct to represent LINK from it's smallest unit
+func NewLinkFromJuels(w int64) *Link {
 	return (*Link)(big.NewInt(w))
 }
 
 // String returns Link formatted as a string.
 func (l *Link) String() string {
+	if l == nil {
+		return "0"
+	}
+	return fmt.Sprintf("%v", (*big.Int)(l))
+}
+
+// Link returns Link formatted as a string, in LINK units
+func (l *Link) Link() string {
 	if l == nil {
 		return "0"
 	}
@@ -177,6 +185,7 @@ func NewEthValue(w int64) Eth {
 }
 
 // NewEthValueS returns a new struct to represent ETH from a string value of Eth (not wei)
+// the underlying value is still wei
 func NewEthValueS(s string) (Eth, error) {
 	e, err := decimal.NewFromString(s)
 	if err != nil {

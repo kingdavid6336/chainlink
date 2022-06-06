@@ -3,35 +3,39 @@ package cmd_test
 import (
 	"bytes"
 	"context"
-	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"math/big"
+	"net/http"
 	"os"
 	"strconv"
 	"testing"
+	"time"
 
-	"github.com/smartcontractkit/chainlink/core/services/job"
-	"github.com/smartcontractkit/chainlink/core/web"
-
-	"github.com/smartcontractkit/chainlink/core/services/eth"
-
-	"github.com/ethereum/go-ethereum/common"
 	"github.com/pelletier/go-toml"
-	"github.com/smartcontractkit/chainlink/core/auth"
-	"github.com/smartcontractkit/chainlink/core/cmd"
-	"github.com/smartcontractkit/chainlink/core/internal/cltest"
-	"github.com/smartcontractkit/chainlink/core/internal/mocks"
-	"github.com/smartcontractkit/chainlink/core/store/models"
-	"github.com/smartcontractkit/chainlink/core/store/presenters"
-	webpresenters "github.com/smartcontractkit/chainlink/core/web/presenters"
 	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 	"github.com/urfave/cli"
 	"gopkg.in/guregu/null.v4"
-	"gorm.io/gorm"
+
+	"github.com/smartcontractkit/chainlink/core/auth"
+	"github.com/smartcontractkit/chainlink/core/bridges"
+	evmmocks "github.com/smartcontractkit/chainlink/core/chains/evm/mocks"
+	"github.com/smartcontractkit/chainlink/core/cmd"
+	"github.com/smartcontractkit/chainlink/core/config"
+	"github.com/smartcontractkit/chainlink/core/internal/cltest"
+	"github.com/smartcontractkit/chainlink/core/internal/testutils"
+	"github.com/smartcontractkit/chainlink/core/internal/testutils/configtest"
+	"github.com/smartcontractkit/chainlink/core/internal/testutils/pgtest"
+	"github.com/smartcontractkit/chainlink/core/logger"
+	"github.com/smartcontractkit/chainlink/core/services/job"
+	"github.com/smartcontractkit/chainlink/core/sessions"
+	"github.com/smartcontractkit/chainlink/core/static"
+	"github.com/smartcontractkit/chainlink/core/testdata/testspecs"
+	"github.com/smartcontractkit/chainlink/core/web"
 )
 
 var (
@@ -40,20 +44,17 @@ var (
 
 type startOptions struct {
 	// Set the config options
-	Config map[string]interface{}
+	SetConfig func(cfg *configtest.TestGeneralConfig)
 	// Use to set up mocks on the app
 	FlagsAndDeps []interface{}
 	// Add a key on start up
 	WithKey bool
-	// Use app.StartAndConnect instead of app.Start
-	StartAndConnect bool
 }
 
 func startNewApplication(t *testing.T, setup ...func(opts *startOptions)) *cltest.TestApplication {
 	t.Helper()
 
 	sopts := &startOptions{
-		Config:       map[string]interface{}{},
 		FlagsAndDeps: []interface{}{},
 	}
 	for _, fn := range setup {
@@ -61,39 +62,32 @@ func startNewApplication(t *testing.T, setup ...func(opts *startOptions)) *cltes
 	}
 
 	// Setup config
-	config, cfgCleanup := cltest.NewConfig(t)
-	t.Cleanup(cfgCleanup)
-	config.Set("DEFAULT_HTTP_TIMEOUT", "30ms")
-	config.Set("MAX_HTTP_ATTEMPTS", "1")
+	config := cltest.NewTestGeneralConfig(t)
+	config.Overrides.SetDefaultHTTPTimeout(30 * time.Millisecond)
+	config.Overrides.SetHTTPServerWriteTimeout(10 * time.Second)
 
-	for k, v := range sopts.Config {
-		config.Set(k, v)
+	// Generally speaking, most tests that use startNewApplication don't
+	// actually need ChainSets loaded. We can greatly reduce test
+	// overhead by disabling EVM here. If you need EVM interactions in
+	// your tests, you can manually override and turn it on using
+	// withConfigSet.
+	config.Overrides.EVMEnabled = null.BoolFrom(false)
+	config.Overrides.P2PEnabled = null.BoolFrom(false)
+
+	if sopts.SetConfig != nil {
+		sopts.SetConfig(config)
 	}
 
-	var app *cltest.TestApplication
-	var cleanup func()
-	if sopts.WithKey {
-		app, cleanup = cltest.NewApplicationWithConfigAndKey(t, config, sopts.FlagsAndDeps...)
-	} else {
-		app, cleanup = cltest.NewApplicationWithConfig(t, config, sopts.FlagsAndDeps...)
-	}
-	t.Cleanup(cleanup)
-
-	if sopts.StartAndConnect {
-		require.NoError(t, app.StartAndConnect())
-	} else {
-		require.NoError(t, app.Start())
-	}
+	app := cltest.NewApplicationWithConfigAndKey(t, config, sopts.FlagsAndDeps...)
+	require.NoError(t, app.Start(testutils.Context(t)))
 
 	return app
 }
 
 // withConfig is a function option which sets config on the app
-func withConfig(cfgs map[string]interface{}) func(opts *startOptions) {
+func withConfigSet(cfgSet func(*configtest.TestGeneralConfig)) func(opts *startOptions) {
 	return func(opts *startOptions) {
-		for k, v := range cfgs {
-			opts.Config[k] = v
-		}
+		opts.SetConfig = cfgSet
 	}
 }
 
@@ -109,19 +103,15 @@ func withKey() func(opts *startOptions) {
 	}
 }
 
-func startAndConnect() func(opts *startOptions) {
-	return func(opts *startOptions) {
-		opts.StartAndConnect = true
-	}
+func newEthMock(t *testing.T) *evmmocks.Client {
+	t.Helper()
+	return cltest.NewEthMocksWithStartupAssertions(t)
 }
 
-func newEthMocks(t *testing.T) (*mocks.RPCClient, *mocks.GethClient) {
+func newEthMockWithTransactionsOnBlocksAssertions(t *testing.T) *evmmocks.Client {
 	t.Helper()
 
-	rpcClient, gethClient, _, assertMocksCalled := cltest.NewEthMocksWithStartupAssertions(t)
-	t.Cleanup(assertMocksCalled)
-
-	return rpcClient, gethClient
+	return cltest.NewEthMocksWithTransactionsOnBlocksAssertions(t)
 }
 
 func keyNameForTest(t *testing.T) string {
@@ -133,113 +123,26 @@ func deleteKeyExportFile(t *testing.T) {
 	err := os.Remove(keyName)
 	if err == nil || os.IsNotExist(err) {
 		return
-	} else {
-		require.NoError(t, err)
 	}
+	require.NoError(t, err)
 }
 
-func TestClient_IndexJobSpecs(t *testing.T) {
+func TestClient_ReplayBlocks(t *testing.T) {
 	t.Parallel()
 
-	app := startNewApplication(t)
-	client, r := app.NewClientAndRenderer()
+	app := startNewApplication(t,
+		withConfigSet(func(c *configtest.TestGeneralConfig) {
+			c.Overrides.EVMEnabled = null.BoolFrom(true)
+			c.Overrides.GlobalEvmNonceAutoSync = null.BoolFrom(false)
+			c.Overrides.GlobalBalanceMonitorEnabled = null.BoolFrom(false)
+			c.Overrides.GlobalGasEstimatorMode = null.StringFrom("FixedPrice")
+		}))
+	client, _ := app.NewClientAndRenderer()
 
-	j1 := cltest.NewJob()
-	app.Store.CreateJob(&j1)
-	j2 := cltest.NewJob()
-	app.Store.CreateJob(&j2)
-
-	require.Nil(t, client.IndexJobSpecs(cltest.EmptyCLIContext()))
-	jobs := *r.Renders[0].(*[]models.JobSpec)
-	require.Equal(t, 2, len(jobs))
-	assert.Equal(t, j1.ID, jobs[0].ID)
-}
-
-func TestClient_ShowJobRun_Exists(t *testing.T) {
-	t.Parallel()
-
-	app := startNewApplication(t)
-	client, r := app.NewClientAndRenderer()
-
-	j := cltest.NewJobWithWebInitiator()
-	assert.NoError(t, app.Store.CreateJob(&j))
-
-	jr := cltest.CreateJobRunViaWeb(t, app, j, `{"result":"100"}`)
-
-	set := flag.NewFlagSet("test", 0)
-	set.Parse([]string{jr.ID.String()})
+	set := flag.NewFlagSet("flagset", 0)
+	set.Int64("block-number", 42, "")
 	c := cli.NewContext(nil, set, nil)
-	assert.NoError(t, client.ShowJobRun(c))
-	assert.Equal(t, 1, len(r.Renders))
-	assert.Equal(t, jr.ID, r.Renders[0].(*presenters.JobRun).ID)
-}
-
-func TestClient_ShowJobRun_NotFound(t *testing.T) {
-	t.Parallel()
-
-	app := startNewApplication(t)
-	client, r := app.NewClientAndRenderer()
-
-	set := flag.NewFlagSet("test", 0)
-	set.Parse([]string{"bogus-ID"})
-	c := cli.NewContext(nil, set, nil)
-	assert.Error(t, client.ShowJobRun(c))
-	assert.Empty(t, r.Renders)
-}
-
-func TestClient_IndexJobRuns(t *testing.T) {
-	t.Parallel()
-
-	app := startNewApplication(t)
-	client, r := app.NewClientAndRenderer()
-
-	j := cltest.NewJobWithWebInitiator()
-	assert.NoError(t, app.Store.CreateJob(&j))
-
-	jr0 := cltest.NewJobRun(j)
-	jr0.Result.Data = cltest.JSONFromString(t, `{"a":"b"}`)
-	require.NoError(t, app.Store.CreateJobRun(&jr0))
-	jr1 := cltest.NewJobRun(j)
-	jr1.Result.Data = cltest.JSONFromString(t, `{"x":"y"}`)
-	require.NoError(t, app.Store.CreateJobRun(&jr1))
-
-	require.Nil(t, client.IndexJobRuns(cltest.EmptyCLIContext()))
-	runs := *r.Renders[0].(*[]presenters.JobRun)
-	require.Len(t, runs, 2)
-	assert.Equal(t, jr0.ID, runs[0].ID)
-	assert.JSONEq(t, `{"a":"b"}`, runs[0].Result.Data.String())
-	assert.Equal(t, jr1.ID, runs[1].ID)
-	assert.JSONEq(t, `{"x":"y"}`, runs[1].Result.Data.String())
-}
-
-func TestClient_ShowJobSpec_Exists(t *testing.T) {
-	t.Parallel()
-
-	app := startNewApplication(t)
-	client, r := app.NewClientAndRenderer()
-
-	job := cltest.NewJob()
-	app.Store.CreateJob(&job)
-
-	set := flag.NewFlagSet("test", 0)
-	set.Parse([]string{job.ID.String()})
-	c := cli.NewContext(nil, set, nil)
-	require.Nil(t, client.ShowJobSpec(c))
-	require.Equal(t, 1, len(r.Renders))
-	assert.Equal(t, job.ID, r.Renders[0].(*presenters.JobSpec).ID)
-}
-
-func TestClient_ShowJobSpec_NotFound(t *testing.T) {
-	t.Parallel()
-
-	app := startNewApplication(t)
-	client, r := app.NewClientAndRenderer()
-
-	set := flag.NewFlagSet("test", 0)
-	set.Parse([]string{"bogus-ID"})
-	c := cli.NewContext(nil, set, nil)
-	assert.Error(t, client.ShowJobSpec(c))
-	assert.Empty(t, r.Renders)
+	assert.NoError(t, client.ReplayFromBlock(c))
 }
 
 func TestClient_CreateExternalInitiator(t *testing.T) {
@@ -265,12 +168,10 @@ func TestClient_CreateExternalInitiator(t *testing.T) {
 			c := cli.NewContext(nil, set, nil)
 
 			err := client.CreateExternalInitiator(c)
-			assert.NoError(t, err)
+			require.NoError(t, err)
 
-			var exi models.ExternalInitiator
-			err = app.Store.RawDBWithAdvisoryLock(func(db *gorm.DB) error {
-				return db.Where("name = ?", test.args[0]).Find(&exi).Error
-			})
+			var exi bridges.ExternalInitiator
+			err = app.GetSqlxDB().Get(&exi, `SELECT * FROM external_initiators WHERE name = $1`, test.args[0])
 			require.NoError(t, err)
 
 			if len(test.args) > 1 {
@@ -298,6 +199,8 @@ func TestClient_CreateExternalInitiator_Errors(t *testing.T) {
 			app := startNewApplication(t)
 			client, _ := app.NewClientAndRenderer()
 
+			initialExis := len(cltest.AllExternalInitiators(t, app.GetSqlxDB()))
+
 			set := flag.NewFlagSet("create", 0)
 			assert.NoError(t, set.Parse(test.args))
 			c := cli.NewContext(nil, set, nil)
@@ -305,8 +208,8 @@ func TestClient_CreateExternalInitiator_Errors(t *testing.T) {
 			err := client.CreateExternalInitiator(c)
 			assert.Error(t, err)
 
-			exis := cltest.AllExternalInitiators(t, app.Store)
-			assert.Len(t, exis, 0)
+			exis := cltest.AllExternalInitiators(t, app.GetSqlxDB())
+			assert.Len(t, exis, initialExis)
 		})
 	}
 }
@@ -318,11 +221,11 @@ func TestClient_DestroyExternalInitiator(t *testing.T) {
 	client, r := app.NewClientAndRenderer()
 
 	token := auth.NewToken()
-	exi, err := models.NewExternalInitiator(token,
-		&models.ExternalInitiatorRequest{Name: "name"},
+	exi, err := bridges.NewExternalInitiator(token,
+		&bridges.ExternalInitiatorRequest{Name: "name"},
 	)
 	require.NoError(t, err)
-	err = app.Store.CreateExternalInitiator(exi)
+	err = app.BridgeORM().CreateExternalInitiator(exi)
 	require.NoError(t, err)
 
 	set := flag.NewFlagSet("test", 0)
@@ -345,236 +248,10 @@ func TestClient_DestroyExternalInitiator_NotFound(t *testing.T) {
 	assert.Empty(t, r.Renders)
 }
 
-func TestClient_CreateJobSpec(t *testing.T) {
-	t.Parallel()
-
-	app := startNewApplication(t)
-	client, _ := app.NewClientAndRenderer()
-
-	tests := []struct {
-		name, input string
-		nJobs       int
-		errored     bool
-	}{
-		{"bad json", "{bad son}", 0, true},
-		{"bad filepath", "bad/filepath/", 0, true},
-		{"web", `{"initiators":[{"type":"web"}],"tasks":[{"type":"NoOp"}]}`, 1, false},
-		{"runAt", `{"initiators":[{"type":"runAt","params":{"time":"3000-01-08T18:12:01.103Z"}}],"tasks":[{"type":"NoOp"}]}`, 2, false},
-		{"file", "../internal/fixtures/web/end_at_job.json", 3, false},
-	}
-
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			set := flag.NewFlagSet("create", 0)
-			set.Parse([]string{test.input})
-			c := cli.NewContext(nil, set, nil)
-
-			err := client.CreateJobSpec(c)
-			cltest.AssertError(t, test.errored, err)
-
-			numberOfJobs := cltest.AllJobs(t, app.Store)
-			assert.Equal(t, test.nJobs, len(numberOfJobs))
-		})
-	}
-}
-
-func TestClient_ArchiveJobSpec(t *testing.T) {
-	t.Parallel()
-
-	eim := new(mocks.ExternalInitiatorManager)
-	app := startNewApplication(t, withMocks(eim))
-	client, _ := app.NewClientAndRenderer()
-
-	job := cltest.NewJob()
-	require.NoError(t, app.Store.CreateJob(&job))
-
-	set := flag.NewFlagSet("archive", 0)
-	set.Parse([]string{job.ID.String()})
-	c := cli.NewContext(nil, set, nil)
-
-	eim.On("DeleteJob", mock.Anything, mock.MatchedBy(func(id models.JobID) bool {
-		return id.String() == job.ID.String()
-	})).Once().Return(nil)
-
-	require.NoError(t, client.ArchiveJobSpec(c))
-
-	jobs := cltest.AllJobs(t, app.Store)
-	require.Len(t, jobs, 0)
-}
-
-func TestClient_CreateJobSpec_JSONAPIErrors(t *testing.T) {
-	t.Parallel()
-
-	app := startNewApplication(t)
-	client, _ := app.NewClientAndRenderer()
-
-	set := flag.NewFlagSet("create", 0)
-	set.Parse([]string{`{"initiators":[{"type":"runAt"}],"tasks":[{"type":"NoOp"}]}`})
-	c := cli.NewContext(nil, set, nil)
-
-	err := client.CreateJobSpec(c)
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "must have a time")
-}
-
-func TestClient_CreateJobRun(t *testing.T) {
-	t.Parallel()
-
-	app := startNewApplication(t)
-	client, _ := app.NewClientAndRenderer()
-
-	tests := []struct {
-		name    string
-		json    string
-		jobSpec models.JobSpec
-		errored bool
-	}{
-		{"CreateSuccess", `{"result": 100}`, cltest.NewJobWithWebInitiator(), false},
-		{"EmptyBody", ``, cltest.NewJobWithWebInitiator(), false},
-		{"InvalidBody", `{`, cltest.NewJobWithWebInitiator(), true},
-		{"WithoutWebInitiator", ``, cltest.NewJobWithLogInitiator(), true},
-		{"NotFound", ``, cltest.NewJobWithWebInitiator(), true},
-	}
-
-	for _, tt := range tests {
-		test := tt
-		t.Run(test.name, func(t *testing.T) {
-			assert.Nil(t, app.Store.CreateJob(&test.jobSpec))
-
-			args := make([]string, 1)
-			args[0] = test.jobSpec.ID.String()
-			if test.name == "NotFound" {
-				args[0] = "badID"
-			}
-
-			if len(test.json) > 0 {
-				args = append(args, test.json)
-			}
-
-			set := flag.NewFlagSet("run", 0)
-			set.Parse(args)
-			c := cli.NewContext(nil, set, nil)
-			if test.errored {
-				assert.Error(t, client.CreateJobRun(c))
-			} else {
-				assert.Nil(t, client.CreateJobRun(c))
-			}
-		})
-	}
-}
-
-func TestClient_CreateBridge(t *testing.T) {
-	t.Parallel()
-
-	app := startNewApplication(t)
-	client, _ := app.NewClientAndRenderer()
-
-	tests := []struct {
-		name    string
-		param   string
-		errored bool
-	}{
-		{"EmptyString", "", true},
-		{"ValidString", `{ "name": "TestBridge", "url": "http://localhost:3000/randomNumber" }`, false},
-		{"InvalidString", `{ "noname": "", "nourl": "" }`, true},
-		{"InvalidChar", `{ "badname": "path/bridge", "nourl": "" }`, true},
-		{"ValidPath", "testdata/create_random_number_bridge_type.json", false},
-		{"InvalidPath", "bad/filepath/", true},
-	}
-
-	for _, tt := range tests {
-		test := tt
-		t.Run(test.name, func(t *testing.T) {
-
-			set := flag.NewFlagSet("bridge", 0)
-			set.Parse([]string{test.param})
-			c := cli.NewContext(nil, set, nil)
-			if test.errored {
-				assert.Error(t, client.CreateBridge(c))
-			} else {
-				assert.Nil(t, client.CreateBridge(c))
-			}
-		})
-	}
-}
-
-func TestClient_IndexBridges(t *testing.T) {
-	t.Parallel()
-
-	app := startNewApplication(t)
-	client, r := app.NewClientAndRenderer()
-
-	bt1 := &models.BridgeType{
-		Name:          models.MustNewTaskType("testingbridges1"),
-		URL:           cltest.WebURL(t, "https://testing.com/bridges"),
-		Confirmations: 0,
-	}
-	err := app.GetStore().CreateBridgeType(bt1)
-	require.NoError(t, err)
-
-	bt2 := &models.BridgeType{
-		Name:          models.MustNewTaskType("testingbridges2"),
-		URL:           cltest.WebURL(t, "https://testing.com/bridges"),
-		Confirmations: 0,
-	}
-	err = app.GetStore().CreateBridgeType(bt2)
-	require.NoError(t, err)
-
-	require.Nil(t, client.IndexBridges(cltest.EmptyCLIContext()))
-	bridges := *r.Renders[0].(*[]models.BridgeType)
-	require.Equal(t, 2, len(bridges))
-	assert.Equal(t, bt1.Name, bridges[0].Name)
-}
-
-func TestClient_ShowBridge(t *testing.T) {
-	t.Parallel()
-
-	app := startNewApplication(t)
-	client, r := app.NewClientAndRenderer()
-
-	bt := &models.BridgeType{
-		Name:          models.MustNewTaskType("testingbridges1"),
-		URL:           cltest.WebURL(t, "https://testing.com/bridges"),
-		Confirmations: 0,
-	}
-	require.NoError(t, app.GetStore().CreateBridgeType(bt))
-
-	set := flag.NewFlagSet("test", 0)
-	set.Parse([]string{bt.Name.String()})
-	c := cli.NewContext(nil, set, nil)
-	require.NoError(t, client.ShowBridge(c))
-	require.Len(t, r.Renders, 1)
-	assert.Equal(t, bt.Name, r.Renders[0].(*models.BridgeType).Name)
-}
-
-func TestClient_RemoveBridge(t *testing.T) {
-	t.Parallel()
-
-	app := startNewApplication(t)
-	client, r := app.NewClientAndRenderer()
-
-	bt := &models.BridgeType{
-		Name:          models.MustNewTaskType("testingbridges1"),
-		URL:           cltest.WebURL(t, "https://testing.com/bridges"),
-		Confirmations: 0,
-	}
-	err := app.GetStore().CreateBridgeType(bt)
-	require.NoError(t, err)
-
-	set := flag.NewFlagSet("test", 0)
-	set.Parse([]string{bt.Name.String()})
-	c := cli.NewContext(nil, set, nil)
-	require.NoError(t, client.RemoveBridge(c))
-	require.Len(t, r.Renders, 1)
-	assert.Equal(t, bt.Name, r.Renders[0].(*models.BridgeType).Name)
-}
-
 func TestClient_RemoteLogin(t *testing.T) {
 	t.Parallel()
 
-	app := startNewApplication(t, withConfig(map[string]interface{}{
-		"ADMIN_CREDENTIALS_FILE": "",
-	}))
+	app := startNewApplication(t)
 
 	tests := []struct {
 		name, file string
@@ -590,11 +267,13 @@ func TestClient_RemoteLogin(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			enteredStrings := []string{test.email, test.pwd}
-			prompter := &cltest.MockCountingPrompter{EnteredStrings: enteredStrings}
+			prompter := &cltest.MockCountingPrompter{T: t, EnteredStrings: enteredStrings}
 			client := app.NewAuthenticatingClient(prompter)
 
 			set := flag.NewFlagSet("test", 0)
 			set.String("file", test.file, "")
+			set.Bool("bypass-version-check", true, "")
+			set.String("admin-credentials-file", "", "")
 			c := cli.NewContext(nil, set, nil)
 
 			err := client.RemoteLogin(c)
@@ -607,38 +286,113 @@ func TestClient_RemoteLogin(t *testing.T) {
 	}
 }
 
-func TestClient_SendEther_From_BPTXM(t *testing.T) {
+func TestClient_RemoteBuildCompatibility(t *testing.T) {
 	t.Parallel()
 
-	rpcClient, gethClient := newEthMocks(t)
-	oca := common.HexToAddress("0xDEADB3333333F")
-	app := startNewApplication(t,
-		withKey(),
-		withConfig(map[string]interface{}{
-			"OPERATOR_CONTRACT_ADDRESS": &oca,
-		}),
-		withMocks(eth.NewClientWith(rpcClient, gethClient)),
-		startAndConnect(),
-	)
-	client, _ := app.NewClientAndRenderer()
-	s := app.GetStore()
+	app := startNewApplication(t)
+	enteredStrings := []string{cltest.APIEmail, cltest.Password}
+	prompter := &cltest.MockCountingPrompter{T: t, EnteredStrings: append(enteredStrings, enteredStrings...)}
+	client := app.NewAuthenticatingClient(prompter)
 
-	set := flag.NewFlagSet("sendether", 0)
-	amount := "100.5"
-	_, fromAddress := cltest.MustAddRandomKeyToKeystore(t, s, 0)
-	to := "0x342156c8d3bA54Abc67920d35ba1d1e67201aC9C"
-	set.Parse([]string{amount, fromAddress.Hex(), to})
+	remoteVersion, remoteSha := "test"+static.Version, "abcd"+static.Sha
+	client.HTTP = &mockHTTPClient{client.HTTP, remoteVersion, remoteSha}
 
-	cliapp := cli.NewApp()
-	c := cli.NewContext(cliapp, set, nil)
+	expErr := cmd.ErrIncompatible{
+		CLIVersion:    static.Version,
+		CLISha:        static.Sha,
+		RemoteVersion: remoteVersion,
+		RemoteSha:     remoteSha,
+	}.Error()
 
-	assert.NoError(t, client.SendEther(c))
+	// Fails without bypass
+	set := flag.NewFlagSet("test", 0)
+	set.Bool("bypass-version-check", false, "")
+	c := cli.NewContext(nil, set, nil)
+	err := client.RemoteLogin(c)
+	assert.Error(t, err)
+	assert.EqualError(t, err, expErr)
 
-	etx := models.EthTx{}
-	require.NoError(t, s.DB.First(&etx).Error)
-	require.Equal(t, "100.500000000000000000", etx.Value.String())
-	require.Equal(t, fromAddress, etx.FromAddress)
-	require.Equal(t, to, etx.ToAddress.Hex())
+	// Defaults to false
+	set = flag.NewFlagSet("test", 0)
+	c = cli.NewContext(nil, set, nil)
+	err = client.RemoteLogin(c)
+	assert.Error(t, err)
+	assert.EqualError(t, err, expErr)
+}
+
+func TestClient_CheckRemoteBuildCompatibility(t *testing.T) {
+	t.Parallel()
+
+	app := startNewApplication(t)
+	tests := []struct {
+		name                         string
+		remoteVersion, remoteSha     string
+		cliVersion, cliSha           string
+		bypassVersionFlag, wantError bool
+	}{
+		{"success match", "1.1.1", "53120d5", "1.1.1", "53120d5", false, false},
+		{"cli unset fails", "1.1.1", "53120d5", "unset", "unset", false, true},
+		{"remote unset fails", "unset", "unset", "1.1.1", "53120d5", false, true},
+		{"mismatch fail", "1.1.1", "53120d5", "1.6.9", "13230sas", false, true},
+		{"mismatch but using bypass_version_flag", "1.1.1", "53120d5", "1.6.9", "13230sas", true, false},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			enteredStrings := []string{cltest.APIEmail, cltest.Password}
+			prompter := &cltest.MockCountingPrompter{T: t, EnteredStrings: enteredStrings}
+			client := app.NewAuthenticatingClient(prompter)
+
+			client.HTTP = &mockHTTPClient{client.HTTP, test.remoteVersion, test.remoteSha}
+
+			err := client.CheckRemoteBuildCompatibility(logger.TestLogger(t), test.bypassVersionFlag, test.cliVersion, test.cliSha)
+			if test.wantError {
+				assert.Error(t, err)
+				assert.ErrorIs(t, err, cmd.ErrIncompatible{
+					RemoteVersion: test.remoteVersion,
+					RemoteSha:     test.remoteSha,
+					CLIVersion:    test.cliVersion,
+					CLISha:        test.cliSha,
+				})
+			} else {
+				assert.NoError(t, err)
+			}
+		})
+	}
+}
+
+type mockHTTPClient struct {
+	HTTP        cmd.HTTPClient
+	mockVersion string
+	mockSha     string
+}
+
+func (h *mockHTTPClient) Get(path string, headers ...map[string]string) (*http.Response, error) {
+	if path == "/v2/build_info" {
+		// Return mocked response here
+		json := fmt.Sprintf(`{"version":"%s","commitSHA":"%s"}`, h.mockVersion, h.mockSha)
+		r := ioutil.NopCloser(bytes.NewReader([]byte(json)))
+		return &http.Response{
+			StatusCode: 200,
+			Body:       r,
+		}, nil
+	}
+	return h.HTTP.Get(path, headers...)
+}
+
+func (h *mockHTTPClient) Post(path string, body io.Reader) (*http.Response, error) {
+	return h.HTTP.Post(path, body)
+}
+
+func (h *mockHTTPClient) Put(path string, body io.Reader) (*http.Response, error) {
+	return h.HTTP.Put(path, body)
+}
+
+func (h *mockHTTPClient) Patch(path string, body io.Reader, headers ...map[string]string) (*http.Response, error) {
+	return h.HTTP.Patch(path, body, headers...)
+}
+
+func (h *mockHTTPClient) Delete(path string) (*http.Response, error) {
+	return h.HTTP.Delete(path)
 }
 
 func TestClient_ChangePassword(t *testing.T) {
@@ -647,13 +401,14 @@ func TestClient_ChangePassword(t *testing.T) {
 	app := startNewApplication(t)
 
 	enteredStrings := []string{cltest.APIEmail, cltest.Password}
-	prompter := &cltest.MockCountingPrompter{EnteredStrings: enteredStrings}
+	prompter := &cltest.MockCountingPrompter{T: t, EnteredStrings: enteredStrings}
 
 	client := app.NewAuthenticatingClient(prompter)
 	otherClient := app.NewAuthenticatingClient(prompter)
 
 	set := flag.NewFlagSet("test", 0)
 	set.String("file", "../internal/fixtures/apicredentials", "")
+	set.Bool("bypass-version-check", true, "")
 	c := cli.NewContext(nil, set, nil)
 	err := client.RemoteLogin(c)
 	require.NoError(t, err)
@@ -676,127 +431,121 @@ func TestClient_ChangePassword(t *testing.T) {
 	require.Contains(t, err.Error(), "Unauthorized")
 }
 
-func TestClient_IndexTransactions(t *testing.T) {
+func TestClient_Profile_InvalidSecondsParam(t *testing.T) {
 	t.Parallel()
 
 	app := startNewApplication(t)
-	client, r := app.NewClientAndRenderer()
+	enteredStrings := []string{cltest.APIEmail, cltest.Password}
+	prompter := &cltest.MockCountingPrompter{T: t, EnteredStrings: enteredStrings}
 
-	store := app.GetStore()
-	_, from := cltest.MustAddRandomKeyToKeystore(t, store)
+	client := app.NewAuthenticatingClient(prompter)
 
-	tx := cltest.MustInsertConfirmedEthTxWithAttempt(t, store, 0, 1, from)
-	attempt := tx.EthTxAttempts[0]
-
-	// page 1
-	set := flag.NewFlagSet("test transactions", 0)
-	set.Int("page", 1, "doc")
+	set := flag.NewFlagSet("test", 0)
+	set.String("file", "../internal/fixtures/apicredentials", "")
+	set.Bool("bypass-version-check", true, "")
 	c := cli.NewContext(nil, set, nil)
-	require.Equal(t, 1, c.Int("page"))
-	assert.NoError(t, client.IndexTransactions(c))
+	err := client.RemoteLogin(c)
+	require.NoError(t, err)
 
-	renderedTxs := *r.Renders[0].(*[]webpresenters.EthTxResource)
-	assert.Equal(t, 1, len(renderedTxs))
-	assert.Equal(t, attempt.Hash.Hex(), renderedTxs[0].Hash.Hex())
+	set.Uint("seconds", 10, "")
 
-	// page 2 which doesn't exist
-	set = flag.NewFlagSet("test txattempts", 0)
-	set.Int("page", 2, "doc")
-	c = cli.NewContext(nil, set, nil)
-	require.Equal(t, 2, c.Int("page"))
-	assert.NoError(t, client.IndexTransactions(c))
+	err = client.Profile(cli.NewContext(nil, set, nil))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "profile duration should be less than server write timeout.")
 
-	renderedTxs = *r.Renders[1].(*[]webpresenters.EthTxResource)
-	assert.Equal(t, 0, len(renderedTxs))
 }
 
-func TestClient_ShowTransaction(t *testing.T) {
+func TestClient_Profile(t *testing.T) {
 	t.Parallel()
 
 	app := startNewApplication(t)
-	client, r := app.NewClientAndRenderer()
+	enteredStrings := []string{cltest.APIEmail, cltest.Password}
+	prompter := &cltest.MockCountingPrompter{T: t, EnteredStrings: enteredStrings}
 
-	store := app.GetStore()
-	_, from := cltest.MustAddRandomKeyToKeystore(t, store)
+	client := app.NewAuthenticatingClient(prompter)
 
-	tx := cltest.MustInsertConfirmedEthTxWithAttempt(t, store, 0, 1, from)
-	attempt := tx.EthTxAttempts[0]
-
-	set := flag.NewFlagSet("test get tx", 0)
-	set.Parse([]string{attempt.Hash.Hex()})
+	set := flag.NewFlagSet("test", 0)
+	set.String("file", "../internal/fixtures/apicredentials", "")
+	set.Bool("bypass-version-check", true, "")
 	c := cli.NewContext(nil, set, nil)
-	assert.NoError(t, client.ShowTransaction(c))
+	err := client.RemoteLogin(c)
+	require.NoError(t, err)
 
-	renderedTx := *r.Renders[0].(*webpresenters.EthTxResource)
-	assert.Equal(t, &tx.FromAddress, renderedTx.From)
+	set.Uint("seconds", 8, "")
+	set.String("output_dir", t.TempDir(), "")
+
+	err = client.Profile(cli.NewContext(nil, set, nil))
+	require.NoError(t, err)
 }
-
-func TestClient_IndexTxAttempts(t *testing.T) {
+func TestClient_SetDefaultGasPrice(t *testing.T) {
 	t.Parallel()
 
-	app := startNewApplication(t)
-	client, r := app.NewClientAndRenderer()
-
-	store := app.GetStore()
-	_, from := cltest.MustAddRandomKeyToKeystore(t, store)
-
-	tx := cltest.MustInsertConfirmedEthTxWithAttempt(t, store, 0, 1, from)
-
-	// page 1
-	set := flag.NewFlagSet("test txattempts", 0)
-	set.Int("page", 1, "doc")
-	c := cli.NewContext(nil, set, nil)
-	require.Equal(t, 1, c.Int("page"))
-	assert.NoError(t, client.IndexTxAttempts(c))
-
-	renderedAttempts := *r.Renders[0].(*[]webpresenters.EthTxResource)
-	require.Len(t, tx.EthTxAttempts, 1)
-	assert.Equal(t, tx.EthTxAttempts[0].Hash.Hex(), renderedAttempts[0].Hash.Hex())
-
-	// page 2 which doesn't exist
-	set = flag.NewFlagSet("test transactions", 0)
-	set.Int("page", 2, "doc")
-	c = cli.NewContext(nil, set, nil)
-	require.Equal(t, 2, c.Int("page"))
-	assert.NoError(t, client.IndexTxAttempts(c))
-
-	renderedAttempts = *r.Renders[1].(*[]webpresenters.EthTxResource)
-	assert.Equal(t, 0, len(renderedAttempts))
-}
-
-func TestClient_SetMinimumGasPrice(t *testing.T) {
-	t.Parallel()
-
-	// Setup Withdrawals application
-	rpcClient, gethClient := newEthMocks(t)
-	oca := common.HexToAddress("0xDEADB3333333F")
+	ethMock := newEthMock(t)
 	app := startNewApplication(t,
 		withKey(),
-		withConfig(map[string]interface{}{
-			"OPERATOR_CONTRACT_ADDRESS": &oca,
+		withMocks(ethMock),
+		withConfigSet(func(c *configtest.TestGeneralConfig) {
+			c.Overrides.EVMEnabled = null.BoolFrom(true)
+			c.Overrides.GlobalEvmNonceAutoSync = null.BoolFrom(false)
+			c.Overrides.GlobalBalanceMonitorEnabled = null.BoolFrom(false)
 		}),
-		withMocks(eth.NewClientWith(rpcClient, gethClient)),
-		startAndConnect(),
 	)
 	client, _ := app.NewClientAndRenderer()
 
-	set := flag.NewFlagSet("setgasprice", 0)
-	set.Parse([]string{"8616460799"})
+	t.Run("without specifying chain id setting value", func(t *testing.T) {
+		set := flag.NewFlagSet("setgasprice", 0)
+		set.Parse([]string{"8616460799"})
 
-	c := cli.NewContext(nil, set, nil)
+		c := cli.NewContext(nil, set, nil)
 
-	assert.NoError(t, client.SetMinimumGasPrice(c))
-	assert.Equal(t, big.NewInt(8616460799), app.Store.Config.EthGasPriceDefault())
+		assert.NoError(t, client.SetEvmGasPriceDefault(c))
+		ch, err := app.GetChains().EVM.Default()
+		require.NoError(t, err)
+		cfg := ch.Config()
+		assert.Equal(t, big.NewInt(8616460799), cfg.EvmGasPriceDefault())
 
-	client, _ = app.NewClientAndRenderer()
-	set = flag.NewFlagSet("setgasprice", 0)
-	set.String("amount", "861.6460799", "")
-	set.Bool("gwei", true, "")
-	set.Parse([]string{"-gwei", "861.6460799"})
+		client, _ = app.NewClientAndRenderer()
+		set = flag.NewFlagSet("setgasprice", 0)
+		set.String("amount", "", "")
+		set.Bool("gwei", true, "")
+		set.Parse([]string{"-gwei", "861.6460799"})
 
-	c = cli.NewContext(nil, set, nil)
-	assert.NoError(t, client.SetMinimumGasPrice(c))
-	assert.Equal(t, big.NewInt(861646079900), app.Store.Config.EthGasPriceDefault())
+		c = cli.NewContext(nil, set, nil)
+		assert.NoError(t, client.SetEvmGasPriceDefault(c))
+		assert.Equal(t, big.NewInt(861646079900), cfg.EvmGasPriceDefault())
+	})
+
+	t.Run("specifying wrong chain id", func(t *testing.T) {
+		set := flag.NewFlagSet("setgasprice", 0)
+		set.String("evmChainID", "", "")
+		set.Parse([]string{"-evmChainID", "985435435435", "8616460799"})
+
+		c := cli.NewContext(nil, set, nil)
+
+		err := client.SetEvmGasPriceDefault(c)
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "evmChainID does not match any local chains")
+
+		ch, err := app.GetChains().EVM.Default()
+		require.NoError(t, err)
+		cfg := ch.Config()
+		assert.Equal(t, big.NewInt(861646079900), cfg.EvmGasPriceDefault())
+	})
+
+	t.Run("specifying correct chain id", func(t *testing.T) {
+		set := flag.NewFlagSet("setgasprice", 0)
+		set.String("evmChainID", "", "")
+		set.Parse([]string{"-evmChainID", "0", "12345678900"})
+
+		c := cli.NewContext(nil, set, nil)
+
+		assert.NoError(t, client.SetEvmGasPriceDefault(c))
+		ch, err := app.GetChains().EVM.Default()
+		require.NoError(t, err)
+		cfg := ch.Config()
+
+		assert.Equal(t, big.NewInt(12345678900), cfg.EvmGasPriceDefault())
+	})
 }
 
 func TestClient_GetConfiguration(t *testing.T) {
@@ -804,74 +553,54 @@ func TestClient_GetConfiguration(t *testing.T) {
 
 	app := startNewApplication(t)
 	client, r := app.NewClientAndRenderer()
+	cfg := app.GetConfig()
 
 	assert.NoError(t, client.GetConfiguration(cltest.EmptyCLIContext()))
 	require.Equal(t, 1, len(r.Renders))
 
-	cp := *r.Renders[0].(*presenters.ConfigPrinter)
-	assert.Equal(t, cp.EnvPrinter.BridgeResponseURL, app.Config.BridgeResponseURL().String())
-	assert.Equal(t, cp.EnvPrinter.ChainID, app.Config.ChainID())
-	assert.Equal(t, cp.EnvPrinter.Dev, app.Config.Dev())
-	assert.Equal(t, cp.EnvPrinter.EthGasBumpThreshold, app.Config.EthGasBumpThreshold())
-	assert.Equal(t, cp.EnvPrinter.LogLevel, app.Config.LogLevel())
-	assert.Equal(t, cp.EnvPrinter.LogSQLStatements, app.Config.LogSQLStatements())
-	assert.Equal(t, cp.EnvPrinter.MinIncomingConfirmations, app.Config.MinIncomingConfirmations())
-	assert.Equal(t, cp.EnvPrinter.MinRequiredOutgoingConfirmations, app.Config.MinRequiredOutgoingConfirmations())
-	assert.Equal(t, cp.EnvPrinter.MinimumContractPayment, app.Config.MinimumContractPayment())
-	assert.Equal(t, cp.EnvPrinter.RootDir, app.Config.RootDir())
-	assert.Equal(t, cp.EnvPrinter.SessionTimeout, app.Config.SessionTimeout())
-}
-
-func TestClient_CancelJobRun(t *testing.T) {
-	t.Parallel()
-
-	app := startNewApplication(t)
-	client, _ := app.NewClientAndRenderer()
-
-	job := cltest.NewJobWithWebInitiator()
-	require.NoError(t, app.Store.CreateJob(&job))
-	run := cltest.NewJobRun(job)
-	require.NoError(t, app.Store.CreateJobRun(&run))
-
-	set := flag.NewFlagSet("cancel", 0)
-	set.Parse([]string{run.ID.String()})
-	c := cli.NewContext(nil, set, nil)
-
-	require.NoError(t, client.CancelJobRun(c))
-
-	runs := cltest.MustAllJobsWithStatus(t, app.Store, models.RunStatusCancelled)
-	require.Len(t, runs, 1)
-	assert.Equal(t, models.RunStatusCancelled, runs[0].GetStatus())
-	assert.NotNil(t, runs[0].FinishedAt)
+	cp := *r.Renders[0].(*config.ConfigPrinter)
+	assert.Equal(t, cp.EnvPrinter.BridgeResponseURL, cfg.BridgeResponseURL().String())
+	assert.Equal(t, cp.EnvPrinter.DefaultChainID, cfg.DefaultChainID().String())
+	assert.Equal(t, cp.EnvPrinter.Dev, cfg.Dev())
+	assert.Equal(t, cp.EnvPrinter.LogLevel, cfg.LogLevel())
+	assert.Equal(t, cp.EnvPrinter.LogSQL, cfg.LogSQL())
+	assert.Equal(t, cp.EnvPrinter.RootDir, cfg.RootDir())
+	assert.Equal(t, cp.EnvPrinter.SessionTimeout, cfg.SessionTimeout())
 }
 
 func TestClient_RunOCRJob_HappyPath(t *testing.T) {
 	t.Parallel()
 
-	app := startNewApplication(t)
+	app := startNewApplication(t, withConfigSet(func(c *configtest.TestGeneralConfig) {
+		c.Overrides.EVMEnabled = null.BoolFrom(true)
+		c.Overrides.FeatureOffchainReporting = null.BoolFrom(true)
+		c.Overrides.GlobalGasEstimatorMode = null.StringFrom("FixedPrice")
+	}))
 	client, _ := app.NewClientAndRenderer()
 
-	_, bridge := cltest.NewBridgeType(t, "voter_turnout", "http://blah.com")
-	require.NoError(t, app.Store.DB.Create(bridge).Error)
-	_, bridge2 := cltest.NewBridgeType(t, "election_winner", "http://blah.com")
-	require.NoError(t, app.Store.DB.Create(bridge2).Error)
+	app.KeyStore.OCR().Add(cltest.DefaultOCRKey)
+	app.KeyStore.P2P().Add(cltest.DefaultP2PKey)
 
-	var ocrJobSpecFromFile job.Job
-	tree, err := toml.LoadFile("testdata/oracle-spec.toml")
-	require.NoError(t, err)
-	err = tree.Unmarshal(&ocrJobSpecFromFile)
-	require.NoError(t, err)
-	var ocrSpec job.OffchainReportingOracleSpec
-	err = tree.Unmarshal(&ocrSpec)
-	require.NoError(t, err)
-	ocrJobSpecFromFile.OffchainreportingOracleSpec = &ocrSpec
-	key := cltest.MustInsertRandomKey(t, app.Store.DB)
-	ocrJobSpecFromFile.OffchainreportingOracleSpec.TransmitterAddress = &key.Address
+	_, bridge := cltest.MustCreateBridge(t, app.GetSqlxDB(), cltest.BridgeOpts{}, app.GetConfig())
+	_, bridge2 := cltest.MustCreateBridge(t, app.GetSqlxDB(), cltest.BridgeOpts{}, app.GetConfig())
 
-	jobID, _ := app.AddJobV2(context.Background(), ocrJobSpecFromFile, null.String{})
+	var jb job.Job
+	ocrspec := testspecs.GenerateOCRSpec(testspecs.OCRSpecParams{DS1BridgeName: bridge.Name.String(), DS2BridgeName: bridge2.Name.String()})
+	err := toml.Unmarshal([]byte(ocrspec.Toml()), &jb)
+	require.NoError(t, err)
+	var ocrSpec job.OCROracleSpec
+	err = toml.Unmarshal([]byte(ocrspec.Toml()), &ocrspec)
+	require.NoError(t, err)
+	jb.OCROracleSpec = &ocrSpec
+	key, _ := cltest.MustInsertRandomKey(t, app.KeyStore.Eth())
+	jb.OCROracleSpec.TransmitterAddress = &key.Address
+
+	err = app.AddJobV2(context.Background(), &jb)
+	require.NoError(t, err)
 
 	set := flag.NewFlagSet("test", 0)
-	set.Parse([]string{strconv.FormatInt(int64(jobID), 10)})
+	set.Bool("bypass-version-check", true, "")
+	set.Parse([]string{strconv.FormatInt(int64(jb.ID), 10)})
 	c := cli.NewContext(nil, set, nil)
 
 	require.NoError(t, client.RemoteLogin(c))
@@ -885,6 +614,7 @@ func TestClient_RunOCRJob_MissingJobID(t *testing.T) {
 	client, _ := app.NewClientAndRenderer()
 
 	set := flag.NewFlagSet("test", 0)
+	set.Bool("bypass-version-check", true, "")
 	c := cli.NewContext(nil, set, nil)
 
 	require.NoError(t, client.RemoteLogin(c))
@@ -899,53 +629,12 @@ func TestClient_RunOCRJob_JobNotFound(t *testing.T) {
 
 	set := flag.NewFlagSet("test", 0)
 	set.Parse([]string{"1"})
+	set.Bool("bypass-version-check", true, "")
 	c := cli.NewContext(nil, set, nil)
 
 	require.NoError(t, client.RemoteLogin(c))
-	assert.EqualError(t, client.TriggerPipelineRun(c), "parseResponse error: Error; job ID 1: record not found")
-}
-
-func TestClient_ListJobsV2(t *testing.T) {
-	t.Parallel()
-
-	app := startNewApplication(t)
-	client, r := app.NewClientAndRenderer()
-
-	// Create the job
-	toml, err := ioutil.ReadFile("./testdata/direct-request-spec.toml")
-	assert.NoError(t, err)
-
-	request, err := json.Marshal(models.CreateJobSpecRequest{
-		TOML: string(toml),
-	})
-	assert.NoError(t, err)
-
-	resp, err := client.HTTP.Post("/v2/jobs", bytes.NewReader(request))
-	assert.NoError(t, err)
-
-	responseBodyBytes, err := ioutil.ReadAll(resp.Body)
-	assert.NoError(t, err)
-
-	job := cmd.Job{}
-	err = web.ParseJSONAPIResponse(responseBodyBytes, &job)
-	assert.NoError(t, err)
-
-	require.Nil(t, client.ListJobsV2(cltest.EmptyCLIContext()))
-	jobs := *r.Renders[0].(*[]cmd.Job)
-	require.Equal(t, 1, len(jobs))
-	assert.Equal(t, job.ID, jobs[0].ID)
-}
-
-func TestClient_CreateJobV2(t *testing.T) {
-	t.Parallel()
-
-	app := startNewApplication(t)
-	client, _ := app.NewClientAndRenderer()
-
-	fs := flag.NewFlagSet("", flag.ExitOnError)
-	fs.Parse([]string{"./testdata/ocr-bootstrap-spec.toml"})
-	err := client.CreateJobV2(cli.NewContext(nil, fs, nil))
-	require.NoError(t, err)
+	err := client.TriggerPipelineRun(c)
+	assert.Contains(t, err.Error(), "parseResponse error: Error; job ID 1")
 }
 
 func TestClient_AutoLogin(t *testing.T) {
@@ -953,20 +642,62 @@ func TestClient_AutoLogin(t *testing.T) {
 
 	app := startNewApplication(t)
 
-	user := cltest.MustRandomUser()
-	require.NoError(t, app.Store.SaveUser(&user))
+	user := cltest.MustRandomUser(t)
+	require.NoError(t, app.SessionORM().CreateUser(&user))
 
-	sr := models.SessionRequest{
+	sr := sessions.SessionRequest{
 		Email:    user.Email,
 		Password: cltest.Password,
 	}
 	client, _ := app.NewClientAndRenderer()
-	client.CookieAuthenticator = cmd.NewSessionCookieAuthenticator(app.Config.Config, &cmd.MemoryCookieStore{})
-	client.HTTP = cmd.NewAuthenticatedHTTPClient(app.Config, client.CookieAuthenticator, sr)
+	client.CookieAuthenticator = cmd.NewSessionCookieAuthenticator(app.NewClientOpts(), &cmd.MemoryCookieStore{}, logger.TestLogger(t))
+	client.HTTP = cmd.NewAuthenticatedHTTPClient(app.Logger, app.NewClientOpts(), client.CookieAuthenticator, sr)
 
 	fs := flag.NewFlagSet("", flag.ExitOnError)
-	err := client.ListJobsV2(cli.NewContext(nil, fs, nil))
+	err := client.ListJobs(cli.NewContext(nil, fs, nil))
 	require.NoError(t, err)
+
+	// Expire the session and then try again
+	pgtest.MustExec(t, app.GetSqlxDB(), "TRUNCATE sessions")
+	err = client.ListJobs(cli.NewContext(nil, fs, nil))
+	require.NoError(t, err)
+}
+
+func TestClient_AutoLogin_AuthFails(t *testing.T) {
+	t.Parallel()
+
+	app := startNewApplication(t)
+
+	user := cltest.MustRandomUser(t)
+	require.NoError(t, app.SessionORM().CreateUser(&user))
+
+	sr := sessions.SessionRequest{
+		Email:    user.Email,
+		Password: cltest.Password,
+	}
+	client, _ := app.NewClientAndRenderer()
+	client.CookieAuthenticator = FailingAuthenticator{}
+	client.HTTP = cmd.NewAuthenticatedHTTPClient(app.Logger, app.NewClientOpts(), client.CookieAuthenticator, sr)
+
+	fs := flag.NewFlagSet("", flag.ExitOnError)
+	err := client.ListJobs(cli.NewContext(nil, fs, nil))
+	require.Error(t, err)
+}
+
+type FailingAuthenticator struct{}
+
+func (FailingAuthenticator) Cookie() (*http.Cookie, error) {
+	return &http.Cookie{}, nil
+}
+
+// Authenticate retrieves a session ID via a cookie and saves it to disk.
+func (FailingAuthenticator) Authenticate(sessionRequest sessions.SessionRequest) (*http.Cookie, error) {
+	return nil, errors.New("no luck")
+}
+
+// Remove a session ID from disk
+func (FailingAuthenticator) Logout() error {
+	return errors.New("no luck")
 }
 
 func TestClient_SetLogConfig(t *testing.T) {
@@ -991,7 +722,7 @@ func TestClient_SetLogConfig(t *testing.T) {
 
 	err = client.SetLogSQL(c)
 	assert.NoError(t, err)
-	assert.Equal(t, sqlEnabled, app.Config.LogSQLStatements())
+	assert.Equal(t, sqlEnabled, app.Config.LogSQL())
 
 	sqlEnabled = false
 	set = flag.NewFlagSet("logsql", 0)
@@ -1000,5 +731,5 @@ func TestClient_SetLogConfig(t *testing.T) {
 
 	err = client.SetLogSQL(c)
 	assert.NoError(t, err)
-	assert.Equal(t, sqlEnabled, app.Config.LogSQLStatements())
+	assert.Equal(t, sqlEnabled, app.Config.LogSQL())
 }

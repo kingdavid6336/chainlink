@@ -7,20 +7,19 @@ import (
 	"net/http"
 	"testing"
 
-	"github.com/smartcontractkit/chainlink/core/services/eth"
-
 	"github.com/smartcontractkit/chainlink/core/auth"
 	"github.com/smartcontractkit/chainlink/core/internal/cltest"
-	"github.com/smartcontractkit/chainlink/core/store/models"
+	"github.com/smartcontractkit/chainlink/core/internal/testutils"
+	"github.com/smartcontractkit/chainlink/core/sessions"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
 func TestUserController_UpdatePassword(t *testing.T) {
-	app, cleanup := cltest.NewApplicationWithKey(t)
-	t.Cleanup(cleanup)
-	require.NoError(t, app.Start())
+	app := cltest.NewApplicationEVMDisabled(t)
+	require.NoError(t, app.Start(testutils.Context(t)))
+
 	client := app.NewHTTPClient()
 
 	testCases := []struct {
@@ -71,16 +70,11 @@ func TestUserController_UpdatePassword(t *testing.T) {
 func TestUserController_NewAPIToken(t *testing.T) {
 	t.Parallel()
 
-	rpcClient, gethClient, _, assertMocksCalled := cltest.NewEthMocksWithStartupAssertions(t)
-	defer assertMocksCalled()
-	app, cleanup := cltest.NewApplicationWithKey(t,
-		eth.NewClientWith(rpcClient, gethClient),
-	)
-	defer cleanup()
-	require.NoError(t, app.Start())
+	app := cltest.NewApplicationEVMDisabled(t)
+	require.NoError(t, app.Start(testutils.Context(t)))
 
 	client := app.NewHTTPClient()
-	req, err := json.Marshal(models.ChangeAuthTokenRequest{
+	req, err := json.Marshal(sessions.ChangeAuthTokenRequest{
 		Password: cltest.Password,
 	})
 	require.NoError(t, err)
@@ -98,16 +92,11 @@ func TestUserController_NewAPIToken(t *testing.T) {
 func TestUserController_NewAPIToken_unauthorized(t *testing.T) {
 	t.Parallel()
 
-	rpcClient, gethClient, _, assertMocksCalled := cltest.NewEthMocksWithStartupAssertions(t)
-	defer assertMocksCalled()
-	app, cleanup := cltest.NewApplicationWithKey(t,
-		eth.NewClientWith(rpcClient, gethClient),
-	)
-	defer cleanup()
-	require.NoError(t, app.Start())
+	app := cltest.NewApplicationEVMDisabled(t)
+	require.NoError(t, app.Start(testutils.Context(t)))
 
 	client := app.NewHTTPClient()
-	req, err := json.Marshal(models.ChangeAuthTokenRequest{
+	req, err := json.Marshal(sessions.ChangeAuthTokenRequest{
 		Password: "wrong-password",
 	})
 	require.NoError(t, err)
@@ -119,16 +108,11 @@ func TestUserController_NewAPIToken_unauthorized(t *testing.T) {
 func TestUserController_DeleteAPIKey(t *testing.T) {
 	t.Parallel()
 
-	rpcClient, gethClient, _, assertMocksCalled := cltest.NewEthMocksWithStartupAssertions(t)
-	defer assertMocksCalled()
-	app, cleanup := cltest.NewApplicationWithKey(t,
-		eth.NewClientWith(rpcClient, gethClient),
-	)
-	defer cleanup()
-	require.NoError(t, app.Start())
+	app := cltest.NewApplicationEVMDisabled(t)
+	require.NoError(t, app.Start(testutils.Context(t)))
 
 	client := app.NewHTTPClient()
-	req, err := json.Marshal(models.ChangeAuthTokenRequest{
+	req, err := json.Marshal(sessions.ChangeAuthTokenRequest{
 		Password: cltest.Password,
 	})
 	require.NoError(t, err)
@@ -141,16 +125,11 @@ func TestUserController_DeleteAPIKey(t *testing.T) {
 func TestUserController_DeleteAPIKey_unauthorized(t *testing.T) {
 	t.Parallel()
 
-	rpcClient, gethClient, _, assertMocksCalled := cltest.NewEthMocksWithStartupAssertions(t)
-	defer assertMocksCalled()
-	app, cleanup := cltest.NewApplicationWithKey(t,
-		eth.NewClientWith(rpcClient, gethClient),
-	)
-	defer cleanup()
-	require.NoError(t, app.Start())
+	app := cltest.NewApplicationEVMDisabled(t)
+	require.NoError(t, app.Start(testutils.Context(t)))
 
 	client := app.NewHTTPClient()
-	req, err := json.Marshal(models.ChangeAuthTokenRequest{
+	req, err := json.Marshal(sessions.ChangeAuthTokenRequest{
 		Password: "wrong-password",
 	})
 	require.NoError(t, err)

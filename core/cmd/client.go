@@ -2,34 +2,58 @@ package cmd
 
 import (
 	"bytes"
+	"context"
+	"crypto/tls"
+	"database/sql"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"io/ioutil"
-	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"path"
 	"strconv"
 	"strings"
 	"time"
 
-	"github.com/smartcontractkit/chainlink/core/logger"
-	"github.com/smartcontractkit/chainlink/core/services"
-	"github.com/smartcontractkit/chainlink/core/services/chainlink"
-	"github.com/smartcontractkit/chainlink/core/services/eth"
-	"github.com/smartcontractkit/chainlink/core/services/postgres"
-	"github.com/smartcontractkit/chainlink/core/store"
-	"github.com/smartcontractkit/chainlink/core/store/models"
-	"github.com/smartcontractkit/chainlink/core/store/orm"
-	"github.com/smartcontractkit/chainlink/core/web"
-
+	"github.com/Depado/ginprom"
+	"github.com/Masterminds/semver/v3"
 	"github.com/gin-gonic/gin"
+	"github.com/pkg/errors"
 	clipkg "github.com/urfave/cli"
 	"go.uber.org/multierr"
+	"go.uber.org/zap/zapcore"
 	"golang.org/x/sync/errgroup"
+
+	"github.com/smartcontractkit/sqlx"
+
+	"github.com/smartcontractkit/chainlink/core/chains/evm"
+	"github.com/smartcontractkit/chainlink/core/chains/solana"
+	"github.com/smartcontractkit/chainlink/core/chains/terra"
+	"github.com/smartcontractkit/chainlink/core/config"
+	"github.com/smartcontractkit/chainlink/core/logger"
+	"github.com/smartcontractkit/chainlink/core/services/chainlink"
+	"github.com/smartcontractkit/chainlink/core/services/keystore"
+	"github.com/smartcontractkit/chainlink/core/services/periodicbackup"
+	"github.com/smartcontractkit/chainlink/core/services/pg"
+	"github.com/smartcontractkit/chainlink/core/services/versioning"
+	"github.com/smartcontractkit/chainlink/core/services/webhook"
+	"github.com/smartcontractkit/chainlink/core/sessions"
+	"github.com/smartcontractkit/chainlink/core/static"
+	"github.com/smartcontractkit/chainlink/core/store/migrate"
+	"github.com/smartcontractkit/chainlink/core/utils"
+	clhttp "github.com/smartcontractkit/chainlink/core/utils/http"
+	"github.com/smartcontractkit/chainlink/core/web"
 )
+
+var prometheus *ginprom.Prometheus
+
+func init() {
+	// ensure metrics are registered once per instance to avoid registering
+	// metrics multiple times (panic)
+	prometheus = ginprom.New(ginprom.Namespace("service"))
+}
 
 var (
 	// ErrorNoAPICredentialsAvailable is returned when not run from a terminal
@@ -40,9 +64,11 @@ var (
 // Client is the shell for the node, local commands and remote commands.
 type Client struct {
 	Renderer
-	Config                         *orm.Config
+	Config                         config.GeneralConfig
+	Logger                         logger.Logger
+	CloseLogger                    func() error
 	AppFactory                     AppFactory
-	KeyStoreAuthenticator          KeyStoreAuthenticator
+	KeyStoreAuthenticator          TerminalKeyStoreAuthenticator
 	FallbackAPIInitializer         APIInitializer
 	Runner                         Runner
 	HTTP                           HTTPClient
@@ -62,33 +88,160 @@ func (cli *Client) errorOut(err error) error {
 
 // AppFactory implements the NewApplication method.
 type AppFactory interface {
-	NewApplication(*orm.Config, ...func(chainlink.Application)) (chainlink.Application, error)
+	NewApplication(cfg config.GeneralConfig, db *sqlx.DB) (chainlink.Application, error)
 }
 
 // ChainlinkAppFactory is used to create a new Application.
 type ChainlinkAppFactory struct{}
 
 // NewApplication returns a new instance of the node with the given config.
-func (n ChainlinkAppFactory) NewApplication(config *orm.Config, onConnectCallbacks ...func(chainlink.Application)) (chainlink.Application, error) {
-	var ethClient eth.Client
-	if config.EthereumDisabled() {
-		logger.Info("ETH_DISABLED is set, using Null eth.Client")
-		ethClient = &eth.NullClient{}
-	} else {
-		var err error
-		ethClient, err = eth.NewClient(config.EthereumURL(), config.EthereumSecondaryURLs()...)
+func (n ChainlinkAppFactory) NewApplication(cfg config.GeneralConfig, db *sqlx.DB) (app chainlink.Application, err error) {
+	appLggr, closeLggr := logger.NewLogger()
+
+	keyStore := keystore.New(db, utils.GetScryptParams(cfg), appLggr, cfg)
+
+	// Set up the versioning ORM
+	verORM := versioning.NewORM(db, appLggr)
+
+	if static.Version != "unset" {
+		var appv, dbv *semver.Version
+		appv, dbv, err = versioning.CheckVersion(db, appLggr, static.Version)
 		if err != nil {
+			// Exit immediately and don't touch the database if the app version is too old
+			return nil, errors.Wrap(err, "CheckVersion")
+		}
+
+		// Take backup if app version is newer than DB version
+		// Need to do this BEFORE migration
+		if cfg.DatabaseBackupMode() != config.DatabaseBackupModeNone && cfg.DatabaseBackupOnVersionUpgrade() {
+			if err = takeBackupIfVersionUpgrade(cfg, appLggr, appv, dbv); err != nil {
+				if errors.Is(err, sql.ErrNoRows) {
+					appLggr.Debugf("Failed to find any node version in the DB: %w", err)
+				} else if strings.Contains(err.Error(), "relation \"node_versions\" does not exist") {
+					appLggr.Debugf("Failed to find any node version in the DB, the node_versions table does not exist yet: %w", err)
+				} else {
+					return nil, errors.Wrap(err, "initializeORM#FindLatestNodeVersion")
+				}
+			}
+		}
+	}
+
+	// Migrate the database
+	if cfg.MigrateDatabase() {
+		if err = migrate.Migrate(db.DB, appLggr); err != nil {
+			return nil, errors.Wrap(err, "initializeORM#Migrate")
+		}
+	}
+
+	// Update to latest version
+	if static.Version != "unset" {
+		version := versioning.NewNodeVersion(static.Version)
+		if err = verORM.UpsertNodeVersion(version); err != nil {
+			return nil, errors.Wrap(err, "UpsertNodeVersion")
+		}
+	}
+
+	// Upsert EVM chains/nodes from ENV, necessary for backwards compatibility
+	if cfg.EVMEnabled() {
+		if err = evm.ClobberDBFromEnv(db, cfg, appLggr); err != nil {
 			return nil, err
 		}
 	}
 
-	advisoryLock := postgres.NewAdvisoryLock(config.DatabaseURL())
-	return chainlink.NewApplication(config, ethClient, advisoryLock, store.StandardKeyStoreGen, services.NewExternalInitiatorManager(), onConnectCallbacks...)
+	eventBroadcaster := pg.NewEventBroadcaster(cfg.DatabaseURL(), cfg.DatabaseListenerMinReconnectInterval(), cfg.DatabaseListenerMaxReconnectDuration(), appLggr, cfg.AppID())
+	ccOpts := evm.ChainSetOpts{
+		Config:           cfg,
+		Logger:           appLggr,
+		DB:               db,
+		ORM:              evm.NewORM(db, appLggr, cfg),
+		KeyStore:         keyStore.Eth(),
+		EventBroadcaster: eventBroadcaster,
+	}
+	var chains chainlink.Chains
+	chains.EVM, err = evm.LoadChainSet(ccOpts)
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to load EVM chainset")
+	}
+
+	if cfg.TerraEnabled() {
+		terraLggr := appLggr.Named("Terra")
+		if err := terra.SetupNodes(db, cfg, terraLggr); err != nil {
+			return nil, errors.Wrap(err, "failed to setup Terra nodes")
+		}
+		chains.Terra, err = terra.NewChainSet(terra.ChainSetOpts{
+			Config:           cfg,
+			Logger:           terraLggr,
+			DB:               db,
+			KeyStore:         keyStore.Terra(),
+			EventBroadcaster: eventBroadcaster,
+			ORM:              terra.NewORM(db, terraLggr, cfg),
+		})
+		if err != nil {
+			return nil, errors.Wrap(err, "failed to load Terra chainset")
+		}
+	}
+
+	if cfg.SolanaEnabled() {
+		solLggr := appLggr.Named("Solana")
+		if err := solana.SetupNodes(db, cfg, solLggr); err != nil {
+			return nil, errors.Wrap(err, "failed to setup Solana nodes")
+		}
+		chains.Solana, err = solana.NewChainSet(solana.ChainSetOpts{
+			Config:           cfg,
+			Logger:           solLggr,
+			DB:               db,
+			KeyStore:         keyStore.Solana(),
+			EventBroadcaster: eventBroadcaster,
+			ORM:              solana.NewORM(db, solLggr, cfg),
+		})
+		if err != nil {
+			return nil, errors.Wrap(err, "failed to load Solana chainset")
+		}
+	}
+
+	restrictedClient := clhttp.NewRestrictedHTTPClient(cfg, appLggr)
+	unrestrictedClient := clhttp.NewUnrestrictedHTTPClient()
+	externalInitiatorManager := webhook.NewExternalInitiatorManager(db, unrestrictedClient, appLggr, cfg)
+	return chainlink.NewApplication(chainlink.ApplicationOpts{
+		Config:                   cfg,
+		SqlxDB:                   db,
+		KeyStore:                 keyStore,
+		Chains:                   chains,
+		EventBroadcaster:         eventBroadcaster,
+		Logger:                   appLggr,
+		CloseLogger:              closeLggr,
+		ExternalInitiatorManager: externalInitiatorManager,
+		Version:                  static.Version,
+		RestrictedHTTPClient:     restrictedClient,
+		UnrestrictedHTTPClient:   unrestrictedClient,
+	})
+}
+
+func takeBackupIfVersionUpgrade(cfg config.GeneralConfig, lggr logger.Logger, appv, dbv *semver.Version) (err error) {
+	if appv == nil {
+		lggr.Debug("Application version is missing, skipping automatic DB backup.")
+		return nil
+	}
+	if dbv == nil {
+		lggr.Debug("Database version is missing, skipping automatic DB backup.")
+		return nil
+	}
+	if !appv.GreaterThan(dbv) {
+		lggr.Debugf("Application version %s is older or equal to database version %s, skipping automatic DB backup.", appv.String(), dbv.String())
+		return nil
+	}
+	lggr.Infof("Upgrade detected: application version %s is newer than database version %s, taking automatic DB backup. To skip automatic database backup before version upgrades, set DATABASE_BACKUP_ON_VERSION_UPGRADE=false. To disable backups entirely set DATABASE_BACKUP_MODE=none.", appv.String(), dbv.String())
+
+	databaseBackup, err := periodicbackup.NewDatabaseBackup(cfg, lggr)
+	if err != nil {
+		return errors.Wrap(err, "takeBackupIfVersionUpgrade failed")
+	}
+	return databaseBackup.RunBackup(appv.String())
 }
 
 // Runner implements the Run method.
 type Runner interface {
-	Run(chainlink.Application) error
+	Run(context.Context, chainlink.Application) error
 }
 
 // ChainlinkRunner is used to run the node application.
@@ -96,24 +249,35 @@ type ChainlinkRunner struct{}
 
 // Run sets the log level based on config and starts the web router to listen
 // for input and return data.
-func (n ChainlinkRunner) Run(app chainlink.Application) error {
-	gin.SetMode(app.GetStore().Config.LogLevel().ForGin())
-	handler := web.Router(app.(*chainlink.ChainlinkApplication))
-	config := app.GetStore().Config
-	var g errgroup.Group
+func (n ChainlinkRunner) Run(ctx context.Context, app chainlink.Application) error {
+	config := app.GetConfig()
+	mode := gin.ReleaseMode
+	if config.Dev() && config.LogLevel() < zapcore.InfoLevel {
+		mode = gin.DebugMode
+	}
+	gin.SetMode(mode)
+	gin.DebugPrintRouteFunc = func(httpMethod, absolutePath, handlerName string, nuHandlers int) {
+		app.GetLogger().Debugf("%-6s %-25s --> %s (%d handlers)", httpMethod, absolutePath, handlerName, nuHandlers)
+	}
+	handler := web.Router(app.(*chainlink.ChainlinkApplication), prometheus)
+
+	g, gCtx := errgroup.WithContext(ctx)
 
 	if config.Port() == 0 && config.TLSPort() == 0 {
-		log.Fatal("You must specify at least one port to listen on")
+		return errors.New("You must specify at least one port to listen on")
 	}
 
+	server := server{handler: handler, lggr: app.GetLogger()}
+
 	if config.Port() != 0 {
-		g.Go(func() error { return runServer(handler, config.Port(), config.HTTPServerWriteTimeout()) })
+		go tryRunServerUntilCancelled(gCtx, app.GetLogger(), config, func() error {
+			return server.run(config.Port(), config.HTTPServerWriteTimeout())
+		})
 	}
 
 	if config.TLSPort() != 0 {
-		g.Go(func() error {
-			return runServerTLS(
-				handler,
+		go tryRunServerUntilCancelled(gCtx, app.GetLogger(), config, func() error {
+			return server.runTLS(
 				config.TLSPort(),
 				config.CertFile(),
 				config.KeyFile(),
@@ -121,23 +285,58 @@ func (n ChainlinkRunner) Run(app chainlink.Application) error {
 		})
 	}
 
-	return g.Wait()
+	g.Go(func() error {
+		<-gCtx.Done()
+		var err error
+		if server.httpServer != nil {
+			err = errors.WithStack(server.httpServer.Shutdown(context.Background()))
+		}
+		if server.tlsServer != nil {
+			err = multierr.Combine(err, errors.WithStack(server.tlsServer.Shutdown(context.Background())))
+		}
+		return err
+	})
+
+	return errors.WithStack(g.Wait())
 }
 
-func runServer(handler *gin.Engine, port uint16, writeTimeout time.Duration) error {
-	logger.Infof("Listening and serving HTTP on port %d", port)
-	server := createServer(handler, port, writeTimeout)
-	err := server.ListenAndServe()
-	logger.ErrorIf(err)
-	return err
+func tryRunServerUntilCancelled(ctx context.Context, lggr logger.Logger, cfg config.GeneralConfig, runServer func() error) {
+	for {
+		// try calling runServer() and log error if any
+		if err := runServer(); err != nil {
+			if !errors.Is(err, http.ErrServerClosed) {
+				lggr.Criticalf("Error starting server: %v", err)
+			}
+		}
+		// if ctx is cancelled, we must leave the loop
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(cfg.DefaultHTTPTimeout().Duration()):
+			// pause between attempts, default 15s
+		}
+	}
 }
 
-func runServerTLS(handler *gin.Engine, port uint16, certFile, keyFile string, writeTimeout time.Duration) error {
-	logger.Infof("Listening and serving HTTPS on port %d", port)
-	server := createServer(handler, port, writeTimeout)
-	err := server.ListenAndServeTLS(certFile, keyFile)
-	logger.ErrorIf(err)
-	return err
+type server struct {
+	httpServer *http.Server
+	tlsServer  *http.Server
+	handler    *gin.Engine
+	lggr       logger.Logger
+}
+
+func (s *server) run(port uint16, writeTimeout time.Duration) error {
+	s.lggr.Infof("Listening and serving HTTP on port %d", port)
+	s.httpServer = createServer(s.handler, port, writeTimeout)
+	err := s.httpServer.ListenAndServe()
+	return errors.Wrap(err, "failed to run plaintext HTTP server")
+}
+
+func (s *server) runTLS(port uint16, certFile, keyFile string, writeTimeout time.Duration) error {
+	s.lggr.Infof("Listening and serving HTTPS on port %d", port)
+	s.tlsServer = createServer(s.handler, port, writeTimeout)
+	err := s.tlsServer.ListenAndServeTLS(certFile, keyFile)
+	return errors.Wrap(err, "failed to run TLS server")
 }
 
 func createServer(handler *gin.Engine, port uint16, writeTimeout time.Duration) *http.Server {
@@ -163,21 +362,33 @@ type HTTPClient interface {
 }
 
 type authenticatedHTTPClient struct {
-	config         orm.ConfigReader
 	client         *http.Client
 	cookieAuth     CookieAuthenticator
-	sessionRequest models.SessionRequest
+	sessionRequest sessions.SessionRequest
+	remoteNodeURL  url.URL
 }
 
 // NewAuthenticatedHTTPClient uses the CookieAuthenticator to generate a sessionID
 // which is then used for all subsequent HTTP API requests.
-func NewAuthenticatedHTTPClient(config orm.ConfigReader, cookieAuth CookieAuthenticator, sessionRequest models.SessionRequest) HTTPClient {
+func NewAuthenticatedHTTPClient(lggr logger.Logger, clientOpts ClientOpts, cookieAuth CookieAuthenticator, sessionRequest sessions.SessionRequest) HTTPClient {
 	return &authenticatedHTTPClient{
-		config:         config,
-		client:         &http.Client{},
+		client:         newHttpClient(lggr, clientOpts.InsecureSkipVerify),
 		cookieAuth:     cookieAuth,
 		sessionRequest: sessionRequest,
+		remoteNodeURL:  clientOpts.RemoteNodeURL,
 	}
+}
+
+func newHttpClient(lggr logger.Logger, insecureSkipVerify bool) *http.Client {
+	tr := &http.Transport{
+		// User enables this at their own risk!
+		// #nosec G402
+		TLSClientConfig: &tls.Config{InsecureSkipVerify: insecureSkipVerify},
+	}
+	if insecureSkipVerify {
+		lggr.Warn("InsecureSkipVerify is on, skipping SSL certificate verification.")
+	}
+	return &http.Client{Transport: tr}
 }
 
 // Get performs an HTTP Get using the authenticated HTTP client's cookie.
@@ -213,7 +424,7 @@ func (h *authenticatedHTTPClient) doRequest(verb, path string, body io.Reader, h
 		headers = map[string]string{}
 	}
 
-	request, err := http.NewRequest(verb, h.config.ClientNodeURL()+path, body)
+	request, err := http.NewRequest(verb, h.remoteNodeURL.String()+path, body)
 	if err != nil {
 		return nil, err
 	}
@@ -235,10 +446,11 @@ func (h *authenticatedHTTPClient) doRequest(verb, path string, body io.Reader, h
 	}
 	if response.StatusCode == http.StatusUnauthorized && (h.sessionRequest.Email != "" || h.sessionRequest.Password != "") {
 		var cookieerr error
-		cookie, err = h.cookieAuth.Authenticate(h.sessionRequest)
+		cookie, cookieerr = h.cookieAuth.Authenticate(h.sessionRequest)
 		if cookieerr != nil {
 			return response, err
 		}
+		request.Header.Set("Cookie", "")
 		request.AddCookie(cookie)
 		response, err = h.client.Do(request)
 		if err != nil {
@@ -252,20 +464,27 @@ func (h *authenticatedHTTPClient) doRequest(verb, path string, body io.Reader, h
 // future HTTP requests.
 type CookieAuthenticator interface {
 	Cookie() (*http.Cookie, error)
-	Authenticate(models.SessionRequest) (*http.Cookie, error)
+	Authenticate(sessions.SessionRequest) (*http.Cookie, error)
+	Logout() error
+}
+
+type ClientOpts struct {
+	RemoteNodeURL      url.URL
+	InsecureSkipVerify bool
 }
 
 // SessionCookieAuthenticator is a concrete implementation of CookieAuthenticator
 // that retrieves a session id for the user with credentials from the session request.
 type SessionCookieAuthenticator struct {
-	config *orm.Config
+	config ClientOpts
 	store  CookieStore
+	lggr   logger.Logger
 }
 
 // NewSessionCookieAuthenticator creates a SessionCookieAuthenticator using the passed config
 // and builder.
-func NewSessionCookieAuthenticator(config *orm.Config, store CookieStore) CookieAuthenticator {
-	return &SessionCookieAuthenticator{config: config, store: store}
+func NewSessionCookieAuthenticator(config ClientOpts, store CookieStore, lggr logger.Logger) CookieAuthenticator {
+	return &SessionCookieAuthenticator{config: config, store: store, lggr: lggr}
 }
 
 // Cookie Returns the previously saved authentication cookie.
@@ -274,25 +493,25 @@ func (t *SessionCookieAuthenticator) Cookie() (*http.Cookie, error) {
 }
 
 // Authenticate retrieves a session ID via a cookie and saves it to disk.
-func (t *SessionCookieAuthenticator) Authenticate(sessionRequest models.SessionRequest) (*http.Cookie, error) {
+func (t *SessionCookieAuthenticator) Authenticate(sessionRequest sessions.SessionRequest) (*http.Cookie, error) {
 	b := new(bytes.Buffer)
 	err := json.NewEncoder(b).Encode(sessionRequest)
 	if err != nil {
 		return nil, err
 	}
-	url := t.config.ClientNodeURL() + "/sessions"
+	url := t.config.RemoteNodeURL.String() + "/sessions"
 	req, err := http.NewRequest("POST", url, b)
 	if err != nil {
 		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
 
-	client := http.Client{Timeout: 30 * time.Second}
+	client := newHttpClient(t.lggr, t.config.InsecureSkipVerify)
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, err
 	}
-	defer logger.ErrorIfCalling(resp.Body.Close)
+	defer t.lggr.ErrorIfClosing(resp.Body, "Authenticate response body")
 
 	_, err = parseResponse(resp)
 	if err != nil {
@@ -307,10 +526,16 @@ func (t *SessionCookieAuthenticator) Authenticate(sessionRequest models.SessionR
 	return sc, t.store.Save(sc)
 }
 
+// Deletes any stored session
+func (t *SessionCookieAuthenticator) Logout() error {
+	return t.store.Reset()
+}
+
 // CookieStore is a place to store and retrieve cookies.
 type CookieStore interface {
 	Save(cookie *http.Cookie) error
 	Retrieve() (*http.Cookie, error)
+	Reset() error
 }
 
 // MemoryCookieStore keeps a single cookie in memory
@@ -324,19 +549,35 @@ func (m *MemoryCookieStore) Save(cookie *http.Cookie) error {
 	return nil
 }
 
+// Removes any stored cookie.
+func (m *MemoryCookieStore) Reset() error {
+	m.Cookie = nil
+	return nil
+}
+
 // Retrieve returns any Saved cookies.
 func (m *MemoryCookieStore) Retrieve() (*http.Cookie, error) {
 	return m.Cookie, nil
 }
 
+type DiskCookieConfig interface {
+	RootDir() string
+}
+
 // DiskCookieStore saves a single cookie in the local cli working directory.
 type DiskCookieStore struct {
-	Config *orm.Config
+	Config DiskCookieConfig
 }
 
 // Save stores a cookie.
 func (d DiskCookieStore) Save(cookie *http.Cookie) error {
 	return ioutil.WriteFile(d.cookiePath(), []byte(cookie.String()), 0600)
+}
+
+// Removes any stored cookie.
+func (d DiskCookieStore) Reset() error {
+	// Write empty bytes
+	return ioutil.WriteFile(d.cookiePath(), []byte(""), 0600)
 }
 
 // Retrieve returns any Saved cookies.
@@ -366,7 +607,7 @@ func (d DiskCookieStore) cookiePath() string {
 // abstracting how session requests are generated, whether they be from
 // the prompt or from a file.
 type SessionRequestBuilder interface {
-	Build(flag string) (models.SessionRequest, error)
+	Build(flag string) (sessions.SessionRequest, error)
 }
 
 type promptingSessionRequestBuilder struct {
@@ -379,28 +620,30 @@ func NewPromptingSessionRequestBuilder(prompter Prompter) SessionRequestBuilder 
 	return promptingSessionRequestBuilder{prompter}
 }
 
-func (p promptingSessionRequestBuilder) Build(string) (models.SessionRequest, error) {
+func (p promptingSessionRequestBuilder) Build(string) (sessions.SessionRequest, error) {
 	email := p.prompter.Prompt("Enter email: ")
 	pwd := p.prompter.PasswordPrompt("Enter password: ")
-	return models.SessionRequest{Email: email, Password: pwd}, nil
+	return sessions.SessionRequest{Email: email, Password: pwd}, nil
 }
 
-type fileSessionRequestBuilder struct{}
+type fileSessionRequestBuilder struct {
+	lggr logger.Logger
+}
 
 // NewFileSessionRequestBuilder pulls credentials from a file to generate a SessionRequest.
-func NewFileSessionRequestBuilder() SessionRequestBuilder {
-	return fileSessionRequestBuilder{}
+func NewFileSessionRequestBuilder(lggr logger.Logger) SessionRequestBuilder {
+	return &fileSessionRequestBuilder{lggr: lggr}
 }
 
-func (f fileSessionRequestBuilder) Build(file string) (models.SessionRequest, error) {
-	return credentialsFromFile(file)
+func (f *fileSessionRequestBuilder) Build(file string) (sessions.SessionRequest, error) {
+	return credentialsFromFile(file, f.lggr.With("file", file))
 }
 
 // APIInitializer is the interface used to create the API User credentials
 // needed to access the API. Does nothing if API user already exists.
 type APIInitializer interface {
 	// Initialize creates a new user for API access, or does nothing if one exists.
-	Initialize(store *store.Store) (models.User, error)
+	Initialize(orm sessions.ORM) (sessions.User, error)
 }
 
 type promptingAPIInitializer struct {
@@ -414,24 +657,24 @@ func NewPromptingAPIInitializer(prompter Prompter) APIInitializer {
 }
 
 // Initialize uses the terminal to get credentials that it then saves in the store.
-func (t *promptingAPIInitializer) Initialize(store *store.Store) (models.User, error) {
-	if user, err := store.FindUser(); err == nil {
+func (t *promptingAPIInitializer) Initialize(orm sessions.ORM) (sessions.User, error) {
+	if user, err := orm.FindUser(); err == nil {
 		return user, err
 	}
 
 	if !t.prompter.IsTerminal() {
-		return models.User{}, ErrorNoAPICredentialsAvailable
+		return sessions.User{}, ErrorNoAPICredentialsAvailable
 	}
 
 	for {
 		email := t.prompter.Prompt("Enter API Email: ")
 		pwd := t.prompter.PasswordPrompt("Enter API Password: ")
-		user, err := models.NewUser(email, pwd)
+		user, err := sessions.NewUser(email, pwd)
 		if err != nil {
 			fmt.Println("Error creating API user: ", err)
 			continue
 		}
-		if err = store.SaveUser(&user); err != nil {
+		if err = orm.CreateUser(&user); err != nil {
 			fmt.Println("Error creating API user: ", err)
 		}
 		return user, err
@@ -440,48 +683,49 @@ func (t *promptingAPIInitializer) Initialize(store *store.Store) (models.User, e
 
 type fileAPIInitializer struct {
 	file string
+	lggr logger.Logger
 }
 
 // NewFileAPIInitializer creates a concrete instance of APIInitializer
 // that pulls API user credentials from the passed file path.
-func NewFileAPIInitializer(file string) APIInitializer {
-	return fileAPIInitializer{file: file}
+func NewFileAPIInitializer(file string, lggr logger.Logger) APIInitializer {
+	return fileAPIInitializer{file: file, lggr: lggr.With("file", file)}
 }
 
-func (f fileAPIInitializer) Initialize(store *store.Store) (models.User, error) {
-	if user, err := store.FindUser(); err == nil {
+func (f fileAPIInitializer) Initialize(orm sessions.ORM) (sessions.User, error) {
+	if user, err := orm.FindUser(); err == nil {
 		return user, err
 	}
 
-	request, err := credentialsFromFile(f.file)
+	request, err := credentialsFromFile(f.file, f.lggr)
 	if err != nil {
-		return models.User{}, err
+		return sessions.User{}, err
 	}
 
-	user, err := models.NewUser(request.Email, request.Password)
+	user, err := sessions.NewUser(request.Email, request.Password)
 	if err != nil {
 		return user, err
 	}
-	return user, store.SaveUser(&user)
+	return user, orm.CreateUser(&user)
 }
 
 var ErrNoCredentialFile = errors.New("no API user credential file was passed")
 
-func credentialsFromFile(file string) (models.SessionRequest, error) {
+func credentialsFromFile(file string, lggr logger.Logger) (sessions.SessionRequest, error) {
 	if len(file) == 0 {
-		return models.SessionRequest{}, ErrNoCredentialFile
+		return sessions.SessionRequest{}, ErrNoCredentialFile
 	}
 
-	logger.Debug("Initializing API credentials from ", file)
+	lggr.Debug("Initializing API credentials")
 	dat, err := ioutil.ReadFile(file)
 	if err != nil {
-		return models.SessionRequest{}, err
+		return sessions.SessionRequest{}, err
 	}
 	lines := strings.Split(string(dat), "\n")
 	if len(lines) < 2 {
-		return models.SessionRequest{}, fmt.Errorf("malformed API credentials file does not have at least two lines at %s", file)
+		return sessions.SessionRequest{}, fmt.Errorf("malformed API credentials file does not have at least two lines at %s", file)
 	}
-	credentials := models.SessionRequest{
+	credentials := sessions.SessionRequest{
 		Email:    strings.TrimSpace(lines[0]),
 		Password: strings.TrimSpace(lines[1]),
 	}

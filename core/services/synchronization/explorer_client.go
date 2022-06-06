@@ -8,14 +8,15 @@ import (
 	"net/http"
 	"net/url"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/smartcontractkit/chainlink/core/logger"
+	"github.com/smartcontractkit/chainlink/core/services"
 	"github.com/smartcontractkit/chainlink/core/static"
 	"github.com/smartcontractkit/chainlink/core/utils"
 
 	"github.com/gorilla/websocket"
+	"go.uber.org/atomic"
 )
 
 var (
@@ -46,39 +47,55 @@ const (
 // ExplorerClient encapsulates all the functionality needed to
 // push run information to explorer.
 type ExplorerClient interface {
+	services.ServiceCtx
 	Url() url.URL
 	Status() ConnectionStatus
-	Start() error
-	Close() error
 	Send(context.Context, []byte, ...int)
 	Receive(context.Context, ...time.Duration) ([]byte, error)
 }
 
 type NoopExplorerClient struct{}
 
-func (NoopExplorerClient) Url() url.URL                                              { return url.URL{} }
-func (NoopExplorerClient) Status() ConnectionStatus                                  { return ConnectionStatusDisconnected }
-func (NoopExplorerClient) Start() error                                              { return nil }
-func (NoopExplorerClient) Close() error                                              { return nil }
-func (NoopExplorerClient) Send(context.Context, []byte, ...int)                      {}
+// Url always returns underlying url.
+func (NoopExplorerClient) Url() url.URL { return url.URL{} }
+
+// Status always returns ConnectionStatusDisconnected.
+func (NoopExplorerClient) Status() ConnectionStatus { return ConnectionStatusDisconnected }
+
+// Start is a no-op
+func (NoopExplorerClient) Start(context.Context) error { return nil }
+
+// Close is a no-op
+func (NoopExplorerClient) Close() error { return nil }
+
+// Healthy is a no-op
+func (NoopExplorerClient) Healthy() error { return nil }
+
+// Ready is a no-op
+func (NoopExplorerClient) Ready() error { return nil }
+
+// Send is a no-op
+func (NoopExplorerClient) Send(context.Context, []byte, ...int) {}
+
+// Receive is a no-op
 func (NoopExplorerClient) Receive(context.Context, ...time.Duration) ([]byte, error) { return nil, nil }
 
 type explorerClient struct {
-	boot             *sync.RWMutex
+	utils.StartStopOnce
 	conn             *websocket.Conn
 	sendText         chan []byte
 	sendBinary       chan []byte
-	dropMessageCount uint32
+	dropMessageCount atomic.Uint32
 	receive          chan []byte
 	sleeper          utils.Sleeper
-	started          bool
 	status           ConnectionStatus
 	url              *url.URL
 	accessKey        string
 	secret           string
-	logging          bool
+	lggr             logger.Logger
 
-	done          chan struct{}
+	chStop        chan struct{}
+	wg            sync.WaitGroup
 	writePumpDone chan struct{}
 
 	statusMtx sync.RWMutex
@@ -86,20 +103,15 @@ type explorerClient struct {
 
 // NewExplorerClient returns a stats pusher using a websocket for
 // delivery.
-func NewExplorerClient(url *url.URL, accessKey, secret string, loggingArgs ...bool) ExplorerClient {
-	logging := false
-	if len(loggingArgs) > 0 {
-		logging = loggingArgs[0]
-	}
+func NewExplorerClient(url *url.URL, accessKey, secret string, lggr logger.Logger) ExplorerClient {
 	return &explorerClient{
 		url:       url,
 		receive:   make(chan []byte),
-		boot:      new(sync.RWMutex),
 		sleeper:   utils.NewBackoffSleeper(),
 		status:    ConnectionStatusDisconnected,
 		accessKey: accessKey,
 		secret:    secret,
-		logging:   logging,
+		lggr:      lggr.Named("ExplorerClient"),
 
 		sendText:   make(chan []byte, SendBufferSize),
 		sendBinary: make(chan []byte, SendBufferSize),
@@ -119,18 +131,13 @@ func (ec *explorerClient) Status() ConnectionStatus {
 }
 
 // Start starts a write pump over a websocket.
-func (ec *explorerClient) Start() error {
-	ec.boot.Lock()
-	defer ec.boot.Unlock()
-
-	if ec.started {
+func (ec *explorerClient) Start(context.Context) error {
+	return ec.StartOnce("Explorer client", func() error {
+		ec.chStop = make(chan struct{})
+		ec.wg.Add(1)
+		go ec.connectAndWritePump()
 		return nil
-	}
-
-	ec.done = make(chan struct{})
-	go ec.connectAndWritePump()
-	ec.started = true
-	return nil
+	})
 }
 
 // Send sends data asynchronously across the websocket if it's open, or
@@ -153,7 +160,7 @@ func (ec *explorerClient) Send(ctx context.Context, data []byte, messageTypes ..
 	}
 	select {
 	case send <- data:
-		atomic.StoreUint32(&ec.dropMessageCount, 0)
+		ec.dropMessageCount.Store(0)
 	case <-ctx.Done():
 		return
 	default:
@@ -174,9 +181,9 @@ func (ec *explorerClient) Send(ctx context.Context, data []byte, messageTypes ..
 // 300
 // etc...
 func (ec *explorerClient) logBufferFullWithExpBackoff(data []byte) {
-	count := atomic.AddUint32(&ec.dropMessageCount, 1)
+	count := ec.dropMessageCount.Inc()
 	if count > 0 && (count%100 == 0 || count&(count-1) == 0) {
-		logger.Warnw("explorer client buffer full, dropping message", "data", data, "droppedCount", count)
+		ec.lggr.Warnw("explorer client buffer full, dropping message", "data", data, "droppedCount", count)
 	}
 }
 
@@ -219,31 +226,32 @@ const (
 // lexical confinement of done chan allows multiple connectAndWritePump routines
 // to clean up independent of itself by reducing shared state. i.e. a passed done, not ec.done.
 func (ec *explorerClient) connectAndWritePump() {
+	defer ec.wg.Done()
+	ctx, cancel := utils.ContextFromChan(ec.chStop)
+	defer cancel()
 	for {
 		select {
 		case <-time.After(ec.sleeper.After()):
-			ctx, cancel := utils.ContextFromChan(ec.done)
-			defer cancel()
-
-			logger.Infow("Connecting to explorer", "url", ec.url)
+			ec.lggr.Infow("Connecting to explorer", "url", ec.url)
 			err := ec.connect(ctx)
 			if ctx.Err() != nil {
 				return
 			} else if err != nil {
 				ec.setStatus(ConnectionStatusError)
-				logger.Warn("Failed to connect to explorer (", ec.url.String(), "): ", err)
+				ec.lggr.Warn("Failed to connect to explorer (", ec.url.String(), "): ", err)
 				break
 			}
 
 			ec.setStatus(ConnectionStatusConnected)
 
-			logger.Infow("Connected to explorer", "url", ec.url)
+			ec.lggr.Infow("Connected to explorer", "url", ec.url)
 			ec.sleeper.Reset()
 			ec.writePumpDone = make(chan struct{})
+			ec.wg.Add(1)
 			go ec.readPump()
 			ec.writePump()
 
-		case <-ec.done:
+		case <-ec.chStop:
 			return
 		}
 	}
@@ -272,7 +280,7 @@ func (ec *explorerClient) writePump() {
 
 			err := ec.writeMessage(message, websocket.TextMessage)
 			if err != nil {
-				logger.Warnw("websocketStatsPusher: error writing text message", "err", err)
+				ec.lggr.Warnw("websocketStatsPusher: error writing text message", "err", err)
 				return
 			}
 
@@ -283,7 +291,7 @@ func (ec *explorerClient) writePump() {
 
 			err := ec.writeMessage(message, websocket.BinaryMessage)
 			if err != nil {
-				logger.Warnw("websocketStatsPusher: error writing binary message", "err", err)
+				ec.lggr.Warnw("websocketStatsPusher: error writing binary message", "err", err)
 				return
 			}
 
@@ -296,7 +304,7 @@ func (ec *explorerClient) writePump() {
 
 		case <-ec.writePumpDone:
 			return
-		case <-ec.done:
+		case <-ec.chStop:
 			return
 		}
 	}
@@ -312,9 +320,7 @@ func (ec *explorerClient) writeMessage(message []byte, messageType int) error {
 	if _, err := writer.Write(message); err != nil {
 		return err
 	}
-	if ec.logging {
-		logger.Debugw("websocketStatsPusher successfully wrote message", "messageType", messageType, "message", message)
-	}
+	ec.lggr.Tracew("websocketStatsPusher successfully wrote message", "messageType", messageType, "message", message)
 
 	return writer.Close()
 }
@@ -328,7 +334,7 @@ func (ec *explorerClient) connect(ctx context.Context) error {
 
 	conn, _, err := websocket.DefaultDialer.DialContext(ctx, ec.url.String(), authHeader)
 	if ctx.Err() != nil {
-		return fmt.Errorf("websocketStatsPusher#connect context canceled: %v", ctx.Err())
+		return fmt.Errorf("websocketStatsPusher#connect context canceled: %w", ctx.Err())
 	} else if err != nil {
 		return fmt.Errorf("websocketStatsPusher#connect: %v", err)
 	}
@@ -348,6 +354,7 @@ const CloseTimeout = 100 * time.Millisecond
 //  * https://stackoverflow.com/a/48181794/639773
 //  * https://github.com/gorilla/websocket/blob/master/examples/chat/client.go#L56
 func (ec *explorerClient) readPump() {
+	defer ec.wg.Done()
 	ec.conn.SetReadLimit(maxMessageSize)
 	_ = ec.conn.SetReadDeadline(time.Now().Add(pongWait))
 	ec.conn.SetPongHandler(func(string) error {
@@ -359,7 +366,7 @@ func (ec *explorerClient) readPump() {
 		messageType, message, err := ec.conn.ReadMessage()
 		if err != nil {
 			if websocket.IsUnexpectedCloseError(err, expectedCloseMessages...) {
-				logger.Warnw("Unexpected close error on ExplorerClient", "err", err)
+				ec.lggr.Warnw("Unexpected close error on ExplorerClient", "err", err)
 			}
 			close(ec.writePumpDone)
 			return
@@ -375,20 +382,14 @@ func (ec *explorerClient) readPump() {
 func (ec *explorerClient) wrapConnErrorIf(err error) {
 	if err != nil && websocket.IsUnexpectedCloseError(err, expectedCloseMessages...) {
 		ec.setStatus(ConnectionStatusError)
-		logger.Error(fmt.Sprintf("websocketStatsPusher: %v", err))
+		ec.lggr.Error(fmt.Sprintf("websocketStatsPusher: %v", err))
 	}
 }
 
 func (ec *explorerClient) Close() error {
-	ec.boot.Lock()
-	defer ec.boot.Unlock()
-
-	if !ec.started {
+	return ec.StopOnce("Explorer client", func() error {
+		close(ec.chStop)
+		ec.wg.Wait()
 		return nil
-	}
-
-	ec.started = false
-	close(ec.done)
-
-	return nil
+	})
 }

@@ -6,96 +6,111 @@ import (
 	"time"
 
 	"github.com/pkg/errors"
-
-	"github.com/smartcontractkit/chainlink/core/internal/gethwrappers/generated"
-	"github.com/smartcontractkit/chainlink/core/internal/gethwrappers/generated/keeper_registry_wrapper"
-	"github.com/smartcontractkit/chainlink/core/services"
+	"github.com/smartcontractkit/chainlink/core/chains/evm/log"
+	"github.com/smartcontractkit/chainlink/core/logger"
 	"github.com/smartcontractkit/chainlink/core/services/job"
-	"github.com/smartcontractkit/chainlink/core/services/log"
-	"github.com/smartcontractkit/chainlink/core/store/models"
 	"github.com/smartcontractkit/chainlink/core/utils"
-	"gorm.io/gorm"
+)
+
+// RegistrySynchronizer conforms to the Service and Listener interfaces
+var (
+	_ job.ServiceCtx = (*RegistrySynchronizer)(nil)
+	_ log.Listener   = (*RegistrySynchronizer)(nil)
 )
 
 // MailRoom holds the log mailboxes for all the log types that keeper cares about
 type MailRoom struct {
-	mbUpkeepCanceled   *utils.Mailbox
-	mbSyncRegistry     *utils.Mailbox
-	mbUpkeepPerformed  *utils.Mailbox
-	mbUpkeepRegistered *utils.Mailbox
+	mbUpkeepCanceled    *utils.Mailbox[log.Broadcast]
+	mbSyncRegistry      *utils.Mailbox[log.Broadcast]
+	mbUpkeepPerformed   *utils.Mailbox[log.Broadcast]
+	mbUpkeepRegistered  *utils.Mailbox[log.Broadcast]
+	mbUpkeepReceived    *utils.Mailbox[log.Broadcast]
+	mbUpkeepMigrated    *utils.Mailbox[log.Broadcast]
+	mbUpkeepGasLimitSet *utils.Mailbox[log.Broadcast]
 }
 
-func NewRegistrySynchronizer(
-	job job.Job,
-	contract *keeper_registry_wrapper.KeeperRegistry,
-	db *gorm.DB,
-	headBroadcaster *services.HeadBroadcaster,
-	logBroadcaster log.Broadcaster,
-	syncInterval time.Duration,
-	minConfirmations uint64,
-) *RegistrySynchronizer {
-	mailRoom := MailRoom{
-		mbUpkeepCanceled:   utils.NewMailbox(50),
-		mbSyncRegistry:     utils.NewMailbox(1),
-		mbUpkeepPerformed:  utils.NewMailbox(1),
-		mbUpkeepRegistered: utils.NewMailbox(50),
-	}
-	return &RegistrySynchronizer{
-		chHeads:          make(chan models.Head, 1),
-		chStop:           make(chan struct{}),
-		contract:         contract,
-		headBroadcaster:  headBroadcaster,
-		interval:         syncInterval,
-		job:              job,
-		logBroadcaster:   logBroadcaster,
-		mailRoom:         mailRoom,
-		minConfirmations: minConfirmations,
-		orm:              NewORM(db),
-		StartStopOnce:    utils.StartStopOnce{},
-		wgDone:           sync.WaitGroup{},
-	}
+type RegistrySynchronizerOptions struct {
+	Job                      job.Job
+	RegistryWrapper          RegistryWrapper
+	ORM                      ORM
+	JRM                      job.ORM
+	LogBroadcaster           log.Broadcaster
+	SyncInterval             time.Duration
+	MinIncomingConfirmations uint32
+	Logger                   logger.Logger
+	SyncUpkeepQueueSize      uint32
+	newTurnEnabled           bool
 }
-
-// RegistrySynchronizer conforms to the Service, Listener, and HeadRelayable interfaces
-var _ job.Service = (*RegistrySynchronizer)(nil)
-var _ log.Listener = (*RegistrySynchronizer)(nil)
-var _ services.HeadBroadcastable = (*RegistrySynchronizer)(nil)
 
 type RegistrySynchronizer struct {
-	chHeads          chan models.Head
-	chStop           chan struct{}
-	contract         *keeper_registry_wrapper.KeeperRegistry
-	headBroadcaster  *services.HeadBroadcaster
-	interval         time.Duration
-	job              job.Job
-	logBroadcaster   log.Broadcaster
-	mailRoom         MailRoom
-	minConfirmations uint64
-	orm              ORM
-	wgDone           sync.WaitGroup
+	chStop                   chan struct{}
+	newTurnEnabled           bool
+	registryWrapper          RegistryWrapper
+	interval                 time.Duration
+	job                      job.Job
+	jrm                      job.ORM
+	logBroadcaster           log.Broadcaster
+	mailRoom                 MailRoom
+	minIncomingConfirmations uint32
+	orm                      ORM
+	logger                   logger.SugaredLogger
+	wgDone                   sync.WaitGroup
+	syncUpkeepQueueSize      uint32 //Represents the max number of upkeeps that can be synced in parallel
 	utils.StartStopOnce
 }
 
-func (rs *RegistrySynchronizer) Start() error {
+// NewRegistrySynchronizer is the constructor of RegistrySynchronizer
+func NewRegistrySynchronizer(opts RegistrySynchronizerOptions) *RegistrySynchronizer {
+	mailRoom := MailRoom{
+		mbUpkeepCanceled:    utils.NewMailbox[log.Broadcast](500),
+		mbSyncRegistry:      utils.NewMailbox[log.Broadcast](1),
+		mbUpkeepPerformed:   utils.NewMailbox[log.Broadcast](3000),
+		mbUpkeepRegistered:  utils.NewMailbox[log.Broadcast](500),
+		mbUpkeepReceived:    utils.NewMailbox[log.Broadcast](500),
+		mbUpkeepMigrated:    utils.NewMailbox[log.Broadcast](500),
+		mbUpkeepGasLimitSet: utils.NewMailbox[log.Broadcast](500),
+	}
+	return &RegistrySynchronizer{
+		chStop:                   make(chan struct{}),
+		registryWrapper:          opts.RegistryWrapper,
+		interval:                 opts.SyncInterval,
+		job:                      opts.Job,
+		jrm:                      opts.JRM,
+		logBroadcaster:           opts.LogBroadcaster,
+		mailRoom:                 mailRoom,
+		minIncomingConfirmations: opts.MinIncomingConfirmations,
+		orm:                      opts.ORM,
+		logger:                   logger.Sugared(opts.Logger.Named("RegistrySynchronizer")),
+		syncUpkeepQueueSize:      opts.SyncUpkeepQueueSize,
+		newTurnEnabled:           opts.newTurnEnabled,
+	}
+}
+
+// Start starts RegistrySynchronizer.
+func (rs *RegistrySynchronizer) Start(context.Context) error {
 	return rs.StartOnce("RegistrySynchronizer", func() error {
 		rs.wgDone.Add(2)
 		go rs.run()
 
-		logListenerOpts := log.ListenerOpts{
-			Contract: rs.contract,
-			Logs: []generated.AbigenLog{
-				keeper_registry_wrapper.KeeperRegistryKeepersUpdated{},
-				keeper_registry_wrapper.KeeperRegistryConfigSet{},
-				keeper_registry_wrapper.KeeperRegistryUpkeepCanceled{},
-				keeper_registry_wrapper.KeeperRegistryUpkeepRegistered{},
-				keeper_registry_wrapper.KeeperRegistryUpkeepPerformed{},
-			},
+		var upkeepPerformedFilter [][]log.Topic
+		upkeepPerformedFilter = nil
+		if !rs.newTurnEnabled {
+			upkeepPerformedFilter = [][]log.Topic{
+				{},
+				{},
+				{
+					log.Topic(rs.job.KeeperSpec.FromAddress.Hash()),
+				},
+			}
 		}
-		_, lbUnsubscribe := rs.logBroadcaster.Register(rs, logListenerOpts)
-		hbUnsubscribe := rs.headBroadcaster.Subscribe(rs)
+
+		logListenerOpts, err := rs.registryWrapper.GetLogListenerOpts(rs.minIncomingConfirmations, upkeepPerformedFilter)
+		if err != nil {
+			return errors.Wrap(err, "Unable to fetch log listener opts from wrapper")
+		}
+		lbUnsubscribe := rs.logBroadcaster.Register(rs, *logListenerOpts)
 
 		go func() {
-			defer hbUnsubscribe()
 			defer lbUnsubscribe()
 			defer rs.wgDone.Done()
 			<-rs.chStop
@@ -105,25 +120,19 @@ func (rs *RegistrySynchronizer) Start() error {
 }
 
 func (rs *RegistrySynchronizer) Close() error {
-	if !rs.OkayToStop() {
-		return errors.New("RegistrySynchronizer is already stopped")
-	}
-	close(rs.chStop)
-	rs.wgDone.Wait()
-	return nil
-}
-
-func (rs *RegistrySynchronizer) OnNewLongestChain(ctx context.Context, head models.Head) {
-	select {
-	case rs.chHeads <- head:
-	default:
-	}
+	return rs.StopOnce("RegistrySynchronizer", func() error {
+		close(rs.chStop)
+		rs.wgDone.Wait()
+		return nil
+	})
 }
 
 func (rs *RegistrySynchronizer) run() {
-	ticker := time.NewTicker(rs.interval)
+	syncTicker := time.NewTicker(rs.interval)
+	logTicker := time.NewTicker(time.Second)
 	defer rs.wgDone.Done()
-	defer ticker.Stop()
+	defer syncTicker.Stop()
+	defer logTicker.Stop()
 
 	rs.fullSync()
 
@@ -131,10 +140,10 @@ func (rs *RegistrySynchronizer) run() {
 		select {
 		case <-rs.chStop:
 			return
-		case <-ticker.C:
+		case <-syncTicker.C:
 			rs.fullSync()
-		case head := <-rs.chHeads:
-			rs.processLogs(head)
+		case <-logTicker.C:
+			rs.processLogs()
 		}
 	}
 }

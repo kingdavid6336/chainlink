@@ -53,7 +53,7 @@ export interface ApiResponse<T extends AttributesObject | null>
  * If T is a single attribute object, then the api response is a single resource object, otherwise null.
  */
 export interface PaginatedApiResponse<
-  T extends AttributesObject
+  T extends AttributesObject,
 > extends JsonApiResponse<
     T extends Array<infer U> ? ResourceObject<U>[] : ResourceObject<T>,
     ErrorsObject[],
@@ -85,6 +85,7 @@ export class Api {
   private methodFactory(method: http.Method) {
     return <Params, T, NamedPathParams extends object = object>(
       url: string,
+      raw?: boolean,
     ): Method<Params, T, NamedPathParams> => {
       const toPath = pathToRegexp.compile<NamedPathParams>(url)
 
@@ -99,7 +100,7 @@ export class Api {
           query,
         )
 
-        const options = http.getOptions(method)
+        const options = http.getOptions(method, raw)
 
         const fetch = fetchWithTimeout(u.toString(), options(params))
 

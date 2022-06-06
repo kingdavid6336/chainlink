@@ -2,8 +2,7 @@ package cltest
 
 import (
 	"bytes"
-	"crypto/ecdsa"
-	"crypto/rand"
+	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -11,208 +10,42 @@ import (
 	mathrand "math/rand"
 	"net/url"
 	"strconv"
-	"strings"
 	"testing"
 	"time"
 
-	"github.com/lib/pq"
-	"github.com/smartcontractkit/chainlink/core/adapters"
-
-	"github.com/smartcontractkit/chainlink/core/services/job"
-	"github.com/smartcontractkit/chainlink/core/services/keeper"
-	"github.com/smartcontractkit/chainlink/core/services/postgres"
-
-	p2ppeer "github.com/libp2p/go-libp2p-core/peer"
-	uuid "github.com/satori/go.uuid"
-	"github.com/smartcontractkit/chainlink/core/assets"
-	"github.com/smartcontractkit/chainlink/core/internal/gethwrappers/generated/flux_aggregator_wrapper"
-	"github.com/smartcontractkit/chainlink/core/internal/mocks"
-	"github.com/smartcontractkit/chainlink/core/logger"
-	"github.com/smartcontractkit/chainlink/core/services/fluxmonitor"
-	logmocks "github.com/smartcontractkit/chainlink/core/services/log/mocks"
-	"github.com/smartcontractkit/chainlink/core/services/pipeline"
-	strpkg "github.com/smartcontractkit/chainlink/core/store"
-	"github.com/smartcontractkit/chainlink/core/store/models"
-	"github.com/smartcontractkit/chainlink/core/utils"
-	"gorm.io/gorm"
-
-	"github.com/ethereum/go-ethereum/accounts/keystore"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/common/hexutil"
 	"github.com/ethereum/go-ethereum/core/types"
-	"github.com/ethereum/go-ethereum/crypto"
-	googleuuid "github.com/google/uuid"
+	p2ppeer "github.com/libp2p/go-libp2p-core/peer"
+	uuid "github.com/satori/go.uuid"
 	"github.com/stretchr/testify/require"
-	"github.com/tidwall/gjson"
-	"github.com/tidwall/sjson"
 	"github.com/urfave/cli"
+	"gopkg.in/guregu/null.v4"
+
+	"github.com/smartcontractkit/sqlx"
+
+	"github.com/smartcontractkit/chainlink/core/assets"
+	"github.com/smartcontractkit/chainlink/core/auth"
+	"github.com/smartcontractkit/chainlink/core/bridges"
+	"github.com/smartcontractkit/chainlink/core/chains/evm/headtracker"
+	"github.com/smartcontractkit/chainlink/core/chains/evm/txmgr"
+	evmtypes "github.com/smartcontractkit/chainlink/core/chains/evm/types"
+	"github.com/smartcontractkit/chainlink/core/internal/gethwrappers/generated/flux_aggregator_wrapper"
+	"github.com/smartcontractkit/chainlink/core/internal/testutils"
+	"github.com/smartcontractkit/chainlink/core/logger"
+	"github.com/smartcontractkit/chainlink/core/services/job"
+	"github.com/smartcontractkit/chainlink/core/services/keeper"
+	"github.com/smartcontractkit/chainlink/core/services/keystore"
+	"github.com/smartcontractkit/chainlink/core/services/keystore/keys/ethkey"
+	"github.com/smartcontractkit/chainlink/core/services/pg"
+	"github.com/smartcontractkit/chainlink/core/services/pipeline"
+	"github.com/smartcontractkit/chainlink/core/store/models"
+	"github.com/smartcontractkit/chainlink/core/utils"
 )
 
-// NewJob return new NoOp JobSpec
-func NewJob() models.JobSpec {
-	j := models.NewJob()
-	j.Tasks = []models.TaskSpec{{Type: adapters.TaskTypeNoOp}}
-	return j
-}
-
-// NewTask given the tasktype and json params return a TaskSpec
-func NewTask(t *testing.T, taskType string, json ...string) models.TaskSpec {
-	if len(json) == 0 {
-		json = append(json, ``)
-	}
-	params := JSONFromString(t, json[0])
-	params, err := params.Add("type", taskType)
-	require.NoError(t, err)
-
-	return models.TaskSpec{
-		Type:   models.MustNewTaskType(taskType),
-		Params: params,
-	}
-}
-
-// NewJobWithExternalInitiator creates new Job with external initiator
-func NewJobWithExternalInitiator(ei *models.ExternalInitiator) models.JobSpec {
-	j := NewJob()
-	j.Initiators = []models.Initiator{{
-		JobSpecID: j.ID,
-		Type:      models.InitiatorExternal,
-		InitiatorParams: models.InitiatorParams{
-			Name: ei.Name,
-		},
-	}}
-	return j
-}
-
-// NewJobWithSchedule create new job with the given schedule
-func NewJobWithSchedule(sched string) models.JobSpec {
-	j := NewJob()
-	j.Initiators = []models.Initiator{{
-		JobSpecID: j.ID,
-		Type:      models.InitiatorCron,
-		InitiatorParams: models.InitiatorParams{
-			Schedule: models.Cron(sched),
-		},
-	}}
-	return j
-}
-
-// NewJobWithWebInitiator create new Job with web initiator
-func NewJobWithWebInitiator() models.JobSpec {
-	j := NewJob()
-	j.Initiators = []models.Initiator{{
-		JobSpecID: j.ID,
-		Type:      models.InitiatorWeb,
-	}}
-	return j
-}
-
-// NewJobWithLogInitiator create new Job with ethlog initiator
-func NewJobWithLogInitiator() models.JobSpec {
-	j := NewJob()
-	j.Initiators = []models.Initiator{{
-		JobSpecID: j.ID,
-		Type:      models.InitiatorEthLog,
-		InitiatorParams: models.InitiatorParams{
-			Address: NewAddress(),
-		},
-	}}
-	return j
-}
-
-// NewJobWithRunLogInitiator creates a new JobSpec with the RunLog initiator
-func NewJobWithRunLogInitiator() models.JobSpec {
-	j := NewJob()
-	j.Initiators = []models.Initiator{{
-		JobSpecID: j.ID,
-		Type:      models.InitiatorRunLog,
-		InitiatorParams: models.InitiatorParams{
-			Address: NewAddress(),
-		},
-	}}
-	return j
-}
-
-// NewJobWithRunAtInitiator create new Job with RunAt initiator
-func NewJobWithRunAtInitiator(t time.Time) models.JobSpec {
-	j := NewJob()
-	j.Initiators = []models.Initiator{{
-		JobSpecID: j.ID,
-		Type:      models.InitiatorRunAt,
-		InitiatorParams: models.InitiatorParams{
-			Time: models.NewAnyTime(t),
-		},
-	}}
-	return j
-}
-
-// NewJobWithFluxMonitorInitiator create new Job with FluxMonitor initiator
-func NewJobWithFluxMonitorInitiator() models.JobSpec {
-	j := NewJob()
-	j.Initiators = []models.Initiator{{
-		JobSpecID: j.ID,
-		Type:      models.InitiatorFluxMonitor,
-		InitiatorParams: models.InitiatorParams{
-			Address:           NewAddress(),
-			RequestData:       models.JSON{Result: gjson.Parse(`{"data":{"coin":"ETH","market":"USD"}}`)},
-			Feeds:             models.JSON{Result: gjson.Parse(`["https://lambda.staging.devnet.tools/bnc/call"]`)},
-			Threshold:         0.5,
-			AbsoluteThreshold: 0.01,
-			IdleTimer: models.IdleTimerConfig{
-				Duration: models.MustMakeDuration(time.Minute),
-			},
-			PollTimer: models.PollTimerConfig{
-				Period: models.MustMakeDuration(time.Minute),
-			},
-			Precision: 2,
-		},
-	}}
-	return j
-}
-
-// NewJobWithFluxMonitorInitiator create new Job with FluxMonitor initiator
-func NewJobWithFluxMonitorInitiatorWithBridge(bridgeName string) models.JobSpec {
-	j := NewJob()
-	j.Initiators = []models.Initiator{{
-		JobSpecID: j.ID,
-		Type:      models.InitiatorFluxMonitor,
-		InitiatorParams: models.InitiatorParams{
-			Address:           NewAddress(),
-			RequestData:       models.JSON{Result: gjson.Parse(`{"data":{"coin":"ETH","market":"USD"}}`)},
-			Feeds:             models.JSON{Result: gjson.Parse(fmt.Sprintf("[{\"bridge\":\"%s\"}]", bridgeName))},
-			Threshold:         0.5,
-			AbsoluteThreshold: 0.01,
-			Precision:         2,
-		},
-	}}
-	return j
-}
-
-// NewJobWithRandomnessLog create new Job with VRF initiator
-func NewJobWithRandomnessLog() models.JobSpec {
-	j := NewJob()
-	j.Initiators = []models.Initiator{{
-		JobSpecID: j.ID,
-		Type:      models.InitiatorRandomnessLog,
-		InitiatorParams: models.InitiatorParams{
-			Address: NewAddress(),
-		},
-	}}
-	return j
-}
-
-// NewHash return random Keccak256
-func NewHash() common.Hash {
-	return common.BytesToHash(randomBytes(32))
-}
-
-// NewAddress return a random new address
-func NewAddress() common.Address {
-	return common.BytesToAddress(randomBytes(20))
-}
-
-func NewEIP55Address() models.EIP55Address {
-	a := NewAddress()
-	e, err := models.NewEIP55Address(a.Hex())
+func NewEIP55Address() ethkey.EIP55Address {
+	a := testutils.NewAddress()
+	e, err := ethkey.NewEIP55Address(a.Hex())
 	if err != nil {
 		panic(err)
 	}
@@ -227,34 +60,42 @@ func NewPeerID() p2ppeer.ID {
 	return id
 }
 
-func randomBytes(n int) []byte {
-	b := make([]byte, n)
-	rand.Read(b)
-	return b
-}
-
-func Random32Byte() (b [32]byte) {
-	copy(b[:], randomBytes(32))
-	return b
+type BridgeOpts struct {
+	Name string
+	URL  string
 }
 
 // NewBridgeType create new bridge type given info slice
-func NewBridgeType(t testing.TB, info ...string) (*models.BridgeTypeAuthentication, *models.BridgeType) {
-	btr := &models.BridgeTypeRequest{}
+func NewBridgeType(t testing.TB, opts BridgeOpts) (*bridges.BridgeTypeAuthentication, *bridges.BridgeType) {
+	btr := &bridges.BridgeTypeRequest{}
 
-	if len(info) > 0 {
-		btr.Name = models.MustNewTaskType(info[0])
+	// Must randomise default to avoid unique constraint conflicts with other parallel tests
+	rnd := uuid.NewV4().String()
+
+	if opts.Name != "" {
+		btr.Name = bridges.MustParseBridgeName(opts.Name)
 	} else {
-		btr.Name = models.MustNewTaskType("defaultFixtureBridgeType")
+		btr.Name = bridges.MustParseBridgeName(fmt.Sprintf("test_bridge_%s", rnd))
 	}
 
-	if len(info) > 1 {
-		btr.URL = WebURL(t, info[1])
+	if opts.URL != "" {
+		btr.URL = WebURL(t, opts.URL)
 	} else {
-		btr.URL = WebURL(t, "https://bridge.example.com/api")
+		btr.URL = WebURL(t, fmt.Sprintf("https://bridge.example.com/api?%s", rnd))
 	}
 
-	bta, bt, err := models.NewBridgeType(btr)
+	bta, bt, err := bridges.NewBridgeType(btr)
+	require.NoError(t, err)
+	return bta, bt
+}
+
+// MustCreateBridge creates a bridge
+// Be careful not to specify a name here unless you ABSOLUTELY need to
+// This is because name is a unique index and identical names used across transactional tests will lock/deadlock
+func MustCreateBridge(t testing.TB, db *sqlx.DB, opts BridgeOpts, cfg pg.LogConfig) (bta *bridges.BridgeTypeAuthentication, bt *bridges.BridgeType) {
+	bta, bt = NewBridgeType(t, opts)
+	orm := bridges.NewORM(db, logger.TestLogger(t), cfg)
+	err := orm.CreateBridgeType(bt)
 	require.NoError(t, err)
 	return bta, bt
 }
@@ -278,127 +119,11 @@ func JSONFromBytes(t testing.TB, body []byte) models.JSON {
 	return j
 }
 
-// MustJSONSet uses sjson.Set to set a path in a JSON string and returns the string
-// See https://github.com/tidwall/sjson
-func MustJSONSet(t *testing.T, json, path string, value interface{}) string {
-	json, err := sjson.Set(json, path, value)
+func MustJSONMarshal(t *testing.T, val interface{}) string {
+	t.Helper()
+	bs, err := json.Marshal(val)
 	require.NoError(t, err)
-	return json
-}
-
-// MustJSONDel uses sjson.Delete to remove a path from a JSON string and returns the string
-func MustJSONDel(t *testing.T, json, path string) string {
-	json, err := sjson.Delete(json, path)
-	require.NoError(t, err)
-	return json
-}
-
-// NewRunLog create models.Log for given jobid, address, block, and json
-func NewRunLog(
-	t *testing.T,
-	jobID common.Hash,
-	emitter common.Address,
-	requester common.Address,
-	blk int,
-	json string,
-) models.Log {
-	return models.Log{
-		Address:     emitter,
-		BlockNumber: uint64(blk),
-		Data:        StringToVersionedLogData20190207withoutIndexes(t, "internalID", requester, json),
-		TxHash:      NewHash(),
-		BlockHash:   NewHash(),
-		Topics: []common.Hash{
-			models.RunLogTopic20190207withoutIndexes,
-			jobID,
-		},
-	}
-}
-
-// NewRandomnessRequestLog(t, r, emitter, blk) is a RandomnessRequest log for
-// the randomness request log represented by r.
-func NewRandomnessRequestLog(t *testing.T, r models.RandomnessRequestLog,
-	emitter common.Address, blk int) models.Log {
-	rawData, err := r.RawData()
-	require.NoError(t, err)
-	return models.Log{
-		Address:     emitter,
-		BlockNumber: uint64(blk),
-		Data:        rawData,
-		TxHash:      NewHash(),
-		BlockHash:   NewHash(),
-		Topics:      []common.Hash{models.RandomnessRequestLogTopic, r.JobID},
-	}
-}
-
-func StringToVersionedLogData20190207withoutIndexes(
-	t *testing.T,
-	internalID string,
-	requester common.Address,
-	str string,
-) []byte {
-	requesterBytes := requester.Hash().Bytes()
-	buf := bytes.NewBuffer(requesterBytes)
-
-	requestID := hexutil.MustDecode(StringToHash(internalID).Hex())
-	buf.Write(requestID)
-
-	payment := hexutil.MustDecode(minimumContractPayment.ToHash().Hex())
-	buf.Write(payment)
-
-	callbackAddr := utils.EVMWordUint64(0)
-	buf.Write(callbackAddr)
-
-	callbackFunc := utils.EVMWordUint64(0)
-	buf.Write(callbackFunc)
-
-	expiration := utils.EVMWordUint64(4000000000)
-	buf.Write(expiration)
-
-	version := utils.EVMWordUint64(1)
-	buf.Write(version)
-
-	dataLocation := utils.EVMWordUint64(common.HashLength * 8)
-	buf.Write(dataLocation)
-
-	cbor, err := JSONFromString(t, str).CBOR()
-	require.NoError(t, err)
-	buf.Write(utils.EVMWordUint64(uint64(len(cbor))))
-	paddedLength := common.HashLength * ((len(cbor) / common.HashLength) + 1)
-	buf.Write(common.RightPadBytes(cbor, paddedLength))
-
-	return buf.Bytes()
-}
-
-// BigHexInt create hexutil.Big value from given value
-func BigHexInt(val interface{}) hexutil.Big {
-	switch x := val.(type) {
-	case int: // Single case allows compiler to narrow x's type.
-		return hexutil.Big(*big.NewInt(int64(x)))
-	case uint32:
-		return hexutil.Big(*big.NewInt(int64(x)))
-	case uint64:
-		return hexutil.Big(*big.NewInt(0).SetUint64(x))
-	case int64:
-		return hexutil.Big(*big.NewInt(x))
-	default:
-		logger.Panicf("Could not convert %v of type %T to hexutil.Big", val, val)
-		return hexutil.Big{}
-	}
-}
-
-type MockSigner struct{}
-
-func (s MockSigner) SignHash(common.Hash) (models.Signature, error) {
-	return models.NewSignature("0xb7a987222fc36c4c8ed1b91264867a422769998aadbeeb1c697586a04fa2b616025b5ca936ec5bdb150999e298b6ecf09251d3c4dd1306dedec0692e7037584800")
-}
-
-func ServiceAgreementFromString(str string) (models.ServiceAgreement, error) {
-	us, err := models.NewUnsignedServiceAgreementFromRequest(strings.NewReader(str))
-	if err != nil {
-		return models.ServiceAgreement{}, err
-	}
-	return models.BuildServiceAgreement(us, MockSigner{})
+	return string(bs)
 }
 
 func EmptyCLIContext() *cli.Context {
@@ -406,476 +131,488 @@ func EmptyCLIContext() *cli.Context {
 	return cli.NewContext(nil, set, nil)
 }
 
-// NewJobRun returns a newly initialized job run for test purposes only
-func NewJobRun(job models.JobSpec) models.JobRun {
-	initiator := job.Initiators[0]
-	now := time.Now()
-	run := models.MakeJobRun(&job, now, &initiator, nil, &models.RunRequest{})
-	return run
-}
-
-// NewJobRunPendingBridge returns a new job run in the pending bridge state
-func NewJobRunPendingBridge(job models.JobSpec) models.JobRun {
-	run := NewJobRun(job)
-	run.SetStatus(models.RunStatusPendingBridge)
-	run.TaskRuns[0].Status = models.RunStatusPendingBridge
-	return run
-}
-
-// CreateJobRunWithStatus returns a new job run with the specified status that has been persisted
-func CreateJobRunWithStatus(t testing.TB, store *strpkg.Store, job models.JobSpec, status models.RunStatus) models.JobRun {
-	run := NewJobRun(job)
-	run.SetStatus(status)
-	require.NoError(t, store.CreateJobRun(&run))
-	return run
-}
-
-func BuildInitiatorRequests(t *testing.T, initrs []models.Initiator) []models.InitiatorRequest {
-	bytes, err := json.Marshal(initrs)
-	require.NoError(t, err)
-
-	var dst []models.InitiatorRequest
-	err = json.Unmarshal(bytes, &dst)
-	require.NoError(t, err)
-	return dst
-}
-
-func BuildTaskRequests(t *testing.T, initrs []models.TaskSpec) []models.TaskSpecRequest {
-	bytes, err := json.Marshal(initrs)
-	require.NoError(t, err)
-
-	var dst []models.TaskSpecRequest
-	err = json.Unmarshal(bytes, &dst)
-	require.NoError(t, err)
-	return dst
-}
-
-func NewRunInput(value models.JSON) models.RunInput {
-	jobRunID := uuid.NewV4()
-	taskRunID := uuid.NewV4()
-	return *models.NewRunInput(jobRunID, taskRunID, value, models.RunStatusUnstarted)
-}
-
-func NewRunInputWithString(t testing.TB, value string) models.RunInput {
-	jobRunID := uuid.NewV4()
-	taskRunID := uuid.NewV4()
-	data := JSONFromString(t, value)
-	return *models.NewRunInput(jobRunID, taskRunID, data, models.RunStatusUnstarted)
-}
-
-func NewRunInputWithResult(value interface{}) models.RunInput {
-	jobRunID := uuid.NewV4()
-	taskRunID := uuid.NewV4()
-	return *models.NewRunInputWithResult(jobRunID, taskRunID, value, models.RunStatusUnstarted)
-}
-
-func NewRunInputWithResultAndJobRunID(value interface{}, jobRunID uuid.UUID) models.RunInput {
-	taskRunID := uuid.NewV4()
-	return *models.NewRunInputWithResult(jobRunID, taskRunID, value, models.RunStatusUnstarted)
-}
-
-func NewPollingDeviationChecker(t *testing.T, s *strpkg.Store) *fluxmonitor.PollingDeviationChecker {
-	fluxAggregator := new(mocks.FluxAggregator)
-	runManager := new(mocks.RunManager)
-	fetcher := new(mocks.Fetcher)
-	initr := models.Initiator{
-		JobSpecID: models.NewJobID(),
-		InitiatorParams: models.InitiatorParams{
-			PollTimer: models.PollTimerConfig{
-				Period: models.MustMakeDuration(time.Second),
-			},
-		},
-	}
-	lb := new(logmocks.Broadcaster)
-	checker, err := fluxmonitor.NewPollingDeviationChecker(s, fluxAggregator, nil, lb, initr, nil, runManager, fetcher, func() {}, big.NewInt(0), big.NewInt(100000000000))
-	require.NoError(t, err)
-	return checker
-}
-
-func MustInsertTaskRun(t *testing.T, store *strpkg.Store) uuid.UUID {
-	taskRunID := uuid.NewV4()
-
-	job := NewJobWithWebInitiator()
-	require.NoError(t, store.CreateJob(&job))
-	jobRun := NewJobRun(job)
-	jobRun.TaskRuns = []models.TaskRun{models.TaskRun{ID: taskRunID, Status: models.RunStatusUnstarted, TaskSpecID: job.Tasks[0].ID}}
-	require.NoError(t, store.CreateJobRun(&jobRun))
-
-	return taskRunID
-}
-
-func NewEthTx(t *testing.T, store *strpkg.Store, fromAddress common.Address) models.EthTx {
-	return models.EthTx{
+func NewEthTx(t *testing.T, fromAddress common.Address) txmgr.EthTx {
+	return txmgr.EthTx{
 		FromAddress:    fromAddress,
-		ToAddress:      NewAddress(),
+		ToAddress:      testutils.NewAddress(),
 		EncodedPayload: []byte{1, 2, 3},
 		Value:          assets.NewEthValue(142),
 		GasLimit:       uint64(1000000000),
+		State:          txmgr.EthTxUnstarted,
 	}
 }
 
-func MustInsertUnconfirmedEthTxWithBroadcastAttempt(t *testing.T, store *strpkg.Store, nonce int64, fromAddress common.Address, opts ...interface{}) models.EthTx {
+func MustInsertUnconfirmedEthTx(t *testing.T, borm txmgr.ORM, nonce int64, fromAddress common.Address, opts ...interface{}) txmgr.EthTx {
 	broadcastAt := time.Now()
+	chainID := &FixtureChainID
 	for _, opt := range opts {
 		switch v := opt.(type) {
 		case time.Time:
 			broadcastAt = v
+		case *big.Int:
+			chainID = v
 		}
 	}
-	etx := NewEthTx(t, store, fromAddress)
+	etx := NewEthTx(t, fromAddress)
 
 	etx.BroadcastAt = &broadcastAt
+	etx.InitialBroadcastAt = &broadcastAt
 	n := nonce
 	etx.Nonce = &n
-	etx.State = models.EthTxUnconfirmed
-	require.NoError(t, store.DB.Save(&etx).Error)
-	attempt := NewEthTxAttempt(t, etx.ID)
+	etx.State = txmgr.EthTxUnconfirmed
+	etx.EVMChainID = *utils.NewBig(chainID)
+	require.NoError(t, borm.InsertEthTx(&etx))
+	return etx
+}
 
-	tx := types.NewTransaction(uint64(nonce), NewAddress(), big.NewInt(142), 242, big.NewInt(342), []byte{1, 2, 3})
+func MustInsertUnconfirmedEthTxWithBroadcastLegacyAttempt(t *testing.T, borm txmgr.ORM, nonce int64, fromAddress common.Address, opts ...interface{}) txmgr.EthTx {
+	etx := MustInsertUnconfirmedEthTx(t, borm, nonce, fromAddress, opts...)
+	attempt := NewLegacyEthTxAttempt(t, etx.ID)
+
+	tx := types.NewTransaction(uint64(nonce), testutils.NewAddress(), big.NewInt(142), 242, big.NewInt(342), []byte{1, 2, 3})
 	rlp := new(bytes.Buffer)
 	require.NoError(t, tx.EncodeRLP(rlp))
 	attempt.SignedRawTx = rlp.Bytes()
 
-	attempt.State = models.EthTxAttemptBroadcast
-	require.NoError(t, store.DB.Save(&attempt).Error)
-	etx, err := store.FindEthTxWithAttempts(etx.ID)
+	attempt.State = txmgr.EthTxAttemptBroadcast
+	require.NoError(t, borm.InsertEthTxAttempt(&attempt))
+	etx, err := borm.FindEthTxWithAttempts(etx.ID)
 	require.NoError(t, err)
 	return etx
 }
 
-func MustInsertUnconfirmedEthTxWithInsufficientEthAttempt(t *testing.T, store *strpkg.Store, nonce int64, fromAddress common.Address) models.EthTx {
-	timeNow := time.Now()
-	etx := NewEthTx(t, store, fromAddress)
+func MustInsertUnconfrimedEthTxWithAttemptState(t *testing.T, borm txmgr.ORM, nonce int64, fromAddress common.Address, txAttemptState txmgr.EthTxAttemptState, opts ...interface{}) txmgr.EthTx {
+	etx := MustInsertUnconfirmedEthTx(t, borm, nonce, fromAddress, opts...)
+	attempt := NewLegacyEthTxAttempt(t, etx.ID)
 
-	etx.BroadcastAt = &timeNow
-	n := nonce
-	etx.Nonce = &n
-	etx.State = models.EthTxUnconfirmed
-	require.NoError(t, store.DB.Save(&etx).Error)
-	attempt := NewEthTxAttempt(t, etx.ID)
-
-	tx := types.NewTransaction(uint64(nonce), NewAddress(), big.NewInt(142), 242, big.NewInt(342), []byte{1, 2, 3})
+	tx := types.NewTransaction(uint64(nonce), testutils.NewAddress(), big.NewInt(142), 242, big.NewInt(342), []byte{1, 2, 3})
 	rlp := new(bytes.Buffer)
 	require.NoError(t, tx.EncodeRLP(rlp))
 	attempt.SignedRawTx = rlp.Bytes()
 
-	attempt.State = models.EthTxAttemptInsufficientEth
-	require.NoError(t, store.DB.Save(&attempt).Error)
-	etx, err := store.FindEthTxWithAttempts(etx.ID)
+	attempt.State = txAttemptState
+	require.NoError(t, borm.InsertEthTxAttempt(&attempt))
+	etx, err := borm.FindEthTxWithAttempts(etx.ID)
 	require.NoError(t, err)
 	return etx
 }
 
-func MustInsertConfirmedEthTxWithAttempt(t *testing.T, store *strpkg.Store, nonce int64, broadcastBeforeBlockNum int64, fromAddress common.Address) models.EthTx {
+func MustInsertUnconfirmedEthTxWithBroadcastDynamicFeeAttempt(t *testing.T, borm txmgr.ORM, nonce int64, fromAddress common.Address, opts ...interface{}) txmgr.EthTx {
+	etx := MustInsertUnconfirmedEthTx(t, borm, nonce, fromAddress, opts...)
+	attempt := NewDynamicFeeEthTxAttempt(t, etx.ID)
+
+	addr := testutils.NewAddress()
+	dtx := types.DynamicFeeTx{
+		ChainID:   big.NewInt(0),
+		Nonce:     uint64(nonce),
+		GasTipCap: big.NewInt(1),
+		GasFeeCap: big.NewInt(1),
+		Gas:       242,
+		To:        &addr,
+		Value:     big.NewInt(342),
+		Data:      []byte{2, 3, 4},
+	}
+	tx := types.NewTx(&dtx)
+	rlp := new(bytes.Buffer)
+	require.NoError(t, tx.EncodeRLP(rlp))
+	attempt.SignedRawTx = rlp.Bytes()
+
+	attempt.State = txmgr.EthTxAttemptBroadcast
+	require.NoError(t, borm.InsertEthTxAttempt(&attempt))
+	etx, err := borm.FindEthTxWithAttempts(etx.ID)
+	require.NoError(t, err)
+	return etx
+}
+
+func MustInsertUnconfirmedEthTxWithInsufficientEthAttempt(t *testing.T, borm txmgr.ORM, nonce int64, fromAddress common.Address) txmgr.EthTx {
 	timeNow := time.Now()
-	etx := NewEthTx(t, store, fromAddress)
+	etx := NewEthTx(t, fromAddress)
 
 	etx.BroadcastAt = &timeNow
+	etx.InitialBroadcastAt = &timeNow
+	n := nonce
+	etx.Nonce = &n
+	etx.State = txmgr.EthTxUnconfirmed
+	require.NoError(t, borm.InsertEthTx(&etx))
+	attempt := NewLegacyEthTxAttempt(t, etx.ID)
+
+	tx := types.NewTransaction(uint64(nonce), testutils.NewAddress(), big.NewInt(142), 242, big.NewInt(342), []byte{1, 2, 3})
+	rlp := new(bytes.Buffer)
+	require.NoError(t, tx.EncodeRLP(rlp))
+	attempt.SignedRawTx = rlp.Bytes()
+
+	attempt.State = txmgr.EthTxAttemptInsufficientEth
+	require.NoError(t, borm.InsertEthTxAttempt(&attempt))
+	etx, err := borm.FindEthTxWithAttempts(etx.ID)
+	require.NoError(t, err)
+	return etx
+}
+
+func MustInsertConfirmedMissingReceiptEthTxWithLegacyAttempt(
+	t *testing.T, borm txmgr.ORM, nonce int64, broadcastBeforeBlockNum int64,
+	broadcastAt time.Time, fromAddress common.Address) txmgr.EthTx {
+	etx := NewEthTx(t, fromAddress)
+
+	etx.BroadcastAt = &broadcastAt
+	etx.InitialBroadcastAt = &broadcastAt
 	etx.Nonce = &nonce
-	etx.State = models.EthTxConfirmed
-	require.NoError(t, store.DB.Save(&etx).Error)
-	attempt := NewEthTxAttempt(t, etx.ID)
+	etx.State = txmgr.EthTxConfirmedMissingReceipt
+	require.NoError(t, borm.InsertEthTx(&etx))
+	attempt := NewLegacyEthTxAttempt(t, etx.ID)
 	attempt.BroadcastBeforeBlockNum = &broadcastBeforeBlockNum
-	attempt.State = models.EthTxAttemptBroadcast
-	require.NoError(t, store.DB.Save(&attempt).Error)
+	attempt.State = txmgr.EthTxAttemptBroadcast
+	require.NoError(t, borm.InsertEthTxAttempt(&attempt))
 	etx.EthTxAttempts = append(etx.EthTxAttempts, attempt)
 	return etx
 }
 
-func MustInsertInProgressEthTxWithAttempt(t *testing.T, store *strpkg.Store, nonce int64, fromAddress common.Address) models.EthTx {
-	etx := NewEthTx(t, store, fromAddress)
+func MustInsertConfirmedEthTxWithLegacyAttempt(t *testing.T, borm txmgr.ORM, nonce int64, broadcastBeforeBlockNum int64, fromAddress common.Address) txmgr.EthTx {
+	timeNow := time.Now()
+	etx := NewEthTx(t, fromAddress)
 
-	etx.BroadcastAt = nil
+	etx.BroadcastAt = &timeNow
+	etx.InitialBroadcastAt = &timeNow
 	etx.Nonce = &nonce
-	etx.State = models.EthTxInProgress
-	require.NoError(t, store.DB.Save(&etx).Error)
-	attempt := NewEthTxAttempt(t, etx.ID)
-	tx := types.NewTransaction(uint64(nonce), NewAddress(), big.NewInt(142), 242, big.NewInt(342), []byte{1, 2, 3})
+	etx.State = txmgr.EthTxConfirmed
+	require.NoError(t, borm.InsertEthTx(&etx))
+	attempt := NewLegacyEthTxAttempt(t, etx.ID)
+	attempt.BroadcastBeforeBlockNum = &broadcastBeforeBlockNum
+	attempt.State = txmgr.EthTxAttemptBroadcast
+	require.NoError(t, borm.InsertEthTxAttempt(&attempt))
+	etx.EthTxAttempts = append(etx.EthTxAttempts, attempt)
+	return etx
+}
+
+func MustInsertInProgressEthTxWithAttempt(t *testing.T, borm txmgr.ORM, nonce int64, fromAddress common.Address) txmgr.EthTx {
+	etx := NewEthTx(t, fromAddress)
+
+	etx.Nonce = &nonce
+	etx.State = txmgr.EthTxInProgress
+	require.NoError(t, borm.InsertEthTx(&etx))
+	attempt := NewLegacyEthTxAttempt(t, etx.ID)
+	tx := types.NewTransaction(uint64(nonce), testutils.NewAddress(), big.NewInt(142), 242, big.NewInt(342), []byte{1, 2, 3})
 	rlp := new(bytes.Buffer)
 	require.NoError(t, tx.EncodeRLP(rlp))
 	attempt.SignedRawTx = rlp.Bytes()
-	attempt.State = models.EthTxAttemptInProgress
-	require.NoError(t, store.DB.Save(&attempt).Error)
-	etx, err := store.FindEthTxWithAttempts(etx.ID)
+	attempt.State = txmgr.EthTxAttemptInProgress
+	require.NoError(t, borm.InsertEthTxAttempt(&attempt))
+	etx, err := borm.FindEthTxWithAttempts(etx.ID)
 	require.NoError(t, err)
 	return etx
 }
 
-func MustInsertUnstartedEthTx(t *testing.T, store *strpkg.Store, fromAddress common.Address) models.EthTx {
-	etx := NewEthTx(t, store, fromAddress)
-	etx.State = models.EthTxUnstarted
-	require.NoError(t, store.DB.Save(&etx).Error)
+func MustInsertUnstartedEthTx(t *testing.T, borm txmgr.ORM, fromAddress common.Address, opts ...interface{}) txmgr.EthTx {
+	var subject uuid.NullUUID
+	for _, opt := range opts {
+		switch v := opt.(type) {
+		case uuid.UUID:
+			subject = uuid.NullUUID{UUID: v, Valid: true}
+		}
+	}
+	etx := NewEthTx(t, fromAddress)
+	etx.State = txmgr.EthTxUnstarted
+	etx.Subject = subject
+	require.NoError(t, borm.InsertEthTx(&etx))
 	return etx
 }
 
-func NewEthTxAttempt(t *testing.T, etxID int64) models.EthTxAttempt {
+func NewLegacyEthTxAttempt(t *testing.T, etxID int64) txmgr.EthTxAttempt {
 	gasPrice := utils.NewBig(big.NewInt(1))
-	return models.EthTxAttempt{
-		EthTxID:  etxID,
-		GasPrice: *gasPrice,
+	return txmgr.EthTxAttempt{
+		ChainSpecificGasLimit: 42,
+		EthTxID:               etxID,
+		GasPrice:              gasPrice,
 		// Just a random signed raw tx that decodes correctly
 		// Ignore all actual values
 		SignedRawTx: hexutil.MustDecode("0xf889808504a817c8008307a12094000000000000000000000000000000000000000080a400000000000000000000000000000000000000000000000000000000000000000000000025a0838fe165906e2547b9a052c099df08ec891813fea4fcdb3c555362285eb399c5a070db99322490eb8a0f2270be6eca6e3aedbc49ff57ef939cf2774f12d08aa85e"),
-		Hash:        NewHash(),
+		Hash:        utils.NewHash(),
+		State:       txmgr.EthTxAttemptInProgress,
 	}
 }
 
-func MustInsertBroadcastEthTxAttempt(t *testing.T, etxID int64, store *strpkg.Store, gasPrice int64) models.EthTxAttempt {
-	attempt := NewEthTxAttempt(t, etxID)
-	attempt.State = models.EthTxAttemptBroadcast
-	attempt.GasPrice = *utils.NewBig(big.NewInt(gasPrice))
-	require.NoError(t, store.DB.Create(&attempt).Error)
-	return attempt
+func NewDynamicFeeEthTxAttempt(t *testing.T, etxID int64) txmgr.EthTxAttempt {
+	gasTipCap := utils.NewBig(big.NewInt(1))
+	gasFeeCap := utils.NewBig(big.NewInt(1))
+	return txmgr.EthTxAttempt{
+		TxType:    0x2,
+		EthTxID:   etxID,
+		GasTipCap: gasTipCap,
+		GasFeeCap: gasFeeCap,
+		// Just a random signed raw tx that decodes correctly
+		// Ignore all actual values
+		SignedRawTx:           hexutil.MustDecode("0xf889808504a817c8008307a12094000000000000000000000000000000000000000080a400000000000000000000000000000000000000000000000000000000000000000000000025a0838fe165906e2547b9a052c099df08ec891813fea4fcdb3c555362285eb399c5a070db99322490eb8a0f2270be6eca6e3aedbc49ff57ef939cf2774f12d08aa85e"),
+		Hash:                  utils.NewHash(),
+		State:                 txmgr.EthTxAttemptInProgress,
+		ChainSpecificGasLimit: 42,
+	}
 }
 
-func MustInsertEthReceipt(t *testing.T, s *strpkg.Store, blockNumber int64, blockHash common.Hash, txHash common.Hash) models.EthReceipt {
-	r := models.EthReceipt{
+func NewEthReceipt(t *testing.T, blockNumber int64, blockHash common.Hash, txHash common.Hash, status uint64) txmgr.EthReceipt {
+	transactionIndex := uint(NewRandomInt64())
+
+	receipt := evmtypes.Receipt{
+		BlockNumber:      big.NewInt(blockNumber),
+		BlockHash:        blockHash,
+		TxHash:           txHash,
+		TransactionIndex: transactionIndex,
+		Status:           status,
+	}
+
+	r := txmgr.EthReceipt{
 		BlockNumber:      blockNumber,
 		BlockHash:        blockHash,
 		TxHash:           txHash,
-		TransactionIndex: uint(NewRandomInt64()),
-		Receipt:          []byte(`{"foo":42}`),
+		TransactionIndex: transactionIndex,
+		Receipt:          receipt,
 	}
-	require.NoError(t, s.DB.Save(&r).Error)
 	return r
 }
 
-func MustInsertFatalErrorEthTx(t *testing.T, store *strpkg.Store, fromAddress common.Address) models.EthTx {
-	etx := NewEthTx(t, store, fromAddress)
-	errStr := "something exploded"
-	etx.Error = &errStr
-	etx.State = models.EthTxFatalError
+func MustInsertEthReceipt(t *testing.T, borm txmgr.ORM, blockNumber int64, blockHash common.Hash, txHash common.Hash) txmgr.EthReceipt {
+	r := NewEthReceipt(t, blockNumber, blockHash, txHash, 0x1)
+	require.NoError(t, borm.InsertEthReceipt(&r))
+	return r
+}
 
-	require.NoError(t, store.DB.Save(&etx).Error)
+func MustInsertRevertedEthReceipt(t *testing.T, borm txmgr.ORM, blockNumber int64, blockHash common.Hash, txHash common.Hash) txmgr.EthReceipt {
+	r := NewEthReceipt(t, blockNumber, blockHash, txHash, 0x0)
+	require.NoError(t, borm.InsertEthReceipt(&r))
+	return r
+}
+
+func MustInsertConfirmedEthTxWithReceipt(t *testing.T, borm txmgr.ORM, fromAddress common.Address, nonce, blockNum int64) (etx txmgr.EthTx) {
+	etx = MustInsertConfirmedEthTxWithLegacyAttempt(t, borm, nonce, blockNum, fromAddress)
+	MustInsertEthReceipt(t, borm, blockNum, utils.NewHash(), etx.EthTxAttempts[0].Hash)
 	return etx
 }
 
-func MustAddRandomKeyToKeystore(t testing.TB, store *strpkg.Store, opts ...interface{}) (models.Key, common.Address) {
+func MustInsertFatalErrorEthTx(t *testing.T, borm txmgr.ORM, fromAddress common.Address) txmgr.EthTx {
+	etx := NewEthTx(t, fromAddress)
+	etx.Error = null.StringFrom("something exploded")
+	etx.State = txmgr.EthTxFatalError
+
+	require.NoError(t, borm.InsertEthTx(&etx))
+	return etx
+}
+
+func MustAddRandomKeyToKeystore(t testing.TB, ethKeyStore keystore.Eth) (ethkey.KeyV2, common.Address) {
 	t.Helper()
 
-	k := MustGenerateRandomKey(t, opts...)
-	err := store.KeyStore.Unlock(Password)
-	require.NoError(t, err)
-	MustAddKeyToKeystore(t, &k, store)
+	k := MustGenerateRandomKey(t)
+	MustAddKeyToKeystore(t, k, &FixtureChainID, ethKeyStore)
+
 	return k, k.Address.Address()
 }
 
-func MustAddKeyToKeystore(t testing.TB, key *models.Key, store *strpkg.Store) {
+func MustAddKeyToKeystore(t testing.TB, key ethkey.KeyV2, chainID *big.Int, ethKeyStore keystore.Eth) {
 	t.Helper()
-
-	err := store.KeyStore.Unlock(Password)
+	err := ethKeyStore.Add(key, chainID)
 	require.NoError(t, err)
-	_, err = store.KeyStore.Import(key.JSON.Bytes(), Password)
-	require.NoError(t, err)
-	require.NoError(t, store.DB.Create(key).Error)
 }
 
 // MustInsertRandomKey inserts a randomly generated (not cryptographically
 // secure) key for testing
-// If using this with the keystore, it should be called before the keystore loads keys from the database
-func MustInsertRandomKey(t testing.TB, db *gorm.DB, opts ...interface{}) models.Key {
+func MustInsertRandomKey(
+	t testing.TB,
+	keystore keystore.Eth,
+	opts ...interface{},
+) (ethkey.KeyV2, common.Address) {
 	t.Helper()
 
-	key := MustGenerateRandomKey(t, opts...)
-
-	require.NoError(t, db.Create(&key).Error)
-	return key
-}
-
-func MustGenerateRandomKey(t testing.TB, opts ...interface{}) models.Key {
-	privateKeyECDSA, err := ecdsa.GenerateKey(crypto.S256(), rand.Reader)
-	require.NoError(t, err)
-	//  < Geth 1.10 id type []byte
-	//  >= Geth 1.10 id type [16]byte
-	id := googleuuid.New()
-	k := &keystore.Key{
-		Id:         id,
-		Address:    crypto.PubkeyToAddress(privateKeyECDSA.PublicKey),
-		PrivateKey: privateKeyECDSA,
+	chainID := *utils.NewBig(&FixtureChainID)
+	for _, opt := range opts {
+		switch v := opt.(type) {
+		case utils.Big:
+			chainID = v
+		}
 	}
-	keyjsonbytes, err := keystore.EncryptKey(k, Password, utils.FastScryptParams.N, utils.FastScryptParams.P)
-	require.NoError(t, err)
-	keyjson, err := models.ParseJSON(keyjsonbytes)
-	require.NoError(t, err)
-	eip, err := models.EIP55AddressFromAddress(k.Address)
+
+	key := MustGenerateRandomKey(t)
+	require.NoError(t, keystore.Add(key, chainID.ToInt()))
+	state, err := keystore.GetState(key.ID())
 	require.NoError(t, err)
 
-	var nextNonce int64
-	var funding bool
 	for _, opt := range opts {
 		switch v := opt.(type) {
 		case int:
-			nextNonce = int64(v)
+			state.NextNonce = int64(v)
 		case int64:
-			nextNonce = v
+			state.NextNonce = v
 		case bool:
-			funding = v
+			state.IsFunding = v
+		case utils.Big:
+			state.EVMChainID = v
 		default:
 			t.Fatalf("unrecognised option type: %T", v)
 		}
 	}
+	err = keystore.SetState(state)
+	require.NoError(t, err)
 
-	key := models.Key{
-		Address:   eip,
-		JSON:      keyjson,
-		NextNonce: nextNonce,
-		IsFunding: funding,
-	}
+	return key, key.Address.Address()
+}
+
+func MustInsertRandomKeyReturningState(t testing.TB,
+	keystore keystore.Eth,
+	opts ...interface{},
+) (ethkey.State, common.Address) {
+	k, address := MustInsertRandomKey(t, keystore, opts...)
+	state := MustGetStateForKey(t, keystore, k)
+	return state, address
+}
+
+func MustGenerateRandomKey(t testing.TB) ethkey.KeyV2 {
+	key, err := ethkey.NewV2()
+	require.NoError(t, err)
 	return key
 }
 
-func MustInsertHead(t *testing.T, store *strpkg.Store, number int64) models.Head {
-	h := models.NewHead(big.NewInt(number), NewHash(), NewHash(), 0)
-	err := store.DB.Create(&h).Error
+func MustGenerateRandomKeyState(t testing.TB) ethkey.State {
+	return ethkey.State{Address: NewEIP55Address()}
+}
+
+func MustInsertHead(t *testing.T, db *sqlx.DB, cfg pg.LogConfig, number int64) evmtypes.Head {
+	h := evmtypes.NewHead(big.NewInt(number), utils.NewHash(), utils.NewHash(), 0, utils.NewBig(&FixtureChainID))
+	horm := headtracker.NewORM(db, logger.TestLogger(t), cfg, FixtureChainID)
+
+	err := horm.IdempotentInsertHead(context.Background(), &h)
 	require.NoError(t, err)
 	return h
 }
 
-func MustInsertV2JobSpec(t *testing.T, store *strpkg.Store, transmitterAddress common.Address) job.Job {
+func MustInsertV2JobSpec(t *testing.T, db *sqlx.DB, transmitterAddress common.Address) job.Job {
 	t.Helper()
 
-	addr, err := models.NewEIP55Address(transmitterAddress.Hex())
+	addr, err := ethkey.NewEIP55Address(transmitterAddress.Hex())
 	require.NoError(t, err)
 
-	oracleSpec := MustInsertOffchainreportingOracleSpec(t, store, addr)
+	pipelineSpec := pipeline.Spec{}
+	err = db.Get(&pipelineSpec, `INSERT INTO pipeline_specs (dot_dag_source,created_at) VALUES ('',NOW()) RETURNING *`)
+	require.NoError(t, err)
+
+	oracleSpec := MustInsertOffchainreportingOracleSpec(t, db, addr)
 	jb := job.Job{
-		OffchainreportingOracleSpec: &oracleSpec,
-		Type:                        job.OffchainReporting,
-		SchemaVersion:               1,
-		PipelineSpec:                &pipeline.Spec{},
+		OCROracleSpec:   &oracleSpec,
+		OCROracleSpecID: &oracleSpec.ID,
+		ExternalJobID:   uuid.NewV4(),
+		Type:            job.OffchainReporting,
+		SchemaVersion:   1,
+		PipelineSpec:    &pipelineSpec,
+		PipelineSpecID:  pipelineSpec.ID,
 	}
-	err = store.DB.Create(&jb).Error
+
+	jorm := job.NewORM(db, nil, nil, nil, logger.TestLogger(t), NewTestGeneralConfig(t))
+	err = jorm.InsertJob(&jb)
 	require.NoError(t, err)
 	return jb
 }
 
-func MustInsertOffchainreportingOracleSpec(t *testing.T, store *strpkg.Store, transmitterAddress models.EIP55Address) job.OffchainReportingOracleSpec {
+func MustInsertOffchainreportingOracleSpec(t *testing.T, db *sqlx.DB, transmitterAddress ethkey.EIP55Address) job.OCROracleSpec {
 	t.Helper()
 
-	pid := models.PeerID(DefaultP2PPeerID)
-	spec := job.OffchainReportingOracleSpec{
-		ContractAddress:                        NewEIP55Address(),
-		P2PPeerID:                              &pid,
-		P2PBootstrapPeers:                      pq.StringArray{},
-		IsBootstrapPeer:                        false,
-		EncryptedOCRKeyBundleID:                &DefaultOCRKeyBundleIDSha256,
-		TransmitterAddress:                     &transmitterAddress,
-		ObservationTimeout:                     0,
-		BlockchainTimeout:                      0,
-		ContractConfigTrackerSubscribeInterval: 0,
-		ContractConfigTrackerPollInterval:      0,
-		ContractConfigConfirmations:            0,
-	}
-	require.NoError(t, store.DB.Create(&spec).Error)
+	ocrKeyID := models.MustSha256HashFromHex(DefaultOCRKeyBundleID)
+	spec := job.OCROracleSpec{}
+	require.NoError(t, db.Get(&spec, `INSERT INTO ocr_oracle_specs (created_at, updated_at, contract_address, p2p_bootstrap_peers, is_bootstrap_peer, encrypted_ocr_key_bundle_id, transmitter_address, observation_timeout, blockchain_timeout, contract_config_tracker_subscribe_interval, contract_config_tracker_poll_interval, contract_config_confirmations, database_timeout, observation_grace_period, contract_transmitter_transmit_timeout) VALUES (
+NOW(),NOW(),$1,'{}',false,$2,$3,0,0,0,0,0,0,0,0
+) RETURNING *`, NewEIP55Address(), &ocrKeyID, &transmitterAddress))
 	return spec
 }
 
-func MustInsertJobSpec(t *testing.T, s *strpkg.Store) models.JobSpec {
-	j := NewJob()
-	require.NoError(t, s.CreateJob(&j))
-	return j
-}
-
-func MustInsertKeeperJob(t *testing.T, store *strpkg.Store, from models.EIP55Address, contract models.EIP55Address) job.Job {
+func MakeDirectRequestJobSpec(t *testing.T) *job.Job {
 	t.Helper()
-	keeperSpec := job.KeeperSpec{
-		ContractAddress: contract,
-		FromAddress:     from,
+	drs := &job.DirectRequestSpec{}
+	spec := &job.Job{
+		Type:              job.DirectRequest,
+		SchemaVersion:     1,
+		ExternalJobID:     uuid.NewV4(),
+		DirectRequestSpec: drs,
+		Pipeline:          pipeline.Pipeline{},
+		PipelineSpec:      &pipeline.Spec{},
 	}
-	err := store.DB.Create(&keeperSpec).Error
-	require.NoError(t, err)
-	specDB := job.Job{
-		KeeperSpec:    &keeperSpec,
-		Type:          job.Keeper,
-		SchemaVersion: 1,
-		PipelineSpec:  &pipeline.Spec{},
-	}
-	err = store.DB.Create(&specDB).Error
-	require.NoError(t, err)
-	return specDB
+	return spec
 }
 
-func MustInsertKeeperRegistry(t *testing.T, store *strpkg.Store) (keeper.Registry, job.Job) {
-	key, _ := MustAddRandomKeyToKeystore(t, store)
+func MustInsertKeeperJob(t *testing.T, db *sqlx.DB, korm keeper.ORM, from ethkey.EIP55Address, contract ethkey.EIP55Address) job.Job {
+	t.Helper()
+
+	var keeperSpec job.KeeperSpec
+	err := korm.Q().Get(&keeperSpec, `INSERT INTO keeper_specs (contract_address, from_address, created_at, updated_at) VALUES ($1, $2, NOW(), NOW()) RETURNING *`, contract, from)
+	require.NoError(t, err)
+
+	var pipelineSpec pipeline.Spec
+	err = korm.Q().Get(&pipelineSpec, `INSERT INTO pipeline_specs (dot_dag_source,created_at) VALUES ('',NOW()) RETURNING *`)
+	require.NoError(t, err)
+
+	jb := job.Job{
+		KeeperSpec:     &keeperSpec,
+		KeeperSpecID:   &keeperSpec.ID,
+		ExternalJobID:  uuid.NewV4(),
+		Type:           job.Keeper,
+		SchemaVersion:  1,
+		PipelineSpec:   &pipelineSpec,
+		PipelineSpecID: pipelineSpec.ID,
+	}
+
+	cfg := NewTestGeneralConfig(t)
+	tlg := logger.TestLogger(t)
+	prm := pipeline.NewORM(db, tlg, cfg)
+	jrm := job.NewORM(db, nil, prm, nil, tlg, cfg)
+	err = jrm.InsertJob(&jb)
+	require.NoError(t, err)
+	return jb
+}
+
+func MustInsertKeeperRegistry(t *testing.T, db *sqlx.DB, korm keeper.ORM, ethKeyStore keystore.Eth, keeperIndex, numKeepers, blockCountPerTurn int32) (keeper.Registry, job.Job) {
+	key, _ := MustAddRandomKeyToKeystore(t, ethKeyStore)
 	from := key.Address
 	t.Helper()
 	contractAddress := NewEIP55Address()
-	job := MustInsertKeeperJob(t, store, from, contractAddress)
+	job := MustInsertKeeperJob(t, db, korm, from, contractAddress)
 	registry := keeper.Registry{
 		ContractAddress:   contractAddress,
-		BlockCountPerTurn: 20,
-		CheckGas:          10_000,
+		BlockCountPerTurn: blockCountPerTurn,
+		CheckGas:          150_000,
 		FromAddress:       from,
 		JobID:             job.ID,
-		KeeperIndex:       0,
-		NumKeepers:        1,
+		KeeperIndex:       keeperIndex,
+		NumKeepers:        numKeepers,
+		KeeperIndexMap: map[ethkey.EIP55Address]int32{
+			from: keeperIndex,
+		},
 	}
-	err := store.DB.Create(&registry).Error
+	err := korm.UpsertRegistry(&registry)
 	require.NoError(t, err)
 	return registry, job
 }
 
-func MustInsertUpkeepForRegistry(t *testing.T, store *strpkg.Store, registry keeper.Registry) keeper.UpkeepRegistration {
-	ctx, _ := postgres.DefaultQueryCtx()
-	upkeepID, err := keeper.NewORM(store.DB).LowestUnsyncedID(ctx, registry)
-	require.NoError(t, err)
+func MustInsertUpkeepForRegistry(t *testing.T, db *sqlx.DB, cfg keeper.Config, registry keeper.Registry) keeper.UpkeepRegistration {
+	korm := keeper.NewORM(db, logger.TestLogger(t), cfg, txmgr.SendEveryStrategy{})
+	mathrand.Seed(time.Now().UnixNano())
+	upkeepID := utils.NewBigI(int64(mathrand.Uint32()))
 	upkeep := keeper.UpkeepRegistration{
 		UpkeepID:   upkeepID,
-		ExecuteGas: int32(10_000),
+		ExecuteGas: uint64(150_000),
 		Registry:   registry,
+		RegistryID: registry.ID,
 		CheckData:  common.Hex2Bytes("ABC123"),
 	}
-	err = store.DB.Create(&upkeep).Error
+	positioningConstant, err := keeper.CalcPositioningConstant(upkeepID, registry.ContractAddress)
+	require.NoError(t, err)
+	upkeep.PositioningConstant = positioningConstant
+	err = korm.UpsertUpkeep(&upkeep)
 	require.NoError(t, err)
 	return upkeep
 }
 
-func NewRoundStateForRoundID(store *strpkg.Store, roundID uint32, latestSubmission *big.Int) flux_aggregator_wrapper.OracleRoundState {
-	return flux_aggregator_wrapper.OracleRoundState{
-		RoundId:          roundID,
-		EligibleToSubmit: true,
-		LatestSubmission: latestSubmission,
-		AvailableFunds:   store.Config.MinimumContractPayment().ToInt(),
-		PaymentAmount:    store.Config.MinimumContractPayment().ToInt(),
-	}
-}
-
-func MustInsertPipelineRun(t *testing.T, db *gorm.DB) pipeline.Run {
-	run := pipeline.Run{
-		Outputs:    pipeline.JSONSerializable{Null: true},
-		Errors:     pipeline.RunErrors{},
-		FinishedAt: nil,
-	}
-	require.NoError(t, db.Create(&run).Error)
+func MustInsertPipelineRun(t *testing.T, db *sqlx.DB) (run pipeline.Run) {
+	require.NoError(t, db.Get(&run, `INSERT INTO pipeline_runs (state,pipeline_spec_id,created_at) VALUES ($1, 0, NOW()) RETURNING *`, pipeline.RunStatusRunning))
 	return run
 }
 
-func MustInsertUnfinishedPipelineTaskRun(t *testing.T, store *strpkg.Store, pipelineRunID int64) pipeline.TaskRun {
+func MustInsertUnfinishedPipelineTaskRun(t *testing.T, db *sqlx.DB, pipelineRunID int64) (tr pipeline.TaskRun) {
 	/* #nosec G404 */
-	p := pipeline.TaskRun{DotID: strconv.Itoa(mathrand.Int()), PipelineRunID: pipelineRunID}
-	require.NoError(t, store.DB.Create(&p).Error)
-	return p
-}
-
-func MustInsertSampleDirectRequestJob(t *testing.T, db *gorm.DB) job.Job {
-	t.Helper()
-
-	pspec := pipeline.Spec{DotDagSource: `
-    // data source 1
-    ds1          [type=bridge name=voter_turnout];
-    ds1_parse    [type=jsonparse path="one,two"];
-    ds1_multiply [type=multiply times=1.23];
-`}
-
-	require.NoError(t, db.Create(&pspec).Error)
-
-	drspec := job.DirectRequestSpec{}
-	require.NoError(t, db.Create(&drspec).Error)
-
-	job := job.Job{Type: "directrequest", SchemaVersion: 1, DirectRequestSpecID: &drspec.ID, PipelineSpecID: pspec.ID}
-	require.NoError(t, db.Create(&job).Error)
-
-	return job
+	require.NoError(t, db.Get(&tr, `INSERT INTO pipeline_task_runs (dot_id, pipeline_run_id, id, type, created_at) VALUES ($1,$2,$3, '', NOW()) RETURNING *`, strconv.Itoa(mathrand.Int()), pipelineRunID, uuid.NewV4()))
+	return tr
 }
 
 func RandomLog(t *testing.T) types.Log {
@@ -883,30 +620,68 @@ func RandomLog(t *testing.T) types.Log {
 
 	topics := make([]common.Hash, 4)
 	for i := range topics {
-		topics[i] = NewHash()
+		topics[i] = utils.NewHash()
 	}
 
 	return types.Log{
-		Address:     NewAddress(),
-		BlockHash:   NewHash(),
+		Address:     testutils.NewAddress(),
+		BlockHash:   utils.NewHash(),
 		BlockNumber: uint64(mathrand.Intn(9999999)),
 		Index:       uint(mathrand.Intn(9999999)),
 		Data:        MustRandomBytes(t, 512),
-		Topics:      []common.Hash{NewHash(), NewHash(), NewHash(), NewHash()},
+		Topics:      []common.Hash{utils.NewHash(), utils.NewHash(), utils.NewHash(), utils.NewHash()},
 	}
 }
 
 func RawNewRoundLog(t *testing.T, contractAddr common.Address, blockHash common.Hash, blockNumber uint64, logIndex uint, removed bool) types.Log {
 	t.Helper()
-
 	topic := (flux_aggregator_wrapper.FluxAggregatorNewRound{}).Topic()
+	topics := []common.Hash{topic, utils.NewHash(), utils.NewHash()}
+	return RawNewRoundLogWithTopics(t, contractAddr, blockHash, blockNumber, logIndex, removed, topics)
+}
+
+func RawNewRoundLogWithTopics(t *testing.T, contractAddr common.Address, blockHash common.Hash, blockNumber uint64, logIndex uint, removed bool, topics []common.Hash) types.Log {
+	t.Helper()
 	return types.Log{
 		Address:     contractAddr,
 		BlockHash:   blockHash,
 		BlockNumber: blockNumber,
 		Index:       logIndex,
-		Topics:      []common.Hash{topic, NewHash(), NewHash()},
+		Topics:      topics,
 		Data:        []byte("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
 		Removed:     removed,
 	}
+}
+
+func MustInsertExternalInitiator(t *testing.T, orm bridges.ORM) (ei bridges.ExternalInitiator) {
+	return MustInsertExternalInitiatorWithOpts(t, orm, ExternalInitiatorOpts{})
+}
+
+type ExternalInitiatorOpts struct {
+	NamePrefix     string
+	URL            *models.WebURL
+	OutgoingSecret string
+	OutgoingToken  string
+}
+
+func MustInsertExternalInitiatorWithOpts(t *testing.T, orm bridges.ORM, opts ExternalInitiatorOpts) (ei bridges.ExternalInitiator) {
+	var prefix string
+	if opts.NamePrefix != "" {
+		prefix = opts.NamePrefix
+	} else {
+		prefix = "ei"
+	}
+	ei.Name = fmt.Sprintf("%s-%s", prefix, uuid.NewV4())
+	ei.URL = opts.URL
+	ei.OutgoingSecret = opts.OutgoingSecret
+	ei.OutgoingToken = opts.OutgoingToken
+	token := auth.NewToken()
+	ei.AccessKey = token.AccessKey
+	ei.Salt = utils.NewSecret(utils.DefaultSecretSize)
+	hashedSecret, err := auth.HashedSecret(token, ei.Salt)
+	require.NoError(t, err)
+	ei.HashedSecret = hashedSecret
+	err = orm.CreateExternalInitiator(&ei)
+	require.NoError(t, err)
+	return ei
 }

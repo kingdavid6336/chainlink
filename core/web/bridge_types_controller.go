@@ -1,19 +1,55 @@
 package web
 
 import (
+	"database/sql"
 	"fmt"
 	"net/http"
+	"strings"
 
 	"github.com/jackc/pgconn"
 
-	"github.com/smartcontractkit/chainlink/core/services"
+	"github.com/smartcontractkit/chainlink/core/assets"
+	"github.com/smartcontractkit/chainlink/core/bridges"
 	"github.com/smartcontractkit/chainlink/core/services/chainlink"
 	"github.com/smartcontractkit/chainlink/core/store/models"
-	"github.com/smartcontractkit/chainlink/core/store/orm"
+	"github.com/smartcontractkit/chainlink/core/web/presenters"
 
 	"github.com/gin-gonic/gin"
 	"github.com/pkg/errors"
 )
+
+// ValidateBridgeTypeNotExist checks that a bridge has not already been created
+func ValidateBridgeTypeNotExist(bt *bridges.BridgeTypeRequest, orm bridges.ORM) error {
+	fe := models.NewJSONAPIErrors()
+	_, err := orm.FindBridge(bt.Name)
+	if err == nil {
+		fe.Add(fmt.Sprintf("Bridge Type %v already exists", bt.Name))
+	}
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		fe.Add(fmt.Sprintf("Error determining if bridge type %v already exists", bt.Name))
+	}
+	return fe.CoerceEmptyToNil()
+}
+
+// ValidateBridgeType checks that the bridge type has the required field with valid values.
+func ValidateBridgeType(bt *bridges.BridgeTypeRequest) error {
+	fe := models.NewJSONAPIErrors()
+	if len(bt.Name.String()) < 1 {
+		fe.Add("No name specified")
+	}
+	if _, err := bridges.ParseBridgeName(bt.Name.String()); err != nil {
+		fe.Merge(err)
+	}
+	u := bt.URL.String()
+	if len(strings.TrimSpace(u)) == 0 {
+		fe.Add("URL must be present")
+	}
+	if bt.MinimumContractPayment != nil &&
+		bt.MinimumContractPayment.Cmp(assets.NewLinkFromJuels(0)) < 0 {
+		fe.Add("MinimumContractPayment must be positive")
+	}
+	return fe.CoerceEmptyToNil()
+}
 
 // BridgeTypesController manages BridgeType requests in the node.
 type BridgeTypesController struct {
@@ -22,26 +58,27 @@ type BridgeTypesController struct {
 
 // Create adds the BridgeType to the given context.
 func (btc *BridgeTypesController) Create(c *gin.Context) {
-	btr := &models.BridgeTypeRequest{}
+	btr := &bridges.BridgeTypeRequest{}
 
 	if err := c.ShouldBindJSON(btr); err != nil {
 		jsonAPIError(c, http.StatusUnprocessableEntity, err)
 		return
 	}
-	bta, bt, err := models.NewBridgeType(btr)
+	bta, bt, err := bridges.NewBridgeType(btr)
 	if err != nil {
-		jsonAPIError(c, StatusCodeForError(err), err)
+		jsonAPIError(c, http.StatusInternalServerError, err)
 		return
 	}
-	if e := services.ValidateBridgeType(btr, btc.App.GetStore()); e != nil {
+	if e := ValidateBridgeType(btr); e != nil {
 		jsonAPIError(c, http.StatusBadRequest, e)
 		return
 	}
-	if e := services.ValidateBridgeTypeNotExist(btr, btc.App.GetStore()); e != nil {
+	orm := btc.App.BridgeORM()
+	if e := ValidateBridgeTypeNotExist(btr, orm); e != nil {
 		jsonAPIError(c, http.StatusBadRequest, e)
 		return
 	}
-	if e := btc.App.GetStore().CreateBridgeType(bt); e != nil {
+	if e := orm.CreateBridgeType(bt); e != nil {
 		jsonAPIError(c, http.StatusInternalServerError, e)
 		return
 	}
@@ -56,28 +93,37 @@ func (btc *BridgeTypesController) Create(c *gin.Context) {
 		jsonAPIError(c, http.StatusConflict, apiErr)
 		return
 	default:
-		jsonAPIResponse(c, bta, "bridge")
+		resource := presenters.NewBridgeResource(*bt)
+		resource.IncomingToken = bta.IncomingToken
+
+		jsonAPIResponse(c, resource, "bridge")
 	}
 }
 
 // Index lists Bridges, one page at a time.
 func (btc *BridgeTypesController) Index(c *gin.Context, size, page, offset int) {
-	bridges, count, err := btc.App.GetStore().BridgeTypes(offset, size)
-	paginatedResponse(c, "Bridges", size, page, bridges, count, err)
+	bridges, count, err := btc.App.BridgeORM().BridgeTypes(offset, size)
+
+	var resources []presenters.BridgeResource
+	for _, bridge := range bridges {
+		resources = append(resources, *presenters.NewBridgeResource(bridge))
+	}
+
+	paginatedResponse(c, "Bridges", size, page, resources, count, err)
 }
 
 // Show returns the details of a specific Bridge.
 func (btc *BridgeTypesController) Show(c *gin.Context) {
 	name := c.Param("BridgeName")
 
-	taskType, err := models.NewTaskType(name)
+	taskType, err := bridges.ParseBridgeName(name)
 	if err != nil {
 		jsonAPIError(c, http.StatusUnprocessableEntity, err)
 		return
 	}
 
-	bt, err := btc.App.GetStore().FindBridge(taskType)
-	if errors.Cause(err) == orm.ErrorNotFound {
+	bt, err := btc.App.BridgeORM().FindBridge(taskType)
+	if errors.Is(err, sql.ErrNoRows) {
 		jsonAPIError(c, http.StatusNotFound, errors.New("bridge not found"))
 		return
 	}
@@ -86,22 +132,23 @@ func (btc *BridgeTypesController) Show(c *gin.Context) {
 		return
 	}
 
-	jsonAPIResponse(c, bt, "bridge")
+	jsonAPIResponse(c, presenters.NewBridgeResource(bt), "bridge")
 }
 
 // Update can change the restricted attributes for a bridge
 func (btc *BridgeTypesController) Update(c *gin.Context) {
 	name := c.Param("BridgeName")
-	btr := &models.BridgeTypeRequest{}
+	btr := &bridges.BridgeTypeRequest{}
 
-	taskType, err := models.NewTaskType(name)
+	taskType, err := bridges.ParseBridgeName(name)
 	if err != nil {
 		jsonAPIError(c, http.StatusUnprocessableEntity, err)
 		return
 	}
 
-	bt, err := btc.App.GetStore().FindBridge(taskType)
-	if errors.Cause(err) == orm.ErrorNotFound {
+	orm := btc.App.BridgeORM()
+	bt, err := orm.FindBridge(taskType)
+	if errors.Is(err, sql.ErrNoRows) {
 		jsonAPIError(c, http.StatusNotFound, errors.New("bridge not found"))
 		return
 	}
@@ -114,30 +161,31 @@ func (btc *BridgeTypesController) Update(c *gin.Context) {
 		jsonAPIError(c, http.StatusUnprocessableEntity, err)
 		return
 	}
-	if err := services.ValidateBridgeType(btr, btc.App.GetStore()); err != nil {
+	if err := ValidateBridgeType(btr); err != nil {
 		jsonAPIError(c, http.StatusBadRequest, err)
 		return
 	}
-	if err := btc.App.GetStore().UpdateBridgeType(&bt, btr); err != nil {
+	if err := orm.UpdateBridgeType(&bt, btr); err != nil {
 		jsonAPIError(c, http.StatusInternalServerError, err)
 		return
 	}
 
-	jsonAPIResponse(c, bt, "bridge")
+	jsonAPIResponse(c, presenters.NewBridgeResource(bt), "bridge")
 }
 
 // Destroy removes a specific Bridge.
 func (btc *BridgeTypesController) Destroy(c *gin.Context) {
 	name := c.Param("BridgeName")
 
-	taskType, err := models.NewTaskType(name)
+	taskType, err := bridges.ParseBridgeName(name)
 	if err != nil {
 		jsonAPIError(c, http.StatusUnprocessableEntity, err)
 		return
 	}
 
-	bt, err := btc.App.GetStore().FindBridge(taskType)
-	if errors.Cause(err) == orm.ErrorNotFound {
+	orm := btc.App.BridgeORM()
+	bt, err := orm.FindBridge(taskType)
+	if errors.Is(err, sql.ErrNoRows) {
 		jsonAPIError(c, http.StatusNotFound, errors.New("bridge not found"))
 		return
 	}
@@ -145,28 +193,19 @@ func (btc *BridgeTypesController) Destroy(c *gin.Context) {
 		jsonAPIError(c, http.StatusInternalServerError, fmt.Errorf("error searching for bridge: %+v", err))
 		return
 	}
-	jobsUsingBridge, err := btc.App.GetStore().FindJobIDsWithBridge(name)
+	jobsUsingBridge, err := btc.App.JobORM().FindJobIDsWithBridge(name)
 	if err != nil {
-		jsonAPIError(c, http.StatusInternalServerError, fmt.Errorf("error searching for associated jobs: %+v", err))
+		jsonAPIError(c, http.StatusInternalServerError, fmt.Errorf("error searching for associated v2 jobs: %+v", err))
 		return
 	}
 	if len(jobsUsingBridge) > 0 {
 		jsonAPIError(c, http.StatusConflict, fmt.Errorf("can't remove the bridge because jobs %v are associated with it", jobsUsingBridge))
 		return
 	}
-	v2jobsUsingBridge, err := btc.App.GetJobORM().FindJobIDsWithBridge(name)
-	if err != nil {
-		jsonAPIError(c, http.StatusInternalServerError, fmt.Errorf("error searching for associated v2 jobs: %+v", err))
-		return
-	}
-	if len(v2jobsUsingBridge) > 0 {
-		jsonAPIError(c, http.StatusConflict, fmt.Errorf("can't remove the bridge because jobs %v are associated with it", v2jobsUsingBridge))
-		return
-	}
-	if err = btc.App.GetStore().DeleteBridgeType(&bt); err != nil {
-		jsonAPIError(c, StatusCodeForError(err), fmt.Errorf("failed to delete bridge: %+v", err))
+	if err = orm.DeleteBridgeType(&bt); err != nil {
+		jsonAPIError(c, http.StatusInternalServerError, fmt.Errorf("failed to delete bridge: %+v", err))
 		return
 	}
 
-	jsonAPIResponse(c, bt, "bridge")
+	jsonAPIResponse(c, presenters.NewBridgeResource(bt), "bridge")
 }

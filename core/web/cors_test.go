@@ -4,28 +4,16 @@ import (
 	"net/http"
 	"testing"
 
-	"github.com/smartcontractkit/chainlink/core/services/eth"
-
 	"github.com/smartcontractkit/chainlink/core/internal/cltest"
-
-	"github.com/stretchr/testify/require"
+	"gopkg.in/guregu/null.v4"
 )
 
 func TestCors_DefaultOrigins(t *testing.T) {
 	t.Parallel()
 
-	config, _ := cltest.NewConfig(t)
-	config.Set("ALLOW_ORIGINS", "http://localhost:3000,http://localhost:6689")
-	rpcClient, gethClient, _, assertMocksCalled := cltest.NewEthMocksWithStartupAssertions(t)
-	defer assertMocksCalled()
-	app, cleanup := cltest.NewApplicationWithConfigAndKey(t,
-		config,
-		eth.NewClientWith(rpcClient, gethClient),
-	)
-	defer cleanup()
-	require.NoError(t, app.Start())
-
-	client := app.NewHTTPClient()
+	config := cltest.NewTestGeneralConfig(t)
+	config.Overrides.AllowOrigins = null.StringFrom("http://localhost:3000,http://localhost:6689")
+	config.Overrides.EVMRPCEnabled = null.BoolFrom(false)
 
 	tests := []struct {
 		origin     string
@@ -38,6 +26,10 @@ func TestCors_DefaultOrigins(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.origin, func(t *testing.T) {
+			app := cltest.NewApplicationWithConfig(t, config)
+
+			client := app.NewHTTPClient()
+
 			headers := map[string]string{"Origin": test.origin}
 			resp, cleanup := client.Get("/v2/config", headers)
 			defer cleanup()
@@ -62,17 +54,10 @@ func TestCors_OverrideOrigins(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.origin, func(t *testing.T) {
-			config, _ := cltest.NewConfig(t)
-			config.Set("ALLOW_ORIGINS", test.allow)
-
-			rpcClient, gethClient, _, assertMocksCalled := cltest.NewEthMocksWithStartupAssertions(t)
-			defer assertMocksCalled()
-			app, cleanup := cltest.NewApplicationWithConfigAndKey(t,
-				config,
-				eth.NewClientWith(rpcClient, gethClient),
-			)
-			defer cleanup()
-			require.NoError(t, app.Start())
+			config := cltest.NewTestGeneralConfig(t)
+			config.Overrides.AllowOrigins = null.StringFrom(test.allow)
+			config.Overrides.EVMRPCEnabled = null.BoolFrom(false)
+			app := cltest.NewApplicationWithConfig(t, config)
 
 			client := app.NewHTTPClient()
 

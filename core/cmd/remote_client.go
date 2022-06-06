@@ -4,26 +4,32 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"math/big"
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/manyminds/api2go/jsonapi"
-	homedir "github.com/mitchellh/go-homedir"
+	"github.com/mitchellh/go-homedir"
 	"github.com/pelletier/go-toml"
 	"github.com/pkg/errors"
 	"github.com/tidwall/gjson"
 	clipkg "github.com/urfave/cli"
 	"go.uber.org/multierr"
 
-	"github.com/smartcontractkit/chainlink/core/assets"
-	"github.com/smartcontractkit/chainlink/core/services/pipeline"
+	"github.com/smartcontractkit/chainlink/core/bridges"
+	"github.com/smartcontractkit/chainlink/core/config"
+	"github.com/smartcontractkit/chainlink/core/logger"
+	"github.com/smartcontractkit/chainlink/core/sessions"
+	"github.com/smartcontractkit/chainlink/core/static"
 	"github.com/smartcontractkit/chainlink/core/store/models"
-	"github.com/smartcontractkit/chainlink/core/store/presenters"
 	"github.com/smartcontractkit/chainlink/core/utils"
 	"github.com/smartcontractkit/chainlink/core/web"
 	webpresenters "github.com/smartcontractkit/chainlink/core/web/presenters"
@@ -31,39 +37,13 @@ import (
 
 var errUnauthorized = errors.New(http.StatusText(http.StatusUnauthorized))
 
-// CreateServiceAgreement creates a ServiceAgreement based on JSON input
-func (cli *Client) CreateServiceAgreement(c *clipkg.Context) (err error) {
-	if !c.Args().Present() {
-		return cli.errorOut(errors.New("Must pass in JSON or filepath"))
-	}
-
-	buf, err := getBufferFromJSON(c.Args().First())
-	if err != nil {
-		return cli.errorOut(errors.Wrap(err, "while extracting json to buffer"))
-	}
-
-	resp, err := cli.HTTP.Post("/v2/service_agreements", buf)
-	if err != nil {
-		return cli.errorOut(errors.Wrap(err, "from initializing service-agreement-creation request"))
-	}
-	defer func() {
-		if cerr := resp.Body.Close(); cerr != nil {
-			err = multierr.Append(err, cerr)
-		}
-	}()
-
-	var sa presenters.ServiceAgreement
-	err = cli.renderAPIResponse(resp, &sa)
-	return err
-}
-
 // CreateExternalInitiator adds an external initiator
 func (cli *Client) CreateExternalInitiator(c *clipkg.Context) (err error) {
 	if c.NArg() != 1 && c.NArg() != 2 {
 		return cli.errorOut(errors.New("create expects 1 - 2 arguments: a name and a url (optional)"))
 	}
 
-	var request models.ExternalInitiatorRequest
+	var request bridges.ExternalInitiatorRequest
 	request.Name = c.Args().Get(0)
 
 	// process optional URL
@@ -92,7 +72,7 @@ func (cli *Client) CreateExternalInitiator(c *clipkg.Context) (err error) {
 		}
 	}()
 
-	var ei presenters.ExternalInitiatorAuthentication
+	var ei webpresenters.ExternalInitiatorAuthentication
 	err = cli.renderAPIResponse(resp, &ei)
 	return err
 }
@@ -114,249 +94,6 @@ func (cli *Client) DeleteExternalInitiator(c *clipkg.Context) (err error) {
 	}()
 	_, err = cli.parseResponse(resp)
 	return err
-}
-
-// ShowJobRun returns the status of the given Jobrun.
-func (cli *Client) ShowJobRun(c *clipkg.Context) (err error) {
-	if !c.Args().Present() {
-		return cli.errorOut(errors.New("Must pass the RunID to show"))
-	}
-	resp, err := cli.HTTP.Get("/v2/runs/" + c.Args().First())
-	if err != nil {
-		return cli.errorOut(err)
-	}
-	defer func() {
-		if cerr := resp.Body.Close(); cerr != nil {
-			err = multierr.Append(err, cerr)
-		}
-	}()
-	var job presenters.JobRun
-	err = cli.renderAPIResponse(resp, &job)
-	return err
-}
-
-// IndexJobRuns returns the list of all job runs for a specific job
-// if no jobid is passed, defaults to returning all jobruns
-func (cli *Client) IndexJobRuns(c *clipkg.Context) error {
-	jobID := c.String("jobid")
-	if jobID != "" {
-		return cli.getPage("/v2/runs?jobSpecId="+jobID, c.Int("page"), &[]presenters.JobRun{})
-	}
-	return cli.getPage("/v2/runs", c.Int("page"), &[]presenters.JobRun{})
-}
-
-// ShowJobSpec returns the status of the given JobID.
-func (cli *Client) ShowJobSpec(c *clipkg.Context) (err error) {
-	if !c.Args().Present() {
-		return cli.errorOut(errors.New("Must pass the job id to be shown"))
-	}
-	resp, err := cli.HTTP.Get("/v2/specs/" + c.Args().First())
-	if err != nil {
-		return cli.errorOut(err)
-	}
-	defer func() {
-		if cerr := resp.Body.Close(); cerr != nil {
-			err = multierr.Append(err, cerr)
-		}
-	}()
-	var job presenters.JobSpec
-	err = cli.renderAPIResponse(resp, &job)
-	return err
-}
-
-// IndexJobSpecs returns all job specs.
-func (cli *Client) IndexJobSpecs(c *clipkg.Context) error {
-	return cli.getPage("/v2/specs", c.Int("page"), &[]models.JobSpec{})
-}
-
-// CreateJobSpec creates a JobSpec based on JSON input
-func (cli *Client) CreateJobSpec(c *clipkg.Context) (err error) {
-	if !c.Args().Present() {
-		return cli.errorOut(errors.New("Must pass in JSON or filepath"))
-	}
-
-	buf, err := getBufferFromJSON(c.Args().First())
-	if err != nil {
-		return cli.errorOut(err)
-	}
-
-	resp, err := cli.HTTP.Post("/v2/specs", buf)
-	if err != nil {
-		return cli.errorOut(err)
-	}
-	defer func() {
-		if cerr := resp.Body.Close(); cerr != nil {
-			err = multierr.Append(err, cerr)
-		}
-	}()
-
-	var js presenters.JobSpec
-	err = cli.renderAPIResponse(resp, &js)
-	return err
-}
-
-// ArchiveJobSpec soft deletes a job and its associated runs.
-func (cli *Client) ArchiveJobSpec(c *clipkg.Context) error {
-	if !c.Args().Present() {
-		return cli.errorOut(errors.New("Must pass the job id to be archived"))
-	}
-	resp, err := cli.HTTP.Delete("/v2/specs/" + c.Args().First())
-	if err != nil {
-		return cli.errorOut(err)
-	}
-	_, err = cli.parseResponse(resp)
-	if err != nil {
-		return cli.errorOut(err)
-	}
-	return nil
-}
-
-// ListJobsV2 lists all v2 jobs
-func (cli *Client) ListJobsV2(c *clipkg.Context) (err error) {
-	return cli.getPage("/v2/jobs", c.Int("page"), &[]Job{})
-}
-
-// CreateJobV2 creates a V2 job
-// Valid input is a TOML string or a path to TOML file
-func (cli *Client) CreateJobV2(c *clipkg.Context) (err error) {
-	if !c.Args().Present() {
-		return cli.errorOut(errors.New("Must pass in TOML or filepath"))
-	}
-
-	tomlString, err := getTOMLString(c.Args().First())
-	if err != nil {
-		return cli.errorOut(err)
-	}
-
-	request, err := json.Marshal(models.CreateJobSpecRequest{
-		TOML: tomlString,
-	})
-	if err != nil {
-		return cli.errorOut(err)
-	}
-
-	resp, err := cli.HTTP.Post("/v2/jobs", bytes.NewReader(request))
-	if err != nil {
-		return cli.errorOut(err)
-	}
-	defer func() {
-		if cerr := resp.Body.Close(); cerr != nil {
-			err = multierr.Append(err, cerr)
-		}
-	}()
-
-	if resp.StatusCode >= 400 {
-		body, rerr := ioutil.ReadAll(resp.Body)
-		if err != nil {
-			err = multierr.Append(err, rerr)
-			return cli.errorOut(err)
-		}
-		fmt.Printf("Error : %v\n", string(body))
-		return cli.errorOut(err)
-	}
-
-	var js Job
-	err = cli.renderAPIResponse(resp, &js, "Job created")
-	return err
-}
-
-// DeleteJobV2 deletes a V2 job
-func (cli *Client) DeleteJobV2(c *clipkg.Context) error {
-	if !c.Args().Present() {
-		return cli.errorOut(errors.New("Must pass the job id to be archived"))
-	}
-	resp, err := cli.HTTP.Delete("/v2/jobs/" + c.Args().First())
-	if err != nil {
-		return cli.errorOut(err)
-	}
-	_, err = cli.parseResponse(resp)
-	if err != nil {
-		return cli.errorOut(err)
-	}
-
-	fmt.Printf("Job %v Deleted\n", c.Args().First())
-	return nil
-}
-
-// TriggerPipelineRun triggers a V2 job run based on a job ID
-func (cli *Client) TriggerPipelineRun(c *clipkg.Context) error {
-	if !c.Args().Present() {
-		return cli.errorOut(errors.New("Must pass the job id to trigger a run"))
-	}
-	resp, err := cli.HTTP.Post("/v2/jobs/"+c.Args().First()+"/runs", nil)
-	if err != nil {
-		return cli.errorOut(err)
-	}
-	defer func() {
-		if cerr := resp.Body.Close(); cerr != nil {
-			err = multierr.Append(err, cerr)
-		}
-	}()
-
-	var run pipeline.Run
-	err = cli.renderAPIResponse(resp, &run, "Pipeline run successfully triggered")
-	return err
-}
-
-// CreateJobRun creates job run based on SpecID and optional JSON
-func (cli *Client) CreateJobRun(c *clipkg.Context) (err error) {
-	if !c.Args().Present() {
-		return cli.errorOut(errors.New("Must pass in SpecID [JSON blob | JSON filepath]"))
-	}
-
-	buf := bytes.NewBufferString("")
-	if c.NArg() > 1 {
-		var jbuf *bytes.Buffer
-		jbuf, err = getBufferFromJSON(c.Args().Get(1))
-		if err != nil {
-			return cli.errorOut(err)
-		}
-		buf = jbuf
-	}
-
-	resp, err := cli.HTTP.Post("/v2/specs/"+c.Args().First()+"/runs", buf)
-	if err != nil {
-		return cli.errorOut(err)
-	}
-	defer func() {
-		if cerr := resp.Body.Close(); cerr != nil {
-			err = multierr.Append(err, cerr)
-		}
-	}()
-	var run presenters.JobRun
-	err = cli.renderAPIResponse(resp, &run)
-	return err
-}
-
-// CreateBridge adds a new bridge to the chainlink node
-func (cli *Client) CreateBridge(c *clipkg.Context) (err error) {
-	if !c.Args().Present() {
-		return cli.errorOut(errors.New("Must pass in the bridge's parameters [JSON blob | JSON filepath]"))
-	}
-
-	buf, err := getBufferFromJSON(c.Args().First())
-	if err != nil {
-		return cli.errorOut(err)
-	}
-
-	resp, err := cli.HTTP.Post("/v2/bridge_types", buf)
-	if err != nil {
-		return cli.errorOut(err)
-	}
-	defer func() {
-		if cerr := resp.Body.Close(); cerr != nil {
-			err = multierr.Append(err, cerr)
-		}
-	}()
-
-	var bridge models.BridgeTypeAuthentication
-	err = cli.renderAPIResponse(resp, &bridge)
-	return err
-}
-
-// IndexBridges returns all bridges.
-func (cli *Client) IndexBridges(c *clipkg.Context) (err error) {
-	return cli.getPage("/v2/bridge_types", c.Int("page"), &[]models.BridgeType{})
 }
 
 func (cli *Client) getPage(requestURI string, page int, model interface{}) (err error) {
@@ -388,109 +125,61 @@ func (cli *Client) getPage(requestURI string, page int, model interface{}) (err 
 	return err
 }
 
-// ShowBridge returns the info for the given Bridge name.
-func (cli *Client) ShowBridge(c *clipkg.Context) (err error) {
-	if !c.Args().Present() {
-		return cli.errorOut(errors.New("Must pass the name of the bridge to be shown"))
+// ReplayFromBlock replays chain data from the given block number until the most recent
+func (cli *Client) ReplayFromBlock(c *clipkg.Context) (err error) {
+	blockNumber := c.Int64("block-number")
+	if blockNumber <= 0 {
+		return cli.errorOut(errors.New("Must pass a positive value in '--block-number' parameter"))
 	}
-	bridgeName := c.Args().First()
-	resp, err := cli.HTTP.Get("/v2/bridge_types/" + bridgeName)
-	if err != nil {
-		return cli.errorOut(err)
-	}
-	defer func() {
-		if cerr := resp.Body.Close(); cerr != nil {
-			err = multierr.Append(err, cerr)
-		}
-	}()
-	var bridge models.BridgeType
-	return cli.renderAPIResponse(resp, &bridge)
-}
 
-// RemoveBridge removes a specific Bridge by name.
-func (cli *Client) RemoveBridge(c *clipkg.Context) (err error) {
-	if !c.Args().Present() {
-		return cli.errorOut(errors.New("Must pass the name of the bridge to be removed"))
-	}
-	bridgeName := c.Args().First()
-	resp, err := cli.HTTP.Delete("/v2/bridge_types/" + bridgeName)
+	forceBroadcast := c.Bool("force")
+
+	buf := bytes.NewBufferString("{}")
+	resp, err := cli.HTTP.Post(
+		fmt.Sprintf(
+			"/v2/replay_from_block/%v?force=%s",
+			blockNumber,
+			strconv.FormatBool(forceBroadcast),
+		), buf)
 	if err != nil {
 		return cli.errorOut(err)
 	}
+
 	defer func() {
 		if cerr := resp.Body.Close(); cerr != nil {
 			err = multierr.Append(err, cerr)
 		}
 	}()
-	var bridge models.BridgeType
-	err = cli.renderAPIResponse(resp, &bridge)
+
+	if resp.StatusCode != http.StatusOK {
+		bytes, err2 := cli.parseResponse(resp)
+		if err2 != nil {
+			return errors.Wrap(err2, "parseResponse error")
+		}
+		return cli.errorOut(errors.New(string(bytes)))
+	}
+
+	err = cli.printResponseBody(resp)
 	return err
 }
 
 // RemoteLogin creates a cookie session to run remote commands.
 func (cli *Client) RemoteLogin(c *clipkg.Context) error {
+	lggr := cli.Logger.Named("RemoteLogin")
 	sessionRequest, err := cli.buildSessionRequest(c.String("file"))
 	if err != nil {
 		return cli.errorOut(err)
 	}
 	_, err = cli.CookieAuthenticator.Authenticate(sessionRequest)
-	return cli.errorOut(err)
-}
-
-// SendEther transfers ETH from the node's account to a specified address.
-func (cli *Client) SendEther(c *clipkg.Context) (err error) {
-	if c.NArg() < 3 {
-		return cli.errorOut(errors.New("sendether expects three arguments: amount, fromAddress and toAddress"))
-	}
-
-	amount, err := assets.NewEthValueS(c.Args().Get(0))
-	if err != nil {
-		return cli.errorOut(multierr.Combine(
-			errors.New("while parsing ETH transfer amount"), err))
-	}
-
-	unparsedFromAddress := c.Args().Get(1)
-	fromAddress, err := utils.ParseEthereumAddress(unparsedFromAddress)
-	if err != nil {
-		return cli.errorOut(multierr.Combine(
-			fmt.Errorf("while parsing withdrawal source address %v",
-				unparsedFromAddress), err))
-	}
-
-	unparsedDestinationAddress := c.Args().Get(2)
-	destinationAddress, err := utils.ParseEthereumAddress(unparsedDestinationAddress)
-	if err != nil {
-		return cli.errorOut(multierr.Combine(
-			fmt.Errorf("while parsing withdrawal destination address %v",
-				unparsedDestinationAddress), err))
-	}
-
-	request := models.SendEtherRequest{
-		DestinationAddress: destinationAddress,
-		FromAddress:        fromAddress,
-		Amount:             amount,
-	}
-
-	requestData, err := json.Marshal(request)
 	if err != nil {
 		return cli.errorOut(err)
 	}
-
-	buf := bytes.NewBuffer(requestData)
-
-	resp, err := cli.HTTP.Post("/v2/transfers", buf)
+	err = cli.checkRemoteBuildCompatibility(lggr, c.Bool("bypass-version-check"), static.Version, static.Sha)
 	if err != nil {
 		return cli.errorOut(err)
 	}
-	defer func() {
-		if cerr := resp.Body.Close(); cerr != nil {
-			err = multierr.Append(err, cerr)
-		}
-	}()
-
-	var tx webpresenters.EthTxResource
-	err = cli.renderAPIResponse(resp, &tx)
-	return err
+	fmt.Println("Successfully Logged In.")
+	return nil
 }
 
 // ChangePassword prompts the user for the old password and a new one, then
@@ -517,49 +206,85 @@ func (cli *Client) ChangePassword(c *clipkg.Context) (err error) {
 		}
 	}()
 
-	if resp.StatusCode == http.StatusOK {
+	switch resp.StatusCode {
+	case http.StatusOK:
 		fmt.Println("Password updated.")
-	} else if resp.StatusCode == http.StatusConflict {
+	case http.StatusConflict:
 		fmt.Println("Old password did not match.")
-	} else {
+	default:
 		return cli.printResponseBody(resp)
 	}
 	return nil
 }
 
-// IndexTransactions returns the list of transactions in descending order,
-// taking an optional page parameter
-func (cli *Client) IndexTransactions(c *clipkg.Context) error {
-	return cli.getPage("/v2/transactions", c.Int("page"), &[]webpresenters.EthTxResource{})
-}
-
-// ShowTransaction returns the info for the given transaction hash
-func (cli *Client) ShowTransaction(c *clipkg.Context) (err error) {
-	if !c.Args().Present() {
-		return cli.errorOut(errors.New("Must pass the hash of the transaction"))
+// Profile will collect pprof metrics and store them in a folder.
+func (cli *Client) Profile(c *clipkg.Context) error {
+	seconds := c.Uint("seconds")
+	baseDir := c.String("output_dir")
+	if seconds >= uint(cli.Config.HTTPServerWriteTimeout().Seconds()) {
+		return cli.errorOut(errors.New("profile duration should be less than server write timeout."))
 	}
-	hash := c.Args().First()
-	resp, err := cli.HTTP.Get("/v2/transactions/" + hash)
+
+	genDir := filepath.Join(baseDir, fmt.Sprintf("debuginfo-%s", time.Now().Format(time.RFC3339)))
+
+	err := os.Mkdir(genDir, 0755)
 	if err != nil {
 		return cli.errorOut(err)
 	}
-	defer func() {
-		if cerr := resp.Body.Close(); cerr != nil {
-			err = multierr.Append(err, cerr)
-		}
-	}()
-	var tx webpresenters.EthTxResource
-	err = cli.renderAPIResponse(resp, &tx)
-	return err
+	cli.Logger.Infof("writing pprof to %s", genDir)
+	var wgPprof sync.WaitGroup
+	vitals := []string{
+		"allocs",       // A sampling of all past memory allocations
+		"block",        // Stack traces that led to blocking on synchronization primitives
+		"cmdline",      // The command line invocation of the current program
+		"goroutine",    // Stack traces of all current goroutines
+		"heap",         // A sampling of memory allocations of live objects.
+		"mutex",        // Stack traces of holders of contended mutexes
+		"profile",      // CPU profile.
+		"threadcreate", // Stack traces that led to the creation of new OS threads
+		"trace",        // A trace of execution of the current program.
+	}
+	wgPprof.Add(len(vitals))
+	errs := make(chan error)
+	for _, vt := range vitals {
+		go func(vt string) {
+			defer wgPprof.Done()
+			uri := fmt.Sprintf("/v2/debug/pprof/%s?seconds=%d", vt, seconds)
+			cli.Logger.Infof("Collecting %s ", uri)
+			resp, err := cli.HTTP.Get(uri)
+			if err != nil {
+				cli.Logger.Errorf("error collecting vt %s: %s", vt, err.Error())
+				errs <- err
+				return
+			}
+			defer resp.Body.Close()
+
+			// write to file
+			f, err := os.Create(filepath.Join(genDir, vt))
+			if err != nil {
+				cli.Logger.Errorf("error creating file for %s: %s", vt, err.Error())
+				errs <- err
+				return
+			}
+			defer f.Close()
+
+			_, err = io.Copy(f, resp.Body)
+			if err != nil {
+				cli.Logger.Errorf("error writing to file for %s: %s", vt, err.Error())
+				errs <- err
+				return
+			}
+			cli.Logger.Infof("Collected %s", vt)
+		}(vt)
+	}
+	wgPprof.Wait()
+	if len(errs) > 0 {
+		return cli.errorOut(errors.New("One or more profile collections failed %s"))
+	}
+	return nil
 }
 
-// IndexTxAttempts returns the list of transactions in descending order,
-// taking an optional page parameter
-func (cli *Client) IndexTxAttempts(c *clipkg.Context) error {
-	return cli.getPage("/v2/tx_attempts", c.Int("page"), &[]webpresenters.EthTxResource{})
-}
-
-func (cli *Client) buildSessionRequest(flag string) (models.SessionRequest, error) {
+func (cli *Client) buildSessionRequest(flag string) (sessions.SessionRequest, error) {
 	if len(flag) > 0 {
 		return cli.FileSessionRequestBuilder.Build(flag)
 	}
@@ -584,8 +309,8 @@ func getTOMLString(s string) (string, error) {
 
 func (cli *Client) parseResponse(resp *http.Response) ([]byte, error) {
 	b, err := parseResponse(resp)
-	if err == errUnauthorized {
-		return nil, cli.errorOut(multierr.Append(err, fmt.Errorf("you must first login through the CLI")))
+	if errors.Is(err, errUnauthorized) {
+		return nil, cli.errorOut(multierr.Append(err, fmt.Errorf("your credentials may be missing, invalid or you may need to login first using the CLI via 'chainlink admin login'")))
 	}
 	if err != nil {
 		jae := models.JSONAPIErrors{}
@@ -614,26 +339,38 @@ func (cli *Client) renderAPIResponse(resp *http.Response, dst interface{}, heade
 	return cli.errorOut(cli.Render(dst, headers...))
 }
 
-// SetMinimumGasPrice specifies the minimum gas price to use for outgoing transactions
-func (cli *Client) SetMinimumGasPrice(c *clipkg.Context) (err error) {
+// SetEvmGasPriceDefault specifies the minimum gas price to use for outgoing transactions
+func (cli *Client) SetEvmGasPriceDefault(c *clipkg.Context) (err error) {
+	var adjustedAmount *big.Int
 	if c.NArg() != 1 {
 		return cli.errorOut(errors.New("expecting an amount"))
 	}
-
 	value := c.Args().Get(0)
 	amount, ok := new(big.Float).SetString(value)
 	if !ok {
 		return cli.errorOut(fmt.Errorf("invalid ethereum amount %s", value))
 	}
-
 	if c.IsSet("gwei") {
 		amount.Mul(amount, big.NewFloat(1000000000))
 	}
+	var chainID *big.Int
+	if c.IsSet("evmChainID") {
+		var ok bool
+		chainID, ok = new(big.Int).SetString(c.String("evmChainID"), 10)
+		if !ok {
+			return cli.errorOut(fmt.Errorf("invalid evmChainID %s", value))
+		}
+	}
+	adjustedAmount, _ = amount.Int(nil)
 
-	adjustedAmount, _ := amount.Int(nil)
 	request := struct {
-		EthGasPriceDefault string `json:"ethGasPriceDefault"`
-	}{EthGasPriceDefault: adjustedAmount.String()}
+		EvmGasPriceDefault string     `json:"ethGasPriceDefault"`
+		EvmChainID         *utils.Big `json:"evmChainID"`
+	}{
+		EvmGasPriceDefault: adjustedAmount.String(),
+		EvmChainID:         utils.NewBig(chainID),
+	}
+
 	requestData, err := json.Marshal(request)
 	if err != nil {
 		return cli.errorOut(err)
@@ -670,31 +407,13 @@ func (cli *Client) GetConfiguration(c *clipkg.Context) (err error) {
 			err = multierr.Append(err, cerr)
 		}
 	}()
-	cwl := presenters.ConfigPrinter{}
+	cwl := config.ConfigPrinter{}
 	err = cli.renderAPIResponse(resp, &cwl)
 	return err
 }
 
-// CancelJobRun cancels a running job,
-// Run ID must be passed
-func (cli *Client) CancelJobRun(c *clipkg.Context) error {
-	if !c.Args().Present() {
-		return cli.errorOut(errors.New("Must pass the run id to be cancelled"))
-	}
-
-	response, err := cli.HTTP.Put(fmt.Sprintf("/v2/runs/%s/cancellation", c.Args().First()), nil)
-	if err != nil {
-		return cli.errorOut(errors.Wrap(err, "HTTP.Put"))
-	}
-	_, err = cli.parseResponse(response)
-	if err != nil {
-		return cli.errorOut(errors.Wrap(err, "cli.parseResponse"))
-	}
-	return nil
-}
-
 func normalizePassword(password string) string {
-	return url.PathEscape(strings.TrimSpace(password))
+	return url.QueryEscape(strings.TrimSpace(password))
 }
 
 // SetLogLevel sets the log level on the node
@@ -717,12 +436,12 @@ func (cli *Client) SetLogLevel(c *clipkg.Context) (err error) {
 		}
 	}()
 
-	var lR webpresenters.LogResource
-	err = cli.renderAPIResponse(resp, &lR)
+	var svcLogConfig webpresenters.ServiceLogConfigResource
+	err = cli.renderAPIResponse(resp, &svcLogConfig)
 	return err
 }
 
-// SetLogSQL enables or disables the log sql statemnts
+// SetLogSQL enables or disables the log sql statements
 func (cli *Client) SetLogSQL(c *clipkg.Context) (err error) {
 
 	// Enforces selection of --enable or --disable
@@ -733,9 +452,6 @@ func (cli *Client) SetLogSQL(c *clipkg.Context) (err error) {
 	// Sets logSql to true || false based on the --enabled flag
 	logSql := c.Bool("enable")
 
-	if err != nil {
-		return cli.errorOut(err)
-	}
 	request := web.LogPatchRequest{SqlEnabled: &logSql}
 	requestData, err := json.Marshal(request)
 	if err != nil {
@@ -753,8 +469,8 @@ func (cli *Client) SetLogSQL(c *clipkg.Context) (err error) {
 		}
 	}()
 
-	var lR webpresenters.LogResource
-	err = cli.renderAPIResponse(resp, &lR)
+	var svcLogConfig webpresenters.ServiceLogConfigResource
+	err = cli.renderAPIResponse(resp, &svcLogConfig)
 	return err
 }
 
@@ -807,4 +523,49 @@ func parseResponse(resp *http.Response) ([]byte, error) {
 		return b, errors.New("Error")
 	}
 	return b, err
+}
+
+func (cli *Client) checkRemoteBuildCompatibility(lggr logger.Logger, onlyWarn bool, cliVersion, cliSha string) error {
+	resp, err := cli.HTTP.Get("/v2/build_info")
+	if err != nil {
+		lggr.Warnw("Got error querying for version. Remote node version is unknown and CLI may behave in unexpected ways.", "err", err)
+		return nil
+	}
+	b, err := parseResponse(resp)
+	if err != nil {
+		lggr.Warnw("Got error parsing http response for remote version. Remote node version is unknown and CLI may behave in unexpected ways.", "resp", resp, "err", err)
+		return nil
+	}
+
+	var remoteBuildInfo map[string]string
+	if err := json.Unmarshal(b, &remoteBuildInfo); err != nil {
+		lggr.Warnw("Got error json parsing bytes from remote version response. Remote node version is unknown and CLI may behave in unexpected ways.", "bytes", b, "err", err)
+		return nil
+	}
+	remoteVersion, remoteSha := remoteBuildInfo["version"], remoteBuildInfo["commitSHA"]
+
+	remoteSemverUnset := remoteVersion == "unset" || remoteVersion == "" || remoteSha == "unset" || remoteSha == ""
+	cliRemoteSemverMismatch := remoteVersion != cliVersion || remoteSha != cliSha
+
+	if remoteSemverUnset || cliRemoteSemverMismatch {
+		// Show a warning but allow mismatch
+		if onlyWarn {
+			lggr.Warnf("CLI build (%s@%s) mismatches remote node build (%s@%s), it might behave in unexpected ways", remoteVersion, remoteSha, cliVersion, cliSha)
+			return nil
+		}
+		// Don't allow usage of CLI by unsetting the session cookie to prevent further requests
+		cli.CookieAuthenticator.Logout()
+		return ErrIncompatible{CLIVersion: cliVersion, CLISha: cliSha, RemoteVersion: remoteVersion, RemoteSha: remoteSha}
+	}
+	return nil
+}
+
+// ErrIncompatible is returned when the cli and remote versions are not compatible.
+type ErrIncompatible struct {
+	CLIVersion, CLISha       string
+	RemoteVersion, RemoteSha string
+}
+
+func (e ErrIncompatible) Error() string {
+	return fmt.Sprintf("error: CLI build (%s@%s) mismatches remote node build (%s@%s). You can set flag --bypass-version-check to bypass this", e.CLIVersion, e.CLISha, e.RemoteVersion, e.RemoteSha)
 }

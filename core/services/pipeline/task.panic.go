@@ -1,6 +1,10 @@
 package pipeline
 
-import "context"
+import (
+	"context"
+
+	"github.com/smartcontractkit/chainlink/core/logger"
+)
 
 type PanicTask struct {
 	BaseTask `mapstructure:",squash"`
@@ -13,10 +17,6 @@ func (t *PanicTask) Type() TaskType {
 	return TaskTypePanic
 }
 
-func (t *PanicTask) SetDefaults(_ map[string]string, _ TaskDAG, _ taskDAGNode) error {
-	return nil
-}
-
-func (t *PanicTask) Run(_ context.Context, _ JSONSerializable, _ []Result) (result Result) {
+func (t *PanicTask) Run(_ context.Context, _ logger.Logger, vars Vars, _ []Result) (result Result, runInfo RunInfo) {
 	panic(t.Msg)
 }

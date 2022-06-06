@@ -1,6 +1,7 @@
 package periodicbackup
 
 import (
+	"context"
 	"fmt"
 	"io/ioutil"
 	"net/url"
@@ -10,9 +11,12 @@ import (
 	"time"
 
 	"github.com/pkg/errors"
+
+	"github.com/smartcontractkit/chainlink/core/config"
 	"github.com/smartcontractkit/chainlink/core/logger"
+	"github.com/smartcontractkit/chainlink/core/services"
 	"github.com/smartcontractkit/chainlink/core/static"
-	"github.com/smartcontractkit/chainlink/core/store/orm"
+	"github.com/smartcontractkit/chainlink/core/utils"
 )
 
 var (
@@ -20,12 +24,6 @@ var (
 	minBackupFrequency = time.Minute
 
 	excludedDataFromTables = []string{
-		"job_runs",
-		"task_runs",
-		"eth_task_run_txes",
-		"run_requests",
-		"run_results",
-		"sync_events",
 		"pipeline_runs",
 		"pipeline_task_runs",
 	}
@@ -40,91 +38,118 @@ type backupResult struct {
 
 type (
 	DatabaseBackup interface {
-		Start() error
-		Close() error
-		RunBackupGracefully(version string)
+		services.ServiceCtx
+		RunBackup(version string) error
 	}
 
 	databaseBackup struct {
-		logger          *logger.Logger
+		logger          logger.Logger
 		databaseURL     url.URL
-		mode            orm.DatabaseBackupMode
+		mode            config.DatabaseBackupMode
 		frequency       time.Duration
 		outputParentDir string
 		done            chan bool
+		utils.StartStopOnce
 	}
 
 	Config interface {
-		DatabaseBackupMode() orm.DatabaseBackupMode
+		DatabaseBackupMode() config.DatabaseBackupMode
 		DatabaseBackupFrequency() time.Duration
 		DatabaseBackupURL() *url.URL
+		DatabaseBackupDir() string
 		DatabaseURL() url.URL
 		RootDir() string
 	}
 )
 
-func NewDatabaseBackup(config Config, logger *logger.Logger) DatabaseBackup {
+// NewDatabaseBackup instantiates a *databaseBackup
+func NewDatabaseBackup(config Config, lggr logger.Logger) (DatabaseBackup, error) {
+	lggr = lggr.Named("DatabaseBackup")
 	dbUrl := config.DatabaseURL()
 	dbBackupUrl := config.DatabaseBackupURL()
 	if dbBackupUrl != nil {
 		dbUrl = *dbBackupUrl
 	}
+
+	outputParentDir := filepath.Join(config.RootDir(), "backup")
+	if config.DatabaseBackupDir() != "" {
+		dir, err := filepath.Abs(config.DatabaseBackupDir())
+		if err != nil {
+			return nil, errors.Errorf("failed to get path for DATABASE_BACKUP_DIR (%s) - please set it to a valid directory path", config.DatabaseBackupDir())
+		}
+		outputParentDir = dir
+	}
+
 	return &databaseBackup{
-		logger,
+		lggr,
 		dbUrl,
 		config.DatabaseBackupMode(),
 		config.DatabaseBackupFrequency(),
-		config.RootDir(),
+		outputParentDir,
 		make(chan bool),
-	}
+		utils.StartStopOnce{},
+	}, nil
 }
 
-func (backup databaseBackup) Start() error {
-
-	if backup.frequencyIsTooSmall() {
-		return errors.Errorf("Database backup frequency (%s=%v) is too small. Please set it to at least %s", "DATABASE_BACKUP_FREQUENCY", backup.frequency, minBackupFrequency)
-	}
-
-	ticker := time.NewTicker(backup.frequency)
-
-	go func() {
-		for {
-			select {
-			case <-backup.done:
-				ticker.Stop()
-				return
-			case <-ticker.C:
-				backup.RunBackupGracefully(static.Version)
-			}
+// Start starts DatabaseBackup.
+func (backup *databaseBackup) Start(context.Context) error {
+	return backup.StartOnce("DatabaseBackup", func() (err error) {
+		ticker := time.NewTicker(backup.frequency)
+		if backup.frequency == 0 {
+			backup.logger.Info("Periodic database backups are disabled; DATABASE_BACKUP_FREQUENCY was set to 0")
+			// Stopping the ticker means it will never fire, effectively disabling periodic backups
+			ticker.Stop()
+		} else if backup.frequencyIsTooSmall() {
+			return errors.Errorf("Database backup frequency (%s=%v) is too small. Please set it to at least %s (or set to 0 to disable periodic backups)", "DATABASE_BACKUP_FREQUENCY", backup.frequency, minBackupFrequency)
 		}
-	}()
 
-	return nil
+		go func() {
+			for {
+				select {
+				case <-backup.done:
+					ticker.Stop()
+					return
+				case <-ticker.C:
+					backup.logger.Infow("Starting automatic database backup, this can take a while. To disable periodic backups, set DATABASE_BACKUP_FREQUENCY=0. To disable database backups entirely, set DATABASE_BACKUP_MODE=none.")
+					//nolint:errcheck
+					backup.RunBackup(static.Version)
+				}
+			}
+		}()
+
+		return nil
+	})
 }
 
-func (backup databaseBackup) Close() error {
-	backup.done <- true
-	return nil
+func (backup *databaseBackup) Close() error {
+	return backup.StopOnce("DatabaseBackup", func() (err error) {
+		backup.done <- true
+		return nil
+	})
 }
 
 func (backup *databaseBackup) frequencyIsTooSmall() bool {
 	return backup.frequency < minBackupFrequency
 }
 
-func (backup *databaseBackup) RunBackupGracefully(version string) {
-	backup.logger.Debugw("DatabaseBackup: Starting database backup...", "mode", backup.mode, "url", backup.databaseURL.String(), "directory", backup.outputParentDir)
+func (backup *databaseBackup) RunBackup(version string) error {
+	backup.logger.Debugw("Starting backup", "mode", backup.mode, "url", backup.databaseURL.Redacted(), "directory", backup.outputParentDir)
 	startAt := time.Now()
 	result, err := backup.runBackup(version)
 	duration := time.Since(startAt)
 	if err != nil {
-		backup.logger.Errorw("DatabaseBackup: Failed", "duration", duration, "error", err)
-	} else {
-		backup.logger.Infow("DatabaseBackup: Database backup finished successfully.", "duration", duration, "fileSize", result.size, "filePath", result.path)
+		backup.logger.Errorw("Backup failed", "duration", duration, "err", err)
+		return err
 	}
+	backup.logger.Infow("Backup completed successfully.", "duration", duration, "fileSize", result.size, "filePath", result.path)
+	return nil
 }
 
 func (backup *databaseBackup) runBackup(version string) (*backupResult, error) {
-
+	err := os.MkdirAll(backup.outputParentDir, os.ModePerm)
+	if err != nil {
+		return nil, errors.Wrapf(err, "Failed to create directories on the path: %s", backup.outputParentDir)
+	}
 	tmpFile, err := ioutil.TempFile(backup.outputParentDir, "cl_backup_tmp_")
 	if err != nil {
 		return nil, errors.Wrap(err, "Failed to create a tmp file")
@@ -140,7 +165,7 @@ func (backup *databaseBackup) runBackup(version string) (*backupResult, error) {
 		"-F", "c", // format: custom (zipped)
 	}
 
-	if backup.mode == orm.DatabaseBackupModeLite {
+	if backup.mode == config.DatabaseBackupModeLite {
 		for _, table := range excludedDataFromTables {
 			args = append(args, fmt.Sprintf("--exclude-table-data=%s", table))
 		}
@@ -154,7 +179,7 @@ func (backup *databaseBackup) runBackup(version string) (*backupResult, error) {
 	}
 
 	maskedArgs := maskArgs(args)
-	backup.logger.Debugf("DatabaseBackup: Running pg_dump with: %v", maskedArgs)
+	backup.logger.Debugf("Running pg_dump with: %v", maskedArgs)
 
 	cmd := exec.Command(
 		"pg_dump", args...,
@@ -169,8 +194,9 @@ func (backup *databaseBackup) runBackup(version string) (*backupResult, error) {
 			maskedArguments: maskedArgs,
 			pgDumpArguments: args,
 		}
-		if ee, ok := err.(*exec.ExitError); ok {
-			return partialResult, errors.Wrap(err, fmt.Sprintf("pg_dump failed with output: %s", string(ee.Stderr)))
+		var ee *exec.ExitError
+		if errors.As(err, &ee) {
+			return partialResult, errors.Wrapf(err, "pg_dump failed with output: %s", string(ee.Stderr))
 		}
 		return partialResult, errors.Wrap(err, "pg_dump failed")
 	}

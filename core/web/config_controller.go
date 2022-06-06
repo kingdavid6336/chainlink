@@ -4,8 +4,8 @@ import (
 	"fmt"
 	"net/http"
 
+	"github.com/smartcontractkit/chainlink/core/config"
 	"github.com/smartcontractkit/chainlink/core/services/chainlink"
-	"github.com/smartcontractkit/chainlink/core/store/presenters"
 	"github.com/smartcontractkit/chainlink/core/utils"
 
 	"github.com/gin-gonic/gin"
@@ -20,23 +20,21 @@ type ConfigController struct {
 // Example:
 //  "<application>/config"
 func (cc *ConfigController) Show(c *gin.Context) {
-	cw, err := presenters.NewConfigPrinter(cc.App.GetStore())
-	if err != nil {
-		jsonAPIError(c, http.StatusInternalServerError, fmt.Errorf("failed to build config whitelist: %+v", err))
-		return
-	}
+	cw := config.NewConfigPrinter(cc.App.GetConfig())
 
 	jsonAPIResponse(c, cw, "config")
 }
 
 type configPatchRequest struct {
-	EthGasPriceDefault *utils.Big `json:"ethGasPriceDefault"`
+	EvmGasPriceDefault *utils.Big `json:"ethGasPriceDefault"`
+	EVMChainID         *utils.Big `json:"evmChainID"`
 }
 
 // ConfigPatchResponse represents the change to the configuration made due to a
 // PATCH to the config endpoint
 type ConfigPatchResponse struct {
-	EthGasPriceDefault Change `json:"ethGasPriceDefault"`
+	EvmGasPriceDefault Change     `json:"ethGasPriceDefault"`
+	EVMChainID         *utils.Big `json:"evmChainID"`
 }
 
 // Change represents the old value and the new value after a PATH request has
@@ -65,16 +63,27 @@ func (cc *ConfigController) Patch(c *gin.Context) {
 		return
 	}
 
-	if err := cc.App.GetStore().SetConfigValue("EthGasPriceDefault", request.EthGasPriceDefault); err != nil {
-		jsonAPIError(c, http.StatusInternalServerError, fmt.Errorf("failed to set gas price default: %+v", err))
+	chain, err := getChain(cc.App.GetChains().EVM, request.EVMChainID.String())
+	switch err {
+	case ErrInvalidChainID, ErrMultipleChains, ErrMissingChainID:
+		jsonAPIError(c, http.StatusUnprocessableEntity, err)
+		return
+	case nil:
+		break
+	default:
+		jsonAPIError(c, http.StatusInternalServerError, err)
 		return
 	}
 
+	if err := chain.Config().SetEvmGasPriceDefault(request.EvmGasPriceDefault.ToInt()); err != nil {
+		jsonAPIError(c, http.StatusInternalServerError, fmt.Errorf("failed to set gas price default: %+v", err))
+		return
+	}
 	response := &ConfigPatchResponse{
-		EthGasPriceDefault: Change{
-			From: cc.App.GetStore().Config.EthGasPriceDefault().String(),
-			To:   request.EthGasPriceDefault.String(),
-		},
+		EvmGasPriceDefault: Change{
+			From: chain.Config().EvmGasPriceDefault().String(),
+			To:   request.EvmGasPriceDefault.String(),
+		}, EVMChainID: utils.NewBig(chain.ID()),
 	}
 	jsonAPIResponse(c, response, "config")
 }

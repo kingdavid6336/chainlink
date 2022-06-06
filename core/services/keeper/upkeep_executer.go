@@ -2,234 +2,309 @@ package keeper
 
 import (
 	"context"
+	"fmt"
 	"math/big"
 	"sync"
+	"time"
 
+	"github.com/ethereum/go-ethereum/common"
 	"github.com/pkg/errors"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
 
-	"github.com/ethereum/go-ethereum"
+	evmclient "github.com/smartcontractkit/chainlink/core/chains/evm/client"
+	"github.com/smartcontractkit/chainlink/core/chains/evm/gas"
+	httypes "github.com/smartcontractkit/chainlink/core/chains/evm/headtracker/types"
+	evmtypes "github.com/smartcontractkit/chainlink/core/chains/evm/types"
 	"github.com/smartcontractkit/chainlink/core/logger"
-	"github.com/smartcontractkit/chainlink/core/services"
-	"github.com/smartcontractkit/chainlink/core/services/eth"
 	"github.com/smartcontractkit/chainlink/core/services/job"
-	"github.com/smartcontractkit/chainlink/core/services/postgres"
-	"github.com/smartcontractkit/chainlink/core/store/models"
+	"github.com/smartcontractkit/chainlink/core/services/pg"
+	"github.com/smartcontractkit/chainlink/core/services/pipeline"
 	"github.com/smartcontractkit/chainlink/core/utils"
-	"gorm.io/gorm"
+	bigmath "github.com/smartcontractkit/chainlink/core/utils/big_math"
 )
 
 const (
-	checkUpkeep        = "checkUpkeep"
-	performUpkeep      = "performUpkeep"
 	executionQueueSize = 10
 )
 
-func NewUpkeepExecutor(
-	job job.Job,
-	db *gorm.DB,
-	ethClient eth.Client,
-	headBroadcaster *services.HeadBroadcaster,
-	maxGracePeriod int64,
-) *UpkeepExecutor {
-	return &UpkeepExecutor{
-		chStop:          make(chan struct{}),
-		ethClient:       ethClient,
-		executionQueue:  make(chan struct{}, executionQueueSize),
-		headBroadcaster: headBroadcaster,
-		job:             job,
-		mailbox:         utils.NewMailbox(1),
-		maxGracePeriod:  maxGracePeriod,
-		orm:             NewORM(db),
-		wgDone:          sync.WaitGroup{},
-		StartStopOnce:   utils.StartStopOnce{},
-	}
-}
+// UpkeepExecuter fulfills Service and HeadTrackable interfaces
+var (
+	_ job.ServiceCtx        = (*UpkeepExecuter)(nil)
+	_ httypes.HeadTrackable = (*UpkeepExecuter)(nil)
+)
 
-// UpkeepExecutor fulfills Service and HeadBroadcastable interfaces
-var _ job.Service = (*UpkeepExecutor)(nil)
-var _ services.HeadBroadcastable = (*UpkeepExecutor)(nil)
+var (
+	promCheckUpkeepExecutionTime = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "keeper_check_upkeep_execution_time",
+		Help: "Time taken to fully execute the check upkeep logic",
+	},
+		[]string{"upkeepID"},
+	)
+)
 
-type UpkeepExecutor struct {
+// UpkeepExecuter implements the logic to communicate with KeeperRegistry
+type UpkeepExecuter struct {
 	chStop          chan struct{}
-	ethClient       eth.Client
+	ethClient       evmclient.Client
+	config          Config
 	executionQueue  chan struct{}
-	headBroadcaster *services.HeadBroadcaster
+	headBroadcaster httypes.HeadBroadcasterRegistry
+	gasEstimator    gas.Estimator
 	job             job.Job
-	mailbox         *utils.Mailbox
-	maxGracePeriod  int64
+	mailbox         *utils.Mailbox[*evmtypes.Head]
 	orm             ORM
+	pr              pipeline.Runner
+	logger          logger.Logger
 	wgDone          sync.WaitGroup
 	utils.StartStopOnce
 }
 
-func (executor *UpkeepExecutor) Start() error {
-	return executor.StartOnce("UpkeepExecutor", func() error {
-		executor.wgDone.Add(2)
-		go executor.run()
-		unsubscribe := executor.headBroadcaster.Subscribe(executor)
+// NewUpkeepExecuter is the constructor of UpkeepExecuter
+func NewUpkeepExecuter(
+	job job.Job,
+	orm ORM,
+	pr pipeline.Runner,
+	ethClient evmclient.Client,
+	headBroadcaster httypes.HeadBroadcaster,
+	gasEstimator gas.Estimator,
+	logger logger.Logger,
+	config Config,
+) *UpkeepExecuter {
+	return &UpkeepExecuter{
+		chStop:          make(chan struct{}),
+		ethClient:       ethClient,
+		executionQueue:  make(chan struct{}, executionQueueSize),
+		headBroadcaster: headBroadcaster,
+		gasEstimator:    gasEstimator,
+		job:             job,
+		mailbox:         utils.NewMailbox[*evmtypes.Head](1),
+		config:          config,
+		orm:             orm,
+		pr:              pr,
+		logger:          logger.Named("UpkeepExecuter"),
+	}
+}
+
+// Start starts the upkeep executer logic
+func (ex *UpkeepExecuter) Start(context.Context) error {
+	return ex.StartOnce("UpkeepExecuter", func() error {
+		ex.wgDone.Add(2)
+		go ex.run()
+		latestHead, unsubscribeHeads := ex.headBroadcaster.Subscribe(ex)
+		if latestHead != nil {
+			ex.mailbox.Deliver(latestHead)
+		}
 		go func() {
-			defer unsubscribe()
-			defer executor.wgDone.Done()
-			<-executor.chStop
+			defer unsubscribeHeads()
+			defer ex.wgDone.Done()
+			<-ex.chStop
 		}()
 		return nil
 	})
 }
 
-func (executor *UpkeepExecutor) Close() error {
-	if !executor.OkayToStop() {
-		return errors.New("UpkeepExecutor is already stopped")
-	}
-	close(executor.chStop)
-	executor.wgDone.Wait()
-	return nil
+// Close stops and closes upkeep executer
+func (ex *UpkeepExecuter) Close() error {
+	return ex.StopOnce("UpkeepExecuter", func() error {
+		close(ex.chStop)
+		ex.wgDone.Wait()
+		return nil
+	})
 }
 
-func (executor *UpkeepExecutor) OnNewLongestChain(ctx context.Context, head models.Head) {
-	executor.mailbox.Deliver(head)
+// OnNewLongestChain handles the given head of a new longest chain
+func (ex *UpkeepExecuter) OnNewLongestChain(_ context.Context, head *evmtypes.Head) {
+	ex.mailbox.Deliver(head)
 }
 
-func (executor *UpkeepExecutor) run() {
-	defer executor.wgDone.Done()
+func (ex *UpkeepExecuter) run() {
+	defer ex.wgDone.Done()
 	for {
 		select {
-		case <-executor.chStop:
+		case <-ex.chStop:
 			return
-		case <-executor.mailbox.Notify():
-			executor.processActiveUpkeeps()
+		case <-ex.mailbox.Notify():
+			ex.processActiveUpkeeps()
 		}
 	}
 }
 
-func (executor *UpkeepExecutor) processActiveUpkeeps() {
+func (ex *UpkeepExecuter) processActiveUpkeeps() {
 	// Keepers could miss their turn in the turn taking algo if they are too overloaded
 	// with work because processActiveUpkeeps() blocks
-	head, ok := executor.mailbox.Retrieve().(models.Head)
-	if !ok {
-		logger.Errorf("expected `models.Head`, got %T", head)
+	head, exists := ex.mailbox.Retrieve()
+	if !exists {
+		ex.logger.Info("no head to retrieve. It might have been skipped")
 		return
 	}
 
-	logger.Debugw("UpkeepExecutor: checking active upkeeps", "blockheight", head.Number, "jobID", executor.job.ID)
+	ex.logger.Debugw("checking active upkeeps", "blockheight", head.Number)
 
-	ctx, cancel := postgres.DefaultQueryCtx()
-	defer cancel()
-	activeUpkeeps, err := executor.orm.EligibleUpkeeps(ctx, head.Number, executor.maxGracePeriod)
+	registry, err := ex.orm.RegistryByContractAddress(ex.job.KeeperSpec.ContractAddress)
 	if err != nil {
-		logger.Errorf("unable to load active registrations: %v", err)
+		ex.logger.Error(errors.Wrap(err, "unable to load registry"))
 		return
+	}
+
+	var activeUpkeeps []UpkeepRegistration
+	if ex.config.KeeperTurnFlagEnabled() {
+		turnBinary, err2 := ex.turnBlockHashBinary(registry, head, ex.config.KeeperTurnLookBack())
+		if err2 != nil {
+			ex.logger.Error(errors.Wrap(err2, "unable to get turn block number hash"))
+			return
+		}
+		activeUpkeeps, err2 = ex.orm.NewEligibleUpkeepsForRegistry(
+			ex.job.KeeperSpec.ContractAddress,
+			head.Number,
+			ex.config.KeeperMaximumGracePeriod(),
+			turnBinary)
+		if err2 != nil {
+			ex.logger.Error(errors.Wrap(err2, "unable to load active registrations"))
+			return
+		}
+	} else {
+		activeUpkeeps, err = ex.orm.EligibleUpkeepsForRegistry(
+			ex.job.KeeperSpec.ContractAddress,
+			head.Number,
+			ex.config.KeeperMaximumGracePeriod(),
+		)
+		if err != nil {
+			ex.logger.Error(errors.Wrap(err, "unable to load active registrations"))
+			return
+		}
 	}
 
 	wg := sync.WaitGroup{}
 	wg.Add(len(activeUpkeeps))
-	done := func() { <-executor.executionQueue; wg.Done() }
+	done := func() {
+		<-ex.executionQueue
+		wg.Done()
+	}
 	for _, reg := range activeUpkeeps {
-		executor.executionQueue <- struct{}{}
-		go executor.execute(reg, head.Number, done)
+		ex.executionQueue <- struct{}{}
+		go ex.execute(reg, head, done)
 	}
 
 	wg.Wait()
 }
 
-// execute will call checkForUpkeep and, if it succeeds, trigger a job on the CL node
-// DEV: must perform contract call "manually" because abigen wrapper can only send tx
-func (executor *UpkeepExecutor) execute(upkeep UpkeepRegistration, headNumber int64, done func()) {
+// execute triggers the pipeline run
+func (ex *UpkeepExecuter) execute(upkeep UpkeepRegistration, head *evmtypes.Head, done func()) {
 	defer done()
 
-	logArgs := []interface{}{
-		"jobID", executor.job.ID,
-		"blockNum", headNumber,
-		"registryAddress", upkeep.Registry.ContractAddress.Hex(),
-		"upkeepID", upkeep.UpkeepID,
+	start := time.Now()
+	svcLogger := ex.logger.With("jobID", ex.job.ID, "blockNum", head.Number, "upkeepID", upkeep.UpkeepID)
+	svcLogger.Debugw("checking upkeep", "lastRunBlockHeight", upkeep.LastRunBlockHeight, "lastKeeperIndex", upkeep.LastKeeperIndex)
+
+	ctxService, cancel := utils.ContextFromChanWithDeadline(ex.chStop, time.Minute)
+	defer cancel()
+
+	evmChainID := ""
+	if ex.job.KeeperSpec.EVMChainID != nil {
+		evmChainID = ex.job.KeeperSpec.EVMChainID.String()
 	}
 
-	msg, err := constructCheckUpkeepCallMsg(upkeep)
-	if err != nil {
-		logger.Error(err)
+	var gasPrice, gasTipCap, gasFeeCap *big.Int
+	if ex.config.KeeperCheckUpkeepGasPriceFeatureEnabled() {
+		price, fee, err := ex.estimateGasPrice(upkeep)
+		if err != nil {
+			svcLogger.Error(errors.Wrap(err, "estimating gas price"))
+			return
+		}
+		gasPrice, gasTipCap, gasFeeCap = price, fee.TipCap, fee.FeeCap
+
+		// Make sure the gas price is at least as large as the basefee to avoid ErrFeeCapTooLow error from geth during eth call.
+		// If head.BaseFeePerGas, we assume it is a EIP-1559 chain.
+		// Note: gasPrice will be nil if EvmEIP1559DynamicFees is enabled.
+		if head.BaseFeePerGas != nil && head.BaseFeePerGas.ToInt().BitLen() > 0 {
+			baseFee := addBuffer(head.BaseFeePerGas.ToInt(), ex.config.KeeperBaseFeeBufferPercent())
+			if gasPrice == nil || gasPrice.Cmp(baseFee) < 0 {
+				gasPrice = baseFee
+			}
+		}
+	}
+
+	vars := pipeline.NewVarsFrom(map[string]interface{}{
+		"jobSpec": map[string]interface{}{
+			"jobID":                 ex.job.ID,
+			"fromAddress":           upkeep.Registry.FromAddress.String(),
+			"contractAddress":       upkeep.Registry.ContractAddress.String(),
+			"upkeepID":              upkeep.UpkeepID,
+			"prettyID":              upkeep.PrettyID(),
+			"performUpkeepGasLimit": upkeep.ExecuteGas + ex.orm.config.KeeperRegistryPerformGasOverhead(),
+			"checkUpkeepGasLimit": ex.config.KeeperRegistryCheckGasOverhead() + uint64(upkeep.Registry.CheckGas) +
+				ex.config.KeeperRegistryPerformGasOverhead() + upkeep.ExecuteGas,
+			"gasPrice":   gasPrice,
+			"gasTipCap":  gasTipCap,
+			"gasFeeCap":  gasFeeCap,
+			"evmChainID": evmChainID,
+		},
+	})
+
+	// DotDagSource in database is empty because all the Keeper pipeline runs make use of the same observation source
+	ex.job.PipelineSpec.DotDagSource = observationSource
+	run := pipeline.NewRun(*ex.job.PipelineSpec, vars)
+
+	if _, err := ex.pr.Run(ctxService, &run, svcLogger, true, nil); err != nil {
+		svcLogger.Error(errors.Wrap(err, "failed executing run"))
 		return
 	}
 
-	logger.Debugw("UpkeepExecutor: checking upkeep", logArgs...)
+	// Only after task runs where a tx was broadcast
+	if run.State == pipeline.RunStatusCompleted {
+		err := ex.orm.SetLastRunInfoForUpkeepOnJob(ex.job.ID, upkeep.UpkeepID, head.Number, upkeep.Registry.FromAddress, pg.WithParentCtx(ctxService))
+		if err != nil {
+			svcLogger.Error(errors.Wrap(err, "failed to set last run height for upkeep"))
+		}
+		svcLogger.Debugw("execute pipeline status completed", "fromAddr", upkeep.Registry.FromAddress)
 
-	ctxService, cancel := utils.ContextFromChan(executor.chStop)
-	defer cancel()
-
-	checkUpkeepResult, err := executor.ethClient.CallContract(ctxService, msg, nil)
-	if err != nil {
-		logger.Debugw("UpkeepExecutor: checkUpkeep failed", logArgs...)
-		return
-	}
-
-	performTxData, err := constructPerformUpkeepTxData(checkUpkeepResult, upkeep.UpkeepID)
-	if err != nil {
-		logger.Error(err)
-		return
-	}
-
-	logger.Debugw("UpkeepExecutor: performing upkeep", logArgs...)
-
-	ctxQuery, _ := postgres.DefaultQueryCtx()
-	ctxCombined, cancel := utils.CombinedContext(executor.chStop, ctxQuery)
-	defer cancel()
-
-	err = executor.orm.CreateEthTransactionForUpkeep(ctxCombined, upkeep, performTxData)
-	if err != nil {
-		logger.Error(err)
-	}
-
-	ctxQuery, cancel = postgres.DefaultQueryCtx()
-	defer cancel()
-	ctxCombined, cancel = utils.CombinedContext(executor.chStop, ctxQuery)
-	defer cancel()
-	// DEV: this is the block that initiated the run, not the block height when broadcast nor the block
-	// that the tx gets confirmed in. This is fine because this grace period is just used as a fallback
-	// in case we miss the UpkeepPerformed log or the tx errors. It does not need to be exact.
-	err = executor.orm.SetLastRunHeightForUpkeepOnJob(ctxCombined, executor.job.ID, upkeep.UpkeepID, headNumber)
-	if err != nil {
-		logger.Errorw("UpkeepExecutor: unable to setLastRunHeightForUpkeep for upkeep", logArgs...)
+		elapsed := time.Since(start)
+		promCheckUpkeepExecutionTime.
+			WithLabelValues(upkeep.PrettyID()).
+			Set(float64(elapsed))
 	}
 }
 
-func constructCheckUpkeepCallMsg(upkeep UpkeepRegistration) (ethereum.CallMsg, error) {
-	checkPayload, err := RegistryABI.Pack(
-		checkUpkeep,
-		big.NewInt(int64(upkeep.UpkeepID)),
-		upkeep.Registry.FromAddress.Address(),
+func (ex *UpkeepExecuter) estimateGasPrice(upkeep UpkeepRegistration) (gasPrice *big.Int, fee gas.DynamicFee, err error) {
+	var performTxData []byte
+	performTxData, err = Registry1_1ABI.Pack(
+		"performUpkeep", // performUpkeep is same across registry ABI versions
+		upkeep.UpkeepID.ToInt(),
+		common.Hex2Bytes("1234"), // placeholder
 	)
 	if err != nil {
-		return ethereum.CallMsg{}, err
+		return nil, fee, errors.Wrap(err, "unable to construct performUpkeep data")
 	}
 
-	to := upkeep.Registry.ContractAddress.Address()
-	msg := ethereum.CallMsg{
-		From: utils.ZeroAddress,
-		To:   &to,
-		Gas:  uint64(upkeep.Registry.CheckGas),
-		Data: checkPayload,
+	if ex.config.EvmEIP1559DynamicFees() {
+		fee, _, err = ex.gasEstimator.GetDynamicFee(upkeep.ExecuteGas)
+		fee.TipCap = addBuffer(fee.TipCap, ex.config.KeeperGasTipCapBufferPercent())
+	} else {
+		gasPrice, _, err = ex.gasEstimator.GetLegacyGas(performTxData, upkeep.ExecuteGas)
+		gasPrice = addBuffer(gasPrice, ex.config.KeeperGasPriceBufferPercent())
+	}
+	if err != nil {
+		return nil, fee, errors.Wrap(err, "unable to estimate gas")
 	}
 
-	return msg, nil
+	return gasPrice, fee, nil
 }
 
-func constructPerformUpkeepTxData(checkUpkeepResult []byte, upkeepID int64) ([]byte, error) {
-	unpackedResult, err := RegistryABI.Unpack(checkUpkeep, checkUpkeepResult)
-	if err != nil {
-		return nil, err
-	}
-
-	performData, ok := unpackedResult[0].([]byte)
-	if !ok {
-		return nil, errors.New("checkupkeep payload not as expected")
-	}
-
-	performTxData, err := RegistryABI.Pack(
-		performUpkeep,
-		big.NewInt(upkeepID),
-		performData,
+func addBuffer(val *big.Int, prct uint32) *big.Int {
+	return bigmath.Div(
+		bigmath.Mul(val, 100+prct),
+		100,
 	)
-	if err != nil {
-		return nil, err
-	}
+}
 
-	return performTxData, nil
+func (ex *UpkeepExecuter) turnBlockHashBinary(registry Registry, head *evmtypes.Head, lookback int64) (string, error) {
+	turnBlock := head.Number - (head.Number % int64(registry.BlockCountPerTurn)) - lookback
+	block, err := ex.ethClient.BlockByNumber(context.Background(), big.NewInt(turnBlock))
+	if err != nil {
+		return "", err
+	}
+	hashAtHeight := block.Hash()
+	binaryString := fmt.Sprintf("%b", hashAtHeight.Big())
+	return binaryString, nil
 }

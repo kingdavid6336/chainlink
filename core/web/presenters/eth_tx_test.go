@@ -6,11 +6,12 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/common/hexutil"
 	"github.com/manyminds/api2go/jsonapi"
-	"github.com/smartcontractkit/chainlink/core/assets"
-	"github.com/smartcontractkit/chainlink/core/store/models"
-	"github.com/smartcontractkit/chainlink/core/utils"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/smartcontractkit/chainlink/core/assets"
+	"github.com/smartcontractkit/chainlink/core/chains/evm/txmgr"
+	"github.com/smartcontractkit/chainlink/core/utils"
 )
 
 func TestEthTxResource(t *testing.T) {
@@ -18,13 +19,13 @@ func TestEthTxResource(t *testing.T) {
 
 	from := common.HexToAddress("0x1")
 	to := common.HexToAddress("0x2")
-	tx := models.EthTx{
+	tx := txmgr.EthTx{
 		ID:             1,
 		EncodedPayload: []byte(`{"data": "is wilding out"}`),
 		FromAddress:    from,
 		ToAddress:      to,
 		GasLimit:       uint64(5000),
-		State:          models.EthTxConfirmed,
+		State:          txmgr.EthTxConfirmed,
 		Value:          assets.NewEthValue(1),
 	}
 
@@ -36,7 +37,7 @@ func TestEthTxResource(t *testing.T) {
 	expected := `
 	{
 		"data": {
-		  "type": "transactions",
+		  "type": "evm_transactions",
 		  "id": "",
 		  "attributes": {
 			"state": "confirmed",
@@ -49,7 +50,8 @@ func TestEthTxResource(t *testing.T) {
 			"nonce": "",
 			"sentAt": "",
 			"to": "0x0000000000000000000000000000000000000002",
-			"value": "0.000000000000000001"
+			"value": "0.000000000000000001",
+			"evmChainID": "0"
 		  }
 		}
 	  }
@@ -65,10 +67,10 @@ func TestEthTxResource(t *testing.T) {
 	)
 
 	tx.Nonce = &nonce
-	txa := models.EthTxAttempt{
+	txa := txmgr.EthTxAttempt{
 		EthTx:                   tx,
 		Hash:                    hash,
-		GasPrice:                *gasPrice,
+		GasPrice:                gasPrice,
 		SignedRawTx:             hexutil.MustDecode("0xcafe"),
 		BroadcastBeforeBlockNum: &broadcastBefore,
 	}
@@ -81,7 +83,7 @@ func TestEthTxResource(t *testing.T) {
 	expected = `
 	{
 		"data": {
-		  "type": "transactions",
+		  "type": "evm_transactions",
 		  "id": "0x0000000000000000000000000000000000000000000000000000000000010203",
 		  "attributes": {
 			"state": "confirmed",
@@ -94,7 +96,8 @@ func TestEthTxResource(t *testing.T) {
 			"nonce": "100",
 			"sentAt": "300",
 			"to": "0x0000000000000000000000000000000000000002",
-			"value": "0.000000000000000001"
+			"value": "0.000000000000000001",
+			"evmChainID": "0"
 		  }
 		}
 	  }

@@ -12,30 +12,50 @@ import (
 func TestAssets_NewLinkAndString(t *testing.T) {
 	t.Parallel()
 
-	link := assets.NewLink(0)
+	link := assets.NewLinkFromJuels(0)
 
-	assert.Equal(t, "0.000000000000000000", link.String())
+	assert.Equal(t, "0", link.String())
 
 	link.SetInt64(1)
-	assert.Equal(t, "0.000000000000000001", link.String())
+	assert.Equal(t, "1", link.String())
 
 	link.SetString("900000000000000000", 10)
-	assert.Equal(t, "0.900000000000000000", link.String())
+	assert.Equal(t, "900000000000000000", link.String())
 
 	link.SetString("115792089237316195423570985008687907853269984665640564039457584007913129639935", 10)
-	assert.Equal(t, "115792089237316195423570985008687907853269984665640564039457.584007913129639935", link.String())
-
-	link.SetString("115792089237316195423570985008687907853269984665640564039457584007913129639936", 10)
-	assert.Equal(t, "115792089237316195423570985008687907853269984665640564039457.584007913129639936", link.String())
+	assert.Equal(t, "115792089237316195423570985008687907853269984665640564039457584007913129639935", link.String())
 
 	var nilLink *assets.Link
 	assert.Equal(t, "0", nilLink.String())
 }
 
+func TestAssets_NewLinkAndLink(t *testing.T) {
+	t.Parallel()
+
+	link := assets.NewLinkFromJuels(0)
+
+	assert.Equal(t, "0.000000000000000000", link.Link())
+
+	link.SetInt64(1)
+	assert.Equal(t, "0.000000000000000001", link.Link())
+
+	link.SetString("900000000000000000", 10)
+	assert.Equal(t, "0.900000000000000000", link.Link())
+
+	link.SetString("115792089237316195423570985008687907853269984665640564039457584007913129639935", 10)
+	assert.Equal(t, "115792089237316195423570985008687907853269984665640564039457.584007913129639935", link.Link())
+
+	link.SetString("115792089237316195423570985008687907853269984665640564039457584007913129639936", 10)
+	assert.Equal(t, "115792089237316195423570985008687907853269984665640564039457.584007913129639936", link.Link())
+
+	var nilLink *assets.Link
+	assert.Equal(t, "0", nilLink.Link())
+}
+
 func TestAssets_Link_MarshalJson(t *testing.T) {
 	t.Parallel()
 
-	link := assets.NewLink(1)
+	link := assets.NewLinkFromJuels(1)
 
 	b, err := json.Marshal(link)
 	assert.NoError(t, err)
@@ -49,7 +69,7 @@ func TestAssets_Link_UnmarshalJsonOk(t *testing.T) {
 
 	err := json.Unmarshal([]byte(`"1"`), &link)
 	assert.NoError(t, err)
-	assert.Equal(t, "0.000000000000000001", link.String())
+	assert.Equal(t, "0.000000000000000001", link.Link())
 }
 
 func TestAssets_Link_UnmarshalJsonError(t *testing.T) {

@@ -1,202 +1,311 @@
 package keeper
 
 import (
+	"fmt"
 	"sync"
 
 	"github.com/pkg/errors"
-	"github.com/smartcontractkit/chainlink/core/internal/gethwrappers/generated/keeper_registry_wrapper"
-	"github.com/smartcontractkit/chainlink/core/logger"
-	"github.com/smartcontractkit/chainlink/core/services/log"
-	"github.com/smartcontractkit/chainlink/core/services/postgres"
-	"github.com/smartcontractkit/chainlink/core/store/models"
+
+	"github.com/smartcontractkit/chainlink/core/chains/evm/log"
+	"github.com/smartcontractkit/chainlink/core/services/keystore/keys/ethkey"
+	"github.com/smartcontractkit/chainlink/core/utils"
 )
 
-func (rs *RegistrySynchronizer) processLogs(head models.Head) {
+func (rs *RegistrySynchronizer) processLogs() {
 	wg := sync.WaitGroup{}
-	wg.Add(4)
-	go rs.handleSyncRegistryLog(head, wg.Done)
-	go rs.handleUpkeepCanceledLogs(head, wg.Done)
-	go rs.handleUpkeepRegisteredLogs(head, wg.Done)
-	go rs.handleUpkeepPerformedLogs(head, wg.Done)
+	wg.Add(7)
+	go rs.handleSyncRegistryLog(wg.Done)
+	go rs.handleUpkeepCanceledLogs(wg.Done)
+	go rs.handleUpkeepRegisteredLogs(wg.Done)
+	go rs.handleUpkeepReceivedLogs(wg.Done)
+	go rs.handleUpkeepMigratedLogs(wg.Done)
+	go rs.handleUpkeepPerformedLogs(wg.Done)
+	go rs.handleUpkeepGasLimitSetLogs(wg.Done)
 	wg.Wait()
 }
 
-func (rs *RegistrySynchronizer) handleSyncRegistryLog(head models.Head, done func()) {
+func (rs *RegistrySynchronizer) handleSyncRegistryLog(done func()) {
 	defer done()
-	oldEnough := isOldEnoughConstructor(head, rs.minConfirmations)
-	i := rs.mailRoom.mbSyncRegistry.RetrieveIf(oldEnough)
-	if i == nil {
-		return
-	}
-	broadcast, ok := i.(log.Broadcast)
-	if !ok {
-		logger.Errorf("RegistrySynchronizer: invariant violation, expected log.Broadcast but got %T", broadcast)
+	broadcast, exists := rs.mailRoom.mbSyncRegistry.Retrieve()
+	if !exists {
 		return
 	}
 	txHash := broadcast.RawLog().TxHash.Hex()
-	logger.Debugw("RegistrySynchronizer: processing SyncRegistry log", "jobID", rs.job.ID, "txHash", txHash)
-	was, err := broadcast.WasAlreadyConsumed()
+	rs.logger.Debugw("processing SyncRegistry log", "txHash", txHash)
+	was, err := rs.logBroadcaster.WasAlreadyConsumed(broadcast)
 	if err != nil {
-		logger.Warn(errors.Wrapf(err, "RegistrySynchronizer: unable to check if log was consumed, jobID: %d", rs.job.ID))
+		rs.logger.Warn(errors.Wrap(err, "unable to check if log was consumed"))
 		return
 	}
 	if was {
 		return
 	}
-	if !head.IsInChain(broadcast.RawLog().BlockHash) {
-		return
-	}
 	_, err = rs.syncRegistry()
 	if err != nil {
-		logger.Error(errors.Wrapf(err, "RegistrySynchronizer: unable to sync registry, jobID: %d", rs.job.ID))
+		rs.logger.Error(errors.Wrap(err, "unable to sync registry"))
 		return
 	}
-	err = broadcast.MarkConsumed()
-	logger.ErrorIf((errors.Wrapf(err, "RegistrySynchronizer: unable to mark log as consumed, jobID: %d", rs.job.ID)))
-}
-
-func (rs *RegistrySynchronizer) handleUpkeepCanceledLogs(head models.Head, done func()) {
-	defer done()
-	oldEnough := isOldEnoughConstructor(head, rs.minConfirmations)
-	for {
-		i := rs.mailRoom.mbUpkeepCanceled.RetrieveIf(oldEnough)
-		if i == nil {
-			return
-		}
-		broadcast, ok := i.(log.Broadcast)
-		if !ok {
-			logger.Errorf("RegistrySynchronizer: invariant violation, expected log.Broadcast but got %T", broadcast)
-			continue
-		}
-		txHash := broadcast.RawLog().TxHash.Hex()
-		logger.Debugw("RegistrySynchronizer: processing UpkeepCanceled log", "jobID", rs.job.ID, "txHash", txHash)
-		was, err := broadcast.WasAlreadyConsumed()
-		if err != nil {
-			logger.Warn(errors.Wrapf(err, "RegistrySynchronizer: unable to check if log was consumed, jobID: %d", rs.job.ID))
-			continue
-		}
-		if was {
-			continue
-		}
-		if !head.IsInChain(broadcast.RawLog().BlockHash) {
-			continue
-		}
-		log, ok := broadcast.DecodedLog().(*keeper_registry_wrapper.KeeperRegistryUpkeepCanceled)
-		if !ok {
-			logger.Errorf("RegistrySynchronizer: invariant violation, expected UpkeepCanceled log but got %T", log)
-			continue
-		}
-		ctx, cancel := postgres.DefaultQueryCtx()
-		defer cancel()
-		err = rs.orm.BatchDeleteUpkeepsForJob(ctx, rs.job.ID, []int64{log.Id.Int64()})
-		if err != nil {
-			logger.Error(errors.Wrapf(err, "RegistrySynchronizer: unable to batch delete upkeeps, jobID: %d", rs.job.ID))
-			continue
-		}
-		err = broadcast.MarkConsumed()
-		logger.ErrorIf((errors.Wrapf(err, "RegistrySynchronizer: unable to mark log as consumed, jobID: %d", rs.job.ID)))
+	if err := rs.logBroadcaster.MarkConsumed(broadcast); err != nil {
+		rs.logger.Error(errors.Wrapf(err, "unable to mark SyncRegistryLog log as consumed, log: %v", broadcast.String()))
 	}
 }
 
-func (rs *RegistrySynchronizer) handleUpkeepRegisteredLogs(head models.Head, done func()) {
+func (rs *RegistrySynchronizer) handleUpkeepCanceledLogs(done func()) {
 	defer done()
-	oldEnough := isOldEnoughConstructor(head, rs.minConfirmations)
-	ctx, cancel := postgres.DefaultQueryCtx()
-	defer cancel()
-	registry, err := rs.orm.RegistryForJob(ctx, rs.job.ID)
+	for {
+		broadcast, exists := rs.mailRoom.mbUpkeepCanceled.Retrieve()
+		if !exists {
+			return
+		}
+		rs.handleUpkeepCancelled(broadcast)
+	}
+}
+
+func (rs *RegistrySynchronizer) handleUpkeepCancelled(broadcast log.Broadcast) {
+	txHash := broadcast.RawLog().TxHash.Hex()
+	rs.logger.Debugw("processing UpkeepCanceled log", "txHash", txHash)
+	was, err := rs.logBroadcaster.WasAlreadyConsumed(broadcast)
 	if err != nil {
-		logger.Error(errors.Wrapf(err, "RegistrySynchronizer: unable to find registry for job, jobID: %d", rs.job.ID))
+		rs.logger.Error(errors.Wrap(err, "unable to check if log was consumed"))
+		return
+	}
+	if was {
+		return
+	}
+
+	cancelledID, err := rs.registryWrapper.GetCancelledUpkeepIDFromLog(broadcast)
+	if err != nil {
+		rs.logger.Error(errors.Wrap(err, "Unable to fetch cancelled upkeep ID from log"))
+		return
+	}
+
+	affected, err := rs.orm.BatchDeleteUpkeepsForJob(rs.job.ID, []utils.Big{*utils.NewBig(cancelledID)})
+	if err != nil {
+		rs.logger.Error(errors.Wrap(err, "unable to batch delete upkeeps"))
+		return
+	}
+	rs.logger.Debugw(fmt.Sprintf("deleted %v upkeep registrations", affected), "txHash", txHash)
+
+	if err := rs.logBroadcaster.MarkConsumed(broadcast); err != nil {
+		rs.logger.Error(errors.Wrapf(err, "unable to mark KeeperRegistryUpkeepCanceled log as consumed,  log: %v", broadcast.String()))
+	}
+}
+
+func (rs *RegistrySynchronizer) handleUpkeepRegisteredLogs(done func()) {
+	defer done()
+	registry, err := rs.orm.RegistryForJob(rs.job.ID)
+	if err != nil {
+		rs.logger.Error(errors.Wrap(err, "unable to find registry for job"))
 		return
 	}
 	for {
-		i := rs.mailRoom.mbUpkeepRegistered.RetrieveIf(oldEnough)
-		if i == nil {
+		broadcast, exists := rs.mailRoom.mbUpkeepRegistered.Retrieve()
+		if !exists {
 			return
 		}
-		broadcast, ok := i.(log.Broadcast)
-		if !ok {
-			logger.Errorf("RegistrySynchronizer: invariant violation, expected log.Broadcast but got %T", broadcast)
-			continue
-		}
-		txHash := broadcast.RawLog().TxHash.Hex()
-		logger.Debugw("RegistrySynchronizer: processing UpkeepRegistered log", "jobID", rs.job.ID, "txHash", txHash)
-		was, err := broadcast.WasAlreadyConsumed()
-		if err != nil {
-			logger.Warn(errors.Wrapf(err, "RegistrySynchronizer: unable to check if log was consumed, jobID: %d", rs.job.ID))
-			continue
-		}
-		if was {
-			continue
-		}
-		if !head.IsInChain(broadcast.RawLog().BlockHash) {
-			continue
-		}
-		log, ok := broadcast.DecodedLog().(*keeper_registry_wrapper.KeeperRegistryUpkeepRegistered)
-		if !ok {
-			logger.Errorf("RegistrySynchronizer: invariant violation, expected UpkeepRegistered log but got %T", log)
-			continue
-		}
-		err = rs.syncUpkeep(registry, log.Id.Int64())
-		if err != nil {
-			logger.Error(err)
-			continue
-		}
-		err = broadcast.MarkConsumed()
-		logger.ErrorIf((errors.Wrapf(err, "RegistrySynchronizer: unable to mark log as consumed, jobID: %d", rs.job.ID)))
+		rs.HandleUpkeepRegistered(broadcast, registry)
 	}
 }
 
-func (rs *RegistrySynchronizer) handleUpkeepPerformedLogs(head models.Head, done func()) {
+func (rs *RegistrySynchronizer) HandleUpkeepRegistered(broadcast log.Broadcast, registry Registry) {
+	txHash := broadcast.RawLog().TxHash.Hex()
+	rs.logger.Debugw("processing UpkeepRegistered log", "txHash", txHash)
+	was, err := rs.logBroadcaster.WasAlreadyConsumed(broadcast)
+	if err != nil {
+		rs.logger.Error(errors.Wrap(err, "unable to check if log was consumed"))
+		return
+	}
+	if was {
+		return
+	}
+
+	upkeepID, err := rs.registryWrapper.GetUpkeepIdFromRegistrationLog(broadcast)
+	if err != nil {
+		rs.logger.Error(errors.Wrap(err, "Unable to fetch upkeep ID from registration log"))
+		return
+	}
+
+	err = rs.syncUpkeep(registry, utils.NewBig(upkeepID))
+	if err != nil {
+		rs.logger.Error(errors.Wrapf(err, "failed to sync upkeep, log: %v", broadcast.String()))
+		return
+	}
+	if err := rs.logBroadcaster.MarkConsumed(broadcast); err != nil {
+		rs.logger.Error(errors.Wrapf(err, "unable to mark KeeperRegistryUpkeepRegistered log as consumed, log: %v", broadcast.String()))
+	}
+}
+
+func (rs *RegistrySynchronizer) handleUpkeepPerformedLogs(done func()) {
 	defer done()
-	oldEnough := isOldEnoughConstructor(head, rs.minConfirmations)
 	for {
-		i := rs.mailRoom.mbUpkeepPerformed.RetrieveIf(oldEnough)
-		if i == nil {
+		broadcast, exists := rs.mailRoom.mbUpkeepPerformed.Retrieve()
+		if !exists {
 			return
 		}
-		broadcast, ok := i.(log.Broadcast)
-		if !ok {
-			logger.Errorf("RegistrySynchronizer: invariant violation, expected log.Broadcast but got %T", broadcast)
-			continue
-		}
-		txHash := broadcast.RawLog().TxHash.Hex()
-		logger.Debugw("RegistrySynchronizer: processing UpkeepPerformed log", "jobID", rs.job.ID, "txHash", txHash)
-		was, err := broadcast.WasAlreadyConsumed()
-		if err != nil {
-			logger.Warn(errors.Wrapf(err, "RegistrySynchronizer: unable to check if log was consumed, jobID: %d", rs.job.ID))
-			continue
-		}
-		if was {
-			continue
-		}
-		if !head.IsInChain(broadcast.RawLog().BlockHash) {
-			continue
-		}
-		log, ok := broadcast.DecodedLog().(*keeper_registry_wrapper.KeeperRegistryUpkeepPerformed)
-		if !ok {
-			logger.Errorf("RegistrySynchronizer: invariant violation, expected UpkeepPerformed log but got %T", log)
-			continue
-		}
-		ctx, cancel := postgres.DefaultQueryCtx()
-		defer cancel()
-		// set last run to 0 so that keeper can resume checkUpkeep()
-		err = rs.orm.SetLastRunHeightForUpkeepOnJob(ctx, rs.job.ID, log.Id.Int64(), 0)
-		if err != nil {
-			logger.Error(err)
-			continue
-		}
-		err = broadcast.MarkConsumed()
-		logger.ErrorIf((errors.Wrapf(err, "RegistrySynchronizer: unable to mark log as consumed, jobID: %d", rs.job.ID)))
+		rs.handleUpkeepPerformed(broadcast)
 	}
 }
 
-func isOldEnoughConstructor(head models.Head, minConfirmations uint64) func(interface{}) bool {
-	return func(i interface{}) bool {
-		broadcast, ok := i.(log.Broadcast)
-		if !ok {
-			return true // we want to get bad data out of the queue
+func (rs *RegistrySynchronizer) handleUpkeepPerformed(broadcast log.Broadcast) {
+	txHash := broadcast.RawLog().TxHash.Hex()
+	rs.logger.Debugw("processing UpkeepPerformed log", "jobID", rs.job.ID, "txHash", txHash)
+	was, err := rs.logBroadcaster.WasAlreadyConsumed(broadcast)
+	if err != nil {
+		rs.logger.Warn(errors.Wrap(err, "unable to check if log was consumed"))
+		return
+	}
+
+	if was {
+		return
+	}
+
+	log, err := rs.registryWrapper.ParseUpkeepPerformedLog(broadcast)
+	if err != nil {
+		rs.logger.Error(errors.Wrap(err, "Unable to fetch upkeep ID from performed log"))
+		return
+	}
+	err = rs.orm.SetLastRunInfoForUpkeepOnJob(rs.job.ID, utils.NewBig(log.UpkeepID), int64(broadcast.RawLog().BlockNumber), ethkey.EIP55AddressFromAddress(log.FromKeeper))
+
+	if err != nil {
+		rs.logger.Error(errors.Wrap(err, "failed to set last run to 0"))
+		return
+	}
+	rs.logger.Debugw("updated db for UpkeepPerformed log",
+		"jobID", rs.job.ID,
+		"upkeepID", log.UpkeepID.String(),
+		"blockNumber", int64(broadcast.RawLog().BlockNumber),
+		"fromAddr", ethkey.EIP55AddressFromAddress(log.FromKeeper))
+
+	if err := rs.logBroadcaster.MarkConsumed(broadcast); err != nil {
+		rs.logger.Error(errors.Wrap(err, "unable to mark KeeperRegistryUpkeepPerformed log as consumed"))
+	}
+}
+
+func (rs *RegistrySynchronizer) handleUpkeepGasLimitSetLogs(done func()) {
+	defer done()
+	registry, err := rs.orm.RegistryForJob(rs.job.ID)
+	if err != nil {
+		rs.logger.Error(errors.Wrap(err, "unable to find registry for job"))
+		return
+	}
+	for {
+		broadcast, exists := rs.mailRoom.mbUpkeepGasLimitSet.Retrieve()
+		if !exists {
+			return
 		}
-		logHeight := broadcast.RawLog().BlockNumber
-		return (logHeight + uint64(minConfirmations) - 1) <= uint64(head.Number)
+		rs.handleUpkeepGasLimitSet(broadcast, registry)
+	}
+}
+
+func (rs *RegistrySynchronizer) handleUpkeepGasLimitSet(broadcast log.Broadcast, registry Registry) {
+	txHash := broadcast.RawLog().TxHash.Hex()
+	rs.logger.Debugw("processing UpkeepGasLimitSet log", "jobID", rs.job.ID, "txHash", txHash)
+	was, err := rs.logBroadcaster.WasAlreadyConsumed(broadcast)
+	if err != nil {
+		rs.logger.Warn(errors.Wrap(err, "unable to check if log was consumed"))
+		return
+	}
+	if was {
+		return
+	}
+
+	upkeepID, err := rs.registryWrapper.GetIDFromGasLimitSetLog(broadcast)
+	if err != nil {
+		rs.logger.Error(errors.Wrap(err, "Unable to fetch upkeep ID from gas limit set log"))
+		return
+	}
+
+	err = rs.syncUpkeep(registry, utils.NewBig(upkeepID))
+	if err != nil {
+		rs.logger.Error(errors.Wrapf(err, "failed to sync upkeep, log: %v", broadcast.String()))
+		return
+	}
+	if err := rs.logBroadcaster.MarkConsumed(broadcast); err != nil {
+		rs.logger.Error(errors.Wrapf(err, "unable to mark KeeperRegistryUpkeepGasLimitSet log as consumed, log: %v", broadcast.String()))
+	}
+}
+
+func (rs *RegistrySynchronizer) handleUpkeepReceivedLogs(done func()) {
+	defer done()
+	registry, err := rs.orm.RegistryForJob(rs.job.ID)
+	if err != nil {
+		rs.logger.Error(errors.Wrap(err, "unable to find registry for job"))
+		return
+	}
+	for {
+		broadcast, exists := rs.mailRoom.mbUpkeepReceived.Retrieve()
+		if !exists {
+			return
+		}
+		rs.HandleUpkeepReceived(broadcast, registry)
+	}
+}
+
+func (rs *RegistrySynchronizer) HandleUpkeepReceived(broadcast log.Broadcast, registry Registry) {
+	txHash := broadcast.RawLog().TxHash.Hex()
+	rs.logger.Debugw("processing UpkeepReceived log", "txHash", txHash)
+	was, err := rs.logBroadcaster.WasAlreadyConsumed(broadcast)
+	if err != nil {
+		rs.logger.Error(errors.Wrap(err, "unable to check if log was consumed"))
+		return
+	}
+	if was {
+		return
+	}
+
+	upkeepID, err := rs.registryWrapper.GetUpkeepIdFromReceivedLog(broadcast)
+	if err != nil {
+		rs.logger.Error(errors.Wrap(err, "Unable to fetch upkeep ID from received log"))
+		return
+	}
+
+	err = rs.syncUpkeep(registry, utils.NewBig(upkeepID))
+	if err != nil {
+		rs.logger.Error(errors.Wrapf(err, "failed to sync upkeep, log: %v", broadcast.String()))
+		return
+	}
+	if err := rs.logBroadcaster.MarkConsumed(broadcast); err != nil {
+		rs.logger.Error(errors.Wrapf(err, "unable to mark KeeperRegistryUpkeepReceived log as consumed, log: %v", broadcast.String()))
+	}
+}
+
+func (rs *RegistrySynchronizer) handleUpkeepMigratedLogs(done func()) {
+	defer done()
+	for {
+		broadcast, exists := rs.mailRoom.mbUpkeepMigrated.Retrieve()
+		if !exists {
+			return
+		}
+		rs.handleUpkeepMigrated(broadcast)
+	}
+}
+
+func (rs *RegistrySynchronizer) handleUpkeepMigrated(broadcast log.Broadcast) {
+	txHash := broadcast.RawLog().TxHash.Hex()
+	rs.logger.Debugw("processing UpkeepMigrated log", "txHash", txHash)
+	was, err := rs.logBroadcaster.WasAlreadyConsumed(broadcast)
+	if err != nil {
+		rs.logger.Error(errors.Wrap(err, "unable to check if log was consumed"))
+		return
+	}
+	if was {
+		return
+	}
+
+	migratedID, err := rs.registryWrapper.GetUpkeepIdFromMigratedLog(broadcast)
+	if err != nil {
+		rs.logger.Error(errors.Wrap(err, "Unable to fetch migrated upkeep ID from log"))
+		return
+	}
+
+	affected, err := rs.orm.BatchDeleteUpkeepsForJob(rs.job.ID, []utils.Big{*utils.NewBig(migratedID)})
+	if err != nil {
+		rs.logger.Error(errors.Wrap(err, "unable to batch delete upkeeps"))
+		return
+	}
+	rs.logger.Debugw(fmt.Sprintf("deleted %v upkeep registrations", affected), "txHash", txHash)
+
+	if err := rs.logBroadcaster.MarkConsumed(broadcast); err != nil {
+		rs.logger.Error(errors.Wrapf(err, "unable to mark KeeperRegistryUpkeepMigrated log as consumed,  log: %v", broadcast.String()))
 	}
 }
