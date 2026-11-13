@@ -1,8 +1,8 @@
 package periodicbackup
 
 import (
+	"context"
 	"fmt"
-	"io/ioutil"
 	"net/url"
 	"os"
 	"os/exec"
@@ -10,9 +10,11 @@ import (
 	"time"
 
 	"github.com/pkg/errors"
-	"github.com/smartcontractkit/chainlink/core/logger"
-	"github.com/smartcontractkit/chainlink/core/static"
-	"github.com/smartcontractkit/chainlink/core/store/orm"
+
+	"github.com/smartcontractkit/chainlink-common/pkg/logger"
+	"github.com/smartcontractkit/chainlink-common/pkg/services"
+	"github.com/smartcontractkit/chainlink/v2/core/config"
+	"github.com/smartcontractkit/chainlink/v2/core/static"
 )
 
 var (
@@ -20,12 +22,6 @@ var (
 	minBackupFrequency = time.Minute
 
 	excludedDataFromTables = []string{
-		"job_runs",
-		"task_runs",
-		"eth_task_run_txes",
-		"run_requests",
-		"run_results",
-		"sync_events",
 		"pipeline_runs",
 		"pipeline_task_runs",
 	}
@@ -40,92 +36,125 @@ type backupResult struct {
 
 type (
 	DatabaseBackup interface {
-		Start() error
-		Close() error
-		RunBackupGracefully(version string)
+		services.Service
+		RunBackup(version string) error
 	}
 
 	databaseBackup struct {
-		logger          *logger.Logger
+		services.StateMachine
+		logger          logger.Logger
 		databaseURL     url.URL
-		mode            orm.DatabaseBackupMode
+		mode            config.DatabaseBackupMode
 		frequency       time.Duration
 		outputParentDir string
 		done            chan bool
 	}
 
-	Config interface {
-		DatabaseBackupMode() orm.DatabaseBackupMode
-		DatabaseBackupFrequency() time.Duration
-		DatabaseBackupURL() *url.URL
-		DatabaseURL() url.URL
-		RootDir() string
+	BackupConfig interface {
+		URL() *url.URL
+		Dir() string
+		Mode() config.DatabaseBackupMode
+		Frequency() time.Duration
 	}
 )
 
-func NewDatabaseBackup(config Config, logger *logger.Logger) DatabaseBackup {
-	dbUrl := config.DatabaseURL()
-	dbBackupUrl := config.DatabaseBackupURL()
-	if dbBackupUrl != nil {
-		dbUrl = *dbBackupUrl
-	}
-	return &databaseBackup{
-		logger,
-		dbUrl,
-		config.DatabaseBackupMode(),
-		config.DatabaseBackupFrequency(),
-		config.RootDir(),
-		make(chan bool),
-	}
-}
-
-func (backup databaseBackup) Start() error {
-
-	if backup.frequencyIsTooSmall() {
-		return errors.Errorf("Database backup frequency (%s=%v) is too small. Please set it to at least %s", "DATABASE_BACKUP_FREQUENCY", backup.frequency, minBackupFrequency)
+// NewDatabaseBackup instantiates a *databaseBackup
+func NewDatabaseBackup(dbURL url.URL, rootDir string, backupConfig BackupConfig, lggr logger.Logger) (DatabaseBackup, error) {
+	lggr = logger.Named(lggr, "DatabaseBackup")
+	dbBackupURL := backupConfig.URL()
+	if dbBackupURL != nil {
+		dbURL = *dbBackupURL
 	}
 
-	ticker := time.NewTicker(backup.frequency)
-
-	go func() {
-		for {
-			select {
-			case <-backup.done:
-				ticker.Stop()
-				return
-			case <-ticker.C:
-				backup.RunBackupGracefully(static.Version)
-			}
+	outputParentDir := filepath.Join(rootDir, "backup")
+	if backupConfig.Dir() != "" {
+		dir, err := filepath.Abs(backupConfig.Dir())
+		if err != nil {
+			return nil, errors.Errorf("failed to get path for Database.Backup.Dir (%s) - please set it to a valid directory path", backupConfig.Dir())
 		}
-	}()
+		outputParentDir = dir
+	}
 
-	return nil
+	return &databaseBackup{
+		services.StateMachine{},
+		lggr,
+		dbURL,
+		backupConfig.Mode(),
+		backupConfig.Frequency(),
+		outputParentDir,
+		make(chan bool),
+	}, nil
 }
 
-func (backup databaseBackup) Close() error {
-	backup.done <- true
-	return nil
+// Start starts DatabaseBackup.
+func (backup *databaseBackup) Start(context.Context) error {
+	return backup.StartOnce("DatabaseBackup", func() (err error) {
+		ticker := time.NewTicker(backup.frequency)
+		if backup.frequency == 0 {
+			backup.logger.Info("Periodic database backups are disabled; Database.Backup.Frequency was set to 0")
+			// Stopping the ticker means it will never fire, effectively disabling periodic backups
+			ticker.Stop()
+		} else if backup.frequencyIsTooSmall() {
+			return errors.Errorf("Database backup frequency (%s=%v) is too small. Please set it to at least %s (or set to 0 to disable periodic backups)", "Database.Backup.Frequency", backup.frequency, minBackupFrequency)
+		}
+
+		go func() {
+			for {
+				select {
+				case <-backup.done:
+					ticker.Stop()
+					return
+				case <-ticker.C:
+					backup.logger.Infow("Starting automatic database backup, this can take a while. To disable periodic backups, set Database.Backup.Frequency=0. To disable database backups entirely, set Database.Backup.Mode=none.")
+					//nolint:errcheck // backup failure is surfaced via the logger and SvcErrBuffer
+					backup.RunBackup(static.Version)
+				}
+			}
+		}()
+
+		return nil
+	})
+}
+
+func (backup *databaseBackup) Close() error {
+	return backup.StopOnce("DatabaseBackup", func() (err error) {
+		backup.done <- true
+		return nil
+	})
+}
+
+func (backup *databaseBackup) Name() string {
+	return backup.logger.Name()
+}
+
+func (backup *databaseBackup) HealthReport() map[string]error {
+	return map[string]error{backup.Name(): backup.Healthy()}
 }
 
 func (backup *databaseBackup) frequencyIsTooSmall() bool {
 	return backup.frequency < minBackupFrequency
 }
 
-func (backup *databaseBackup) RunBackupGracefully(version string) {
-	backup.logger.Debugw("DatabaseBackup: Starting database backup...", "mode", backup.mode, "url", backup.databaseURL.String(), "directory", backup.outputParentDir)
+func (backup *databaseBackup) RunBackup(version string) error {
+	backup.logger.Debugw("Starting backup", "mode", backup.mode, "directory", backup.outputParentDir)
 	startAt := time.Now()
 	result, err := backup.runBackup(version)
 	duration := time.Since(startAt)
 	if err != nil {
-		backup.logger.Errorw("DatabaseBackup: Failed", "duration", duration, "error", err)
-	} else {
-		backup.logger.Infow("DatabaseBackup: Database backup finished successfully.", "duration", duration, "fileSize", result.size, "filePath", result.path)
+		logger.Sugared(backup.logger).Criticalw("Backup failed", "duration", duration, "err", err)
+		backup.SvcErrBuffer.Append(err)
+		return err
 	}
+	backup.logger.Infow("Backup completed successfully.", "duration", duration, "fileSize", result.size, "filePath", result.path)
+	return nil
 }
 
 func (backup *databaseBackup) runBackup(version string) (*backupResult, error) {
-
-	tmpFile, err := ioutil.TempFile(backup.outputParentDir, "cl_backup_tmp_")
+	err := os.MkdirAll(backup.outputParentDir, os.ModePerm)
+	if err != nil {
+		return nil, errors.Wrapf(err, "Failed to create directories on the path: %s", backup.outputParentDir)
+	}
+	tmpFile, err := os.CreateTemp(backup.outputParentDir, "cl_backup_tmp_")
 	if err != nil {
 		return nil, errors.Wrap(err, "Failed to create a tmp file")
 	}
@@ -140,9 +169,9 @@ func (backup *databaseBackup) runBackup(version string) (*backupResult, error) {
 		"-F", "c", // format: custom (zipped)
 	}
 
-	if backup.mode == orm.DatabaseBackupModeLite {
+	if backup.mode == config.DatabaseBackupModeLite {
 		for _, table := range excludedDataFromTables {
-			args = append(args, fmt.Sprintf("--exclude-table-data=%s", table))
+			args = append(args, "--exclude-table-data="+table)
 		}
 	}
 
@@ -154,14 +183,13 @@ func (backup *databaseBackup) runBackup(version string) (*backupResult, error) {
 	}
 
 	maskedArgs := maskArgs(args)
-	backup.logger.Debugf("DatabaseBackup: Running pg_dump with: %v", maskedArgs)
+	backup.logger.Debugf("Running pg_dump with: %v", maskedArgs)
 
-	cmd := exec.Command(
+	cmd := exec.CommandContext(context.Background(),
 		"pg_dump", args...,
 	)
 
 	_, err = cmd.Output()
-
 	if err != nil {
 		partialResult := &backupResult{
 			size:            0,
@@ -169,8 +197,9 @@ func (backup *databaseBackup) runBackup(version string) (*backupResult, error) {
 			maskedArguments: maskedArgs,
 			pgDumpArguments: args,
 		}
-		if ee, ok := err.(*exec.ExitError); ok {
-			return partialResult, errors.Wrap(err, fmt.Sprintf("pg_dump failed with output: %s", string(ee.Stderr)))
+		var ee *exec.ExitError
+		if errors.As(err, &ee) {
+			return partialResult, errors.Wrapf(err, "pg_dump failed with output: %s", string(ee.Stderr))
 		}
 		return partialResult, errors.Wrap(err, "pg_dump failed")
 	}

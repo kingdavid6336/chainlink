@@ -4,21 +4,25 @@ import (
 	"bytes"
 	"encoding/json"
 	"net/http"
+	"strconv"
 	"testing"
 
-	"github.com/bmizerany/assert"
-	"github.com/smartcontractkit/chainlink/core/internal/cltest"
-	"github.com/smartcontractkit/chainlink/core/services/eth"
-	"github.com/smartcontractkit/chainlink/core/web"
-	"github.com/smartcontractkit/chainlink/core/web/presenters"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap/zapcore"
+
+	"github.com/smartcontractkit/chainlink/v2/core/config/toml"
+	"github.com/smartcontractkit/chainlink/v2/core/internal/cltest"
+	"github.com/smartcontractkit/chainlink/v2/core/internal/testutils/configtest"
+	"github.com/smartcontractkit/chainlink/v2/core/services/chainlink"
+	"github.com/smartcontractkit/chainlink/v2/core/web"
+	"github.com/smartcontractkit/chainlink/v2/core/web/presenters"
 )
 
 type testCase struct {
 	Description string
 	logLevel    string
-	logSql      *bool
+	logSQL      *bool
 
 	expectedLogLevel  zapcore.Level
 	expectedLogSQL    bool
@@ -28,44 +32,38 @@ type testCase struct {
 func TestLogController_GetLogConfig(t *testing.T) {
 	t.Parallel()
 
-	rpcClient, gethClient, _, assertMocksCalled := cltest.NewEthMocksWithStartupAssertions(t)
-	defer assertMocksCalled()
-	app, cleanup := cltest.NewApplicationWithKey(t,
-		eth.NewClientWith(rpcClient, gethClient),
-	)
+	cfg := configtest.NewGeneralConfig(t, func(c *chainlink.Config, s *chainlink.Secrets) {
+		c.Log.Level = new(toml.LogLevel(zapcore.WarnLevel))
+		c.Database.LogQueries = new(true)
+	})
 
-	// Set log config values
-	logLevel := "warn"
-	sqlEnabled := true
-	app.GetStore().Config.Set("LOG_LEVEL", logLevel)
-	app.GetStore().Config.Set("LOG_SQL", sqlEnabled)
+	app := cltest.NewApplicationWithConfig(t, cfg)
+	require.NoError(t, app.Start(t.Context()))
 
-	defer cleanup()
-	require.NoError(t, app.Start())
-	client := app.NewHTTPClient()
+	client := app.NewHTTPClient(nil)
 
-	resp, err := client.HTTPClient.Get("/v2/log")
-	require.NoError(t, err)
+	resp, clean := client.Get("/v2/log")
+	t.Cleanup(clean)
 
-	lR := presenters.LogResource{}
+	svcLogConfig := presenters.ServiceLogConfigResource{}
 	cltest.AssertServerResponse(t, resp, http.StatusOK)
-	require.NoError(t, cltest.ParseJSONAPIResponse(t, resp, &lR))
+	cltest.ParseJSONAPIResponse(t, resp, &svcLogConfig)
 
-	assert.Equal(t, lR.SqlEnabled, sqlEnabled)
-	assert.Equal(t, lR.Level, logLevel)
+	require.Equal(t, "warn", svcLogConfig.DefaultLogLevel)
+
+	for i, svcName := range svcLogConfig.ServiceName {
+		if svcName == "Global" {
+			assert.Equal(t, zapcore.WarnLevel.String(), svcLogConfig.LogLevel[i])
+		}
+
+		if svcName == "IsSqlEnabled" {
+			assert.Equal(t, strconv.FormatBool(true), svcLogConfig.LogLevel[i])
+		}
+	}
 }
 
 func TestLogController_PatchLogConfig(t *testing.T) {
 	t.Parallel()
-
-	rpcClient, gethClient, _, assertMocksCalled := cltest.NewEthMocksWithStartupAssertions(t)
-	defer assertMocksCalled()
-	app, cleanup := cltest.NewApplicationWithKey(t,
-		eth.NewClientWith(rpcClient, gethClient),
-	)
-	defer cleanup()
-	require.NoError(t, app.Start())
-	client := app.NewHTTPClient()
 
 	sqlTrue := true
 	sqlFalse := false
@@ -73,26 +71,26 @@ func TestLogController_PatchLogConfig(t *testing.T) {
 		{
 			Description:      "Set log level to debug",
 			logLevel:         "debug",
-			logSql:           nil,
+			logSQL:           nil,
 			expectedLogLevel: zapcore.DebugLevel,
 		},
 		{
 			Description:      "Set log level to info",
 			logLevel:         "info",
-			logSql:           nil,
+			logSQL:           nil,
 			expectedLogLevel: zapcore.InfoLevel,
 		},
 		{
 			Description:      "Set log level to info and log sql to true",
 			logLevel:         "info",
-			logSql:           &sqlTrue,
+			logSQL:           &sqlTrue,
 			expectedLogLevel: zapcore.InfoLevel,
 			expectedLogSQL:   true,
 		},
 		{
 			Description:      "Set log level to warn and log sql to false",
 			logLevel:         "warn",
-			logSql:           &sqlFalse,
+			logSQL:           &sqlFalse,
 			expectedLogLevel: zapcore.WarnLevel,
 			expectedLogSQL:   false,
 		},
@@ -108,28 +106,37 @@ func TestLogController_PatchLogConfig(t *testing.T) {
 	}
 
 	for _, tc := range cases {
-		request := web.LogPatchRequest{Level: tc.logLevel, SqlEnabled: tc.logSql}
+		t.Run(tc.Description, func(t *testing.T) {
+			t.Parallel()
+			app := cltest.NewApplicationEVMDisabled(t)
+			require.NoError(t, app.Start(t.Context()))
+			client := app.NewHTTPClient(nil)
 
-		requestData, _ := json.Marshal(request)
-		buf := bytes.NewBuffer(requestData)
+			request := web.LogPatchRequest{Level: tc.logLevel, SQLEnabled: tc.logSQL}
 
-		resp, cleanup := client.Patch("/v2/log", buf)
-		defer cleanup()
+			requestData, _ := json.Marshal(request)
+			buf := bytes.NewBuffer(requestData)
 
-		lR := presenters.LogResource{}
-		if tc.expectedErrorCode != 0 {
-			cltest.AssertServerResponse(t, resp, tc.expectedErrorCode)
-		} else {
-			cltest.AssertServerResponse(t, resp, http.StatusOK)
-			require.NoError(t, cltest.ParseJSONAPIResponse(t, resp, &lR))
-			if tc.logLevel != "" {
-				assert.Equal(t, tc.expectedLogLevel.String(), lR.Level)
+			resp, cleanup := client.Patch("/v2/log", buf)
+			defer cleanup()
+
+			svcLogConfig := presenters.ServiceLogConfigResource{}
+			if tc.expectedErrorCode != 0 {
+				cltest.AssertServerResponse(t, resp, tc.expectedErrorCode)
+			} else {
+				cltest.AssertServerResponse(t, resp, http.StatusOK)
+				cltest.ParseJSONAPIResponse(t, resp, &svcLogConfig)
+
+				for i, svcName := range svcLogConfig.ServiceName {
+					if svcName == "Global" {
+						assert.Equal(t, tc.expectedLogLevel.String(), svcLogConfig.LogLevel[i])
+					}
+
+					if svcName == "IsSqlEnabled" {
+						assert.Equal(t, strconv.FormatBool(tc.expectedLogSQL), svcLogConfig.LogLevel[i])
+					}
+				}
 			}
-			if tc.logSql != nil {
-				assert.Equal(t, tc.logSql, &lR.SqlEnabled)
-				assert.Equal(t, &tc.expectedLogSQL, &lR.SqlEnabled)
-			}
-			assert.Equal(t, tc.expectedLogLevel.String(), app.GetStore().Config.LogLevel().String())
-		}
+		})
 	}
 }

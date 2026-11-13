@@ -4,15 +4,10 @@ tmp/
 .pnp
 .pnp.js
 tools/bin/abigen
+tools/test/.bin/
 
 /chainlink
 core/chainlink
-
-# GUI
-operator_ui/dist
-operator_ui/artifacts
-*-packr.go
-
 
 # SQLite
 tools/clroot/db.sqlite3-shm
@@ -29,7 +24,20 @@ tools/clroot/db.sqlite3-wal
 .DS_Store
 .envrc
 .env*
-.idea 
+.dbenv
+!.github/actions/setup-postgres/.env
+/.github/.agents/skills/**/trials/
+.direnv
+.idea
+.vscode/
+*.iml
+debug.env
+operator_ui/install
+.devenv
+event_dump.ndjson
+
+# neovim
+.nvim.lua
 
 # codeship
 *.aes
@@ -41,3 +49,93 @@ gcr_creds.env
 # DB backups
 
 cl_backup_*.tar.gz
+
+# Test artifacts
+core/cmd/TestClient_ImportExportP2PKeyBundle_test_key.json
+race.*
+*output.txt
+/golangci-lint/
+.covdata
+temp-repo
+diagnose-*/
+diagnose-attempted-fixes-*.jsonl
+
+# DB state
+./db/
+.s.PGSQL.5432.lock
+
+# can be left behind by tests
+core/cmd/vrfkey1
+
+# Integration Tests
+integration-tests/**/logs/
+tests-*.xml
+*.test
+tmp-manifest-*.yaml
+ztarrepo.tar.gz
+**/test-ledger/*
+__debug_bin*
+.test_summary/
+db_dumps/
+.run.id
+integration-tests/**/traces/
+integration-tests/**/integration-tests
+benchmark_report.csv
+benchmark_summary.json
+secrets.toml
+tmp_laneconfig/
+solana_contracts
+
+# Test & linter reports
+*report.xml
+*report.json
+*.out
+dot_graphs/
+
+contracts/yarn.lock
+
+# Ignore DevSpace cache and log folder
+.devspace/
+go.work*
+
+# This sometimes shows up for some reason
+tools/flakeytests/coverage.txt
+
+# Runtime test configuration that might contain secrets
+override*.toml
+
+# Python venv
+.venv/
+__pycache__/
+
+ocr_soak_report.csv
+
+vendor/*
+
+*.wasm
+contracts/lcov.info
+contracts/out/
+/cache
+/.wasm-cache/
+
+# Used by plugins/chainlink.prebuilt.Dockerfile
+/bin/
+/lib/
+/build/bin/
+/build/lib/
+/tools/**/bin/
+/tools/**/.bin/
+
+# artifacts of CRE environment creation or CRE CLI usage
+core/scripts/cre/environment/*.yaml
+core/scripts/cre/environment/*.yml
+core/scripts/cre/environment/logs/
+core/scripts/cre/environment/cron
+core/scripts/cre/environment/binaries/*
+*.br.b64
+
+# AI Agent settings
+.claude/
+.cursor/
+.gemini/
+opencode.json

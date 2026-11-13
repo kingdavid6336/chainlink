@@ -6,201 +6,198 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	"github.com/smartcontractkit/chainlink/core/services/eth"
-
-	"github.com/smartcontractkit/chainlink/core/auth"
-	"github.com/smartcontractkit/chainlink/core/internal/cltest"
-	"github.com/smartcontractkit/chainlink/core/store/models"
-	"github.com/smartcontractkit/chainlink/core/web"
-
+	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/smartcontractkit/chainlink/v2/core/auth"
+	"github.com/smartcontractkit/chainlink/v2/core/bridges"
+	"github.com/smartcontractkit/chainlink/v2/core/internal/cltest"
+	clhttptest "github.com/smartcontractkit/chainlink/v2/core/internal/testutils/httptest"
+	"github.com/smartcontractkit/chainlink/v2/core/web"
 )
 
 func TestTokenAuthRequired_NoCredentials(t *testing.T) {
-	rpcClient, gethClient, _, assertMocksCalled := cltest.NewEthMocksWithStartupAssertions(t)
-	defer assertMocksCalled()
-	app, cleanup := cltest.NewApplicationWithKey(t,
-		eth.NewClientWith(rpcClient, gethClient),
-	)
-	defer cleanup()
-	require.NoError(t, app.Start())
+	t.Parallel()
 
-	router := web.Router(app)
+	ctx := t.Context()
+	app := cltest.NewApplicationEVMDisabled(t)
+	require.NoError(t, app.Start(ctx))
+
+	router := web.Router(t, app, nil)
 	ts := httptest.NewServer(router)
 	defer ts.Close()
 
-	resp, err := http.Post(ts.URL+"/v2/specs/", web.MediaType, bytes.NewBufferString("{}"))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, ts.URL+"/v2/jobs/", bytes.NewBufferString("{}"))
 	require.NoError(t, err)
+	req.Header.Set("Content-Type", web.MediaType)
+	resp, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	defer resp.Body.Close()
 
 	assert.Equal(t, http.StatusUnauthorized, resp.StatusCode)
 }
 
 func TestTokenAuthRequired_SessionCredentials(t *testing.T) {
-	rpcClient, gethClient, _, assertMocksCalled := cltest.NewEthMocksWithStartupAssertions(t)
-	defer assertMocksCalled()
-	app, cleanup := cltest.NewApplicationWithKey(t,
-		eth.NewClientWith(rpcClient, gethClient),
-	)
-	defer cleanup()
-	require.NoError(t, app.Start())
+	t.Parallel()
 
-	router := web.Router(app)
+	app := cltest.NewApplicationEVMDisabled(t)
+	require.NoError(t, app.Start(t.Context()))
+
+	router := web.Router(t, app, nil)
 	ts := httptest.NewServer(router)
 	defer ts.Close()
 
-	client := app.NewHTTPClient()
-	resp, cleanup := client.Post("/v2/specs/", nil)
+	client := app.NewHTTPClient(nil)
+	resp, cleanup := client.Post("/v2/bridge_types/", nil)
 	defer cleanup()
 
-	assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
+	assert.Equal(t, http.StatusUnprocessableEntity, resp.StatusCode)
 }
 
 func TestTokenAuthRequired_TokenCredentials(t *testing.T) {
-	rpcClient, gethClient, _, assertMocksCalled := cltest.NewEthMocksWithStartupAssertions(t)
-	defer assertMocksCalled()
-	app, cleanup := cltest.NewApplicationWithKey(t,
-		eth.NewClientWith(rpcClient, gethClient),
-	)
-	defer cleanup()
-	require.NoError(t, app.Start())
+	t.Parallel()
 
-	router := web.Router(app)
+	ctx := t.Context()
+	app := cltest.NewApplicationEVMDisabled(t)
+	require.NoError(t, app.Start(ctx))
+
+	router := web.Router(t, app, nil)
 	ts := httptest.NewServer(router)
 	defer ts.Close()
 
 	eia := auth.NewToken()
 	url := cltest.WebURL(t, "http://localhost:8888")
-	eir := &models.ExternalInitiatorRequest{
-		Name: "bitcoin",
+	eir := &bridges.ExternalInitiatorRequest{
+		Name: uuid.New().String(),
 		URL:  &url,
 	}
-	ea, err := models.NewExternalInitiator(eia, eir)
+	ea, err := bridges.NewExternalInitiator(eia, eir)
 	require.NoError(t, err)
-	err = app.GetStore().CreateExternalInitiator(ea)
+	err = app.BridgeORM().CreateExternalInitiator(ctx, ea)
 	require.NoError(t, err)
 
-	request, err := http.NewRequest("GET", ts.URL+"/v2/ping/", bytes.NewBufferString("{}"))
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, ts.URL+"/v2/ping/", bytes.NewBufferString("{}"))
 	require.NoError(t, err)
 	request.Header.Set("Content-Type", web.MediaType)
 	request.Header.Set("X-Chainlink-EA-AccessKey", eia.AccessKey)
 	request.Header.Set("X-Chainlink-EA-Secret", eia.Secret)
 
-	client := http.Client{}
+	client := clhttptest.NewTestLocalOnlyHTTPClient()
 	resp, err := client.Do(request)
 	require.NoError(t, err)
+	defer resp.Body.Close()
 
 	assert.Equal(t, http.StatusOK, resp.StatusCode)
 }
 
 func TestTokenAuthRequired_BadTokenCredentials(t *testing.T) {
-	rpcClient, gethClient, _, assertMocksCalled := cltest.NewEthMocksWithStartupAssertions(t)
-	defer assertMocksCalled()
-	app, cleanup := cltest.NewApplicationWithKey(t,
-		eth.NewClientWith(rpcClient, gethClient),
-	)
-	defer cleanup()
-	require.NoError(t, app.Start())
+	t.Parallel()
 
-	router := web.Router(app)
+	ctx := t.Context()
+	app := cltest.NewApplicationEVMDisabled(t)
+	require.NoError(t, app.Start(ctx))
+
+	router := web.Router(t, app, nil)
 	ts := httptest.NewServer(router)
 	defer ts.Close()
 
 	eia := auth.NewToken()
 	url := cltest.WebURL(t, "http://localhost:8888")
-	eir := &models.ExternalInitiatorRequest{
-		Name: "bitcoin",
+	eir := &bridges.ExternalInitiatorRequest{
+		Name: uuid.New().String(),
 		URL:  &url,
 	}
-	ea, err := models.NewExternalInitiator(eia, eir)
+	ea, err := bridges.NewExternalInitiator(eia, eir)
 	require.NoError(t, err)
-	err = app.GetStore().CreateExternalInitiator(ea)
+	err = app.BridgeORM().CreateExternalInitiator(ctx, ea)
 	require.NoError(t, err)
 
-	request, err := http.NewRequest("GET", ts.URL+"/v2/ping/", bytes.NewBufferString("{}"))
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, ts.URL+"/v2/ping/", bytes.NewBufferString("{}"))
 	require.NoError(t, err)
 	request.Header.Set("Content-Type", web.MediaType)
 	request.Header.Set("X-Chainlink-EA-AccessKey", eia.AccessKey)
 	request.Header.Set("X-Chainlink-EA-Secret", "every unpleasant commercial color from aquamarine to beige")
 
-	client := http.Client{}
+	client := clhttptest.NewTestLocalOnlyHTTPClient()
 	resp, err := client.Do(request)
 	require.NoError(t, err)
+	defer resp.Body.Close()
 
 	assert.Equal(t, http.StatusUnauthorized, resp.StatusCode)
 }
 
 func TestSessions_RateLimited(t *testing.T) {
-	rpcClient, gethClient, _, assertMocksCalled := cltest.NewEthMocksWithStartupAssertions(t)
-	defer assertMocksCalled()
-	app, cleanup := cltest.NewApplicationWithKey(t,
-		eth.NewClientWith(rpcClient, gethClient),
-	)
-	defer cleanup()
-	require.NoError(t, app.Start())
+	t.Parallel()
 
-	router := web.Router(app)
+	ctx := t.Context()
+	app := cltest.NewApplicationEVMDisabled(t)
+	require.NoError(t, app.Start(ctx))
+
+	router := web.Router(t, app, nil)
 	ts := httptest.NewServer(router)
 	defer ts.Close()
 
-	client := http.Client{}
+	client := clhttptest.NewTestLocalOnlyHTTPClient()
 	input := `{"email":"brute@force.com", "password": "wrongpassword"}`
 
-	for i := 0; i < 5; i++ {
-		request, err := http.NewRequest("POST", ts.URL+"/sessions", bytes.NewBufferString(input))
+	for range 5 {
+		request, err := http.NewRequestWithContext(ctx, http.MethodPost, ts.URL+"/sessions", bytes.NewBufferString(input))
 		require.NoError(t, err)
 
 		resp, err := client.Do(request)
 		require.NoError(t, err)
 		assert.Equal(t, http.StatusUnauthorized, resp.StatusCode)
+		_ = resp.Body.Close()
 	}
 
-	request, err := http.NewRequest("POST", ts.URL+"/sessions", bytes.NewBufferString(input))
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, ts.URL+"/sessions", bytes.NewBufferString(input))
 	require.NoError(t, err)
 
 	resp, err := client.Do(request)
 	require.NoError(t, err)
+	defer resp.Body.Close()
 	assert.Equal(t, 429, resp.StatusCode)
 }
 
 func TestRouter_LargePOSTBody(t *testing.T) {
-	rpcClient, gethClient, _, assertMocksCalled := cltest.NewEthMocksWithStartupAssertions(t)
-	defer assertMocksCalled()
-	app, cleanup := cltest.NewApplicationWithKey(t,
-		eth.NewClientWith(rpcClient, gethClient),
-	)
-	defer cleanup()
-	require.NoError(t, app.Start())
+	t.Parallel()
 
-	router := web.Router(app)
+	ctx := t.Context()
+	app := cltest.NewApplicationEVMDisabled(t)
+	require.NoError(t, app.Start(ctx))
+
+	router := web.Router(t, app, nil)
 	ts := httptest.NewServer(router)
 	defer ts.Close()
 
-	client := http.Client{}
+	client := clhttptest.NewTestLocalOnlyHTTPClient()
 
 	body := string(make([]byte, 70000))
-	request, err := http.NewRequest("POST", ts.URL+"/sessions", bytes.NewBufferString(body))
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, ts.URL+"/sessions", bytes.NewBufferString(body))
 	require.NoError(t, err)
 
 	resp, err := client.Do(request)
 	require.NoError(t, err)
+	defer resp.Body.Close()
 	assert.Equal(t, http.StatusRequestEntityTooLarge, resp.StatusCode)
 }
 
 func TestRouter_GinHelmetHeaders(t *testing.T) {
-	rpcClient, gethClient, _, assertMocksCalled := cltest.NewEthMocksWithStartupAssertions(t)
-	defer assertMocksCalled()
-	app, cleanup := cltest.NewApplicationWithKey(t,
-		eth.NewClientWith(rpcClient, gethClient),
-	)
-	defer cleanup()
-	require.NoError(t, app.Start())
+	t.Parallel()
 
-	router := web.Router(app)
+	ctx := t.Context()
+	app := cltest.NewApplicationEVMDisabled(t)
+	require.NoError(t, app.Start(ctx))
+
+	router := web.Router(t, app, nil)
 	ts := httptest.NewServer(router)
 	defer ts.Close()
-	res, err := http.Get(ts.URL)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, ts.URL, nil)
 	require.NoError(t, err)
+	res, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	defer res.Body.Close()
 	for _, tt := range []struct {
 		HelmetName  string
 		HeaderKey   string

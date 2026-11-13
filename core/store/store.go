@@ -2,296 +2,318 @@ package store
 
 import (
 	"context"
+	crand "crypto/rand"
+	"database/sql"
+	_ "embed"
+	"errors"
 	"fmt"
-	"math/rand"
-	"os"
-	"path/filepath"
+	"math/big"
+	"net/url"
+	"os/exec"
+	"strings"
 	"sync"
+	"time"
 
-	"github.com/coreos/go-semver/semver"
-	"github.com/smartcontractkit/chainlink/core/logger"
-	"github.com/smartcontractkit/chainlink/core/services/periodicbackup"
-	"github.com/smartcontractkit/chainlink/core/static"
+	"github.com/jmoiron/sqlx"
+	"github.com/kylelemons/godebug/diff"
+	"github.com/lib/pq"
+	"gopkg.in/guregu/null.v4"
 
-	"github.com/smartcontractkit/chainlink/core/gracefulpanic"
-	"github.com/smartcontractkit/chainlink/core/services/eth"
-	"github.com/smartcontractkit/chainlink/core/services/offchainreporting"
-	"github.com/smartcontractkit/chainlink/core/services/postgres"
-	"github.com/smartcontractkit/chainlink/core/store/migrations"
-	"github.com/smartcontractkit/chainlink/core/store/models"
-	"github.com/smartcontractkit/chainlink/core/store/orm"
-	"github.com/smartcontractkit/chainlink/core/utils"
-
-	"github.com/ethereum/go-ethereum/common"
-	"github.com/pkg/errors"
-	"go.uber.org/multierr"
-	"gorm.io/gorm"
+	"github.com/smartcontractkit/chainlink-common/pkg/logger"
+	"github.com/smartcontractkit/chainlink-common/pkg/sqlutil"
+	pgcommon "github.com/smartcontractkit/chainlink-common/pkg/sqlutil/pg"
+	cutils "github.com/smartcontractkit/chainlink-common/pkg/utils"
+	"github.com/smartcontractkit/chainlink/v2/core/services/pg"
+	"github.com/smartcontractkit/chainlink/v2/core/store/migrate"
 )
 
-const (
-	// AutoMigrate is a flag that automatically migrates the DB when passed to initializeORM
-	AutoMigrate = "auto_migrate"
-)
+//go:embed fixtures/fixtures.sql
+var fixturesSQL string
 
-// NotifyNewEthTx allows to notify the ethBroadcaster of a new transaction
-//go:generate mockery --name NotifyNewEthTx --output ../internal/mocks/ --case=underscore
-type NotifyNewEthTx interface {
-	Trigger()
-}
+//go:embed fixtures/users_only_fixture.sql
+var usersOnlyFixtureSQL string
 
-// Store contains fields for the database, Config, and KeyStore
-// for keeping the application state in sync with the database.
-type Store struct {
-	*orm.ORM
-	Config         *orm.Config
-	Clock          utils.AfterNower
-	KeyStore       KeyStoreInterface
-	VRFKeyStore    *VRFKeyStore
-	OCRKeyStore    *offchainreporting.KeyStore
-	EthClient      eth.Client
-	NotifyNewEthTx NotifyNewEthTx
-	AdvisoryLocker postgres.AdvisoryLocker
-	closeOnce      *sync.Once
-}
+func FixturesSQL() string { return fixturesSQL }
 
-type KeyStoreGenerator func(*orm.Config) *KeyStore
-
-func StandardKeyStoreGen(config *orm.Config) *KeyStore {
-	scryptParams := utils.GetScryptParams(config)
-	return NewKeyStore(config.KeysDir(), scryptParams)
-}
-
-func InsecureKeyStoreGen(config *orm.Config) *KeyStore {
-	return NewInsecureKeyStore(config.KeysDir())
-}
-
-// NewStore will create a new store
-func NewStore(config *orm.Config, ethClient eth.Client, advisoryLock postgres.AdvisoryLocker, shutdownSignal gracefulpanic.Signal, keyStoreGenerator KeyStoreGenerator) (*Store, error) {
-	return newStoreWithKeyStore(config, ethClient, advisoryLock, keyStoreGenerator, shutdownSignal)
-}
-
-// NewInsecureStore creates a new store with the given config using an insecure keystore.
-// NOTE: Should only be used for testing!
-func NewInsecureStore(config *orm.Config, ethClient eth.Client, advisoryLocker postgres.AdvisoryLocker, shutdownSignal gracefulpanic.Signal) (*Store, error) {
-	return newStoreWithKeyStore(config, ethClient, advisoryLocker, InsecureKeyStoreGen, shutdownSignal)
-}
-
-// TODO(sam): Remove ethClient from here completely after legacy tx manager is gone
-// See: https://www.pivotaltracker.com/story/show/175493792
-func newStoreWithKeyStore(
-	config *orm.Config,
-	ethClient eth.Client,
-	advisoryLocker postgres.AdvisoryLocker,
-	keyStoreGenerator KeyStoreGenerator,
-	shutdownSignal gracefulpanic.Signal,
-) (*Store, error) {
-	if err := utils.EnsureDirAndMaxPerms(config.RootDir(), os.FileMode(0700)); err != nil {
-		return nil, errors.Wrap(err, "error while creating project root dir")
-	}
-
-	orm, err := initializeORM(config, shutdownSignal)
-	if err != nil {
-		return nil, errors.Wrap(err, "failed to initialize ORM")
-	}
-	if e := orm.ClobberDiskKeyStoreWithDBKeys(config.KeysDir()); e != nil {
-		return nil, errors.Wrap(err, "error migrating key store to disk")
-	}
-
-	keyStore := keyStoreGenerator(config)
-	scryptParams := utils.GetScryptParams(config)
-
-	store := &Store{
-		Clock:          utils.Clock{},
-		AdvisoryLocker: advisoryLocker,
-		Config:         config,
-		KeyStore:       keyStore,
-		OCRKeyStore:    offchainreporting.NewKeyStore(orm.DB, scryptParams),
-		ORM:            orm,
-		EthClient:      ethClient,
-		closeOnce:      &sync.Once{},
-	}
-	store.VRFKeyStore = NewVRFKeyStore(store)
-	return store, nil
-}
-
-// Start initiates all of Store's dependencies
-func (s *Store) Start() error {
-	return s.SyncDiskKeyStoreToDB()
-}
-
-// Close shuts down all of the working parts of the store.
-func (s *Store) Close() error {
-	var err error
-	s.closeOnce.Do(func() {
-		err = s.ORM.Close()
-		err = multierr.Append(err, s.AdvisoryLocker.Close())
-	})
-	return err
-}
-
-// Unscoped returns a shallow copy of the store, with an unscoped ORM allowing
-// one to work with soft deleted records.
-func (s *Store) Unscoped() *Store {
-	cpy := *s
-	cpy.ORM = s.ORM.Unscoped()
-	return &cpy
-}
-
-// AuthorizedUserWithSession will return the one API user if the Session ID exists
-// and hasn't expired, and update session's LastUsed field.
-func (s *Store) AuthorizedUserWithSession(sessionID string) (models.User, error) {
-	return s.ORM.AuthorizedUserWithSession(
-		sessionID, s.Config.SessionTimeout().Duration())
-}
-
-// SyncDiskKeyStoreToDB writes all keys in the keys directory to the underlying
-// orm.
-func (s *Store) SyncDiskKeyStoreToDB() error {
-	files, err := utils.FilesInDir(s.Config.KeysDir())
-	if err != nil {
-		return multierr.Append(errors.New("unable to sync disk keystore to db"), err)
-	}
-
-	var merr error
-	for _, f := range files {
-		key, err := models.NewKeyFromFile(filepath.Join(s.Config.KeysDir(), f))
-		if err != nil {
-			merr = multierr.Append(err, merr)
-			continue
-		}
-
-		err = s.CreateKeyIfNotExists(key)
-		if err != nil {
-			merr = multierr.Append(err, merr)
-		}
-	}
-	return merr
-}
-
-// DeleteKey hard-deletes a key whose address matches the supplied address.
-func (s *Store) DeleteKey(address common.Address) error {
-	return postgres.GormTransaction(context.Background(), s.ORM.DB, func(tx *gorm.DB) error {
-		err := tx.Where("address = ?", address).Delete(&models.Key{}).Error
-		if err != nil {
-			return errors.Wrap(err, "while deleting ETH key from DB")
-		}
-		return s.KeyStore.Delete(address)
-	})
-}
-
-// ArchiveKey soft-deletes a key whose address matches the supplied address.
-func (s *Store) ArchiveKey(address common.Address) error {
-	err := s.ORM.DB.Where("address = ?", address).Delete(&models.Key{}).Error
+func PrepareTestDB(lggr logger.Logger, dbURL url.URL, userOnly bool) error {
+	db, err := sqlx.Open(pgcommon.DriverPostgres, dbURL.String())
 	if err != nil {
 		return err
 	}
+	defer db.Close()
+	// we no longer create chainlink_test_pristine since pgtestdb handles template caching
 
-	acct, err := s.KeyStore.GetAccountByAddress(address)
+	fixtures := fixturesSQL
+	if userOnly {
+		fixtures = usersOnlyFixtureSQL
+	}
+	if err = insertFixtures(dbURL, fixtures); err != nil {
+		return err
+	}
+	if err = dropDanglingTestDBs(lggr, db); err != nil {
+		return err
+	}
+	return randomizeTestDBSequences(db)
+}
+
+func ResetDatabase(ctx context.Context, lggr logger.Logger, cfg Config, force, deterministic bool) error {
+	u := cfg.URL()
+	lggr.Infof("Resetting database: %#v", u.String())
+	lggr.Debugf("Dropping and recreating database: %#v", u.String())
+	if err := dropAndCreateDB(u, force); err != nil {
+		return err
+	}
+	lggr.Debugf("Migrating database: %#v", u.String())
+	if err := migrateDB(ctx, cfg); err != nil {
+		return err
+	}
+	var restrictKey string
+	if deterministic {
+		restrictKey = "chainlinktestrestrictkey"
+	}
+	schema, err := dumpSchema(u, restrictKey)
 	if err != nil {
 		return err
 	}
-
-	archivedKeysDir := filepath.Join(s.Config.RootDir(), "archivedkeys")
-	err = utils.EnsureDirAndMaxPerms(archivedKeysDir, os.FileMode(0700))
-	if err != nil {
-		return errors.Wrap(err, "could not create "+archivedKeysDir)
+	lggr.Debugf("Testing rollback and re-migrate for database: %#v", u.String())
+	var baseVersionID int64 = 54
+	if err := downAndUpDB(ctx, cfg, baseVersionID); err != nil {
+		return err
 	}
-
-	basename := filepath.Base(acct.URL.Path)
-	dst := filepath.Join(archivedKeysDir, basename)
-	err = utils.CopyFileWithMaxPerms(acct.URL.Path, dst, os.FileMode(0700))
-	if err != nil {
-		return errors.Wrap(err, "could not copy "+acct.URL.Path+" to "+dst)
-	}
-
-	return s.KeyStore.Delete(address)
+	return checkSchema(u, schema, restrictKey)
 }
 
-func (s *Store) ImportKey(keyJSON []byte, oldPassword string) error {
-	return postgres.GormTransaction(context.Background(), s.ORM.DB, func(tx *gorm.DB) error {
-		_, err := s.KeyStore.Import(keyJSON, oldPassword)
-		if err != nil {
-			return err
-		}
-		return s.SyncDiskKeyStoreToDB()
-	})
+type Config interface {
+	DefaultIdleInTxSessionTimeout() time.Duration
+	DefaultLockTimeout() time.Duration
+	MaxOpenConns() int
+	MaxIdleConns() int
+	URL() url.URL
+	DriverName() string
 }
 
-func CheckSquashUpgrade(db *gorm.DB) error {
-	// Ensure that we don't try to run a node version later than the
-	// squashed database versions without first migrating up to just before the squash.
-	// If we don't see the latest migration and node version >= S, error and recommend
-	// first running version S - 1 (S = version in which migrations are squashed).
-	if static.Version == "unset" {
-		return nil
+var errDBURLMissing = errors.New("you must set CL_DATABASE_URL env variable or provide a secrets TOML with Database.URL set; if you are running this to set up your local test database, try CL_DATABASE_URL=postgresql://postgres@localhost:5432/chainlink_test?sslmode=disable")
+
+func NewConnection(ctx context.Context, cfg Config) (*sqlx.DB, error) {
+	parsed := cfg.URL()
+	if parsed.String() == "" {
+		return nil, errDBURLMissing
 	}
-	squashVersionMinus1 := semver.New("0.9.10")
-	currentVersion, err := semver.NewVersion(static.Version)
+	return pg.NewConnection(ctx, parsed.String(), cfg.DriverName(), cfg)
+}
+
+func migrateDB(ctx context.Context, config Config) error {
+	db, err := NewConnection(ctx, config)
 	if err != nil {
-		return errors.Wrapf(err, "expected VERSION to be valid semver (for example 1.42.3). Got: %s", static.Version)
+		return fmt.Errorf("failed to initialize orm: %w", err)
 	}
-	lastV1Migration := "1611847145"
-	if squashVersionMinus1.LessThan(*currentVersion) {
-		// Completely empty database is fine to run squashed migrations on
-		if !db.Migrator().HasTable("migrations") {
-			return nil
+
+	if err = migrate.Migrate(ctx, db.DB); err != nil {
+		return fmt.Errorf("migrateDB failed: %w", err)
+	}
+	return db.Close()
+}
+
+func dropAndCreateDB(parsed url.URL, _ bool) (err error) {
+	// Cannot drop the database if we are connected to it, so we must connect
+	// to a different one. template1 should be present on all postgres installations
+	dbname := parsed.Path[1:]
+	parsed.Path = "/template1"
+	db, err := sql.Open(pgcommon.DriverPostgres, parsed.String())
+	if err != nil {
+		return fmt.Errorf("unable to open postgres database for creating test db: %w", err)
+	}
+	defer func() {
+		if cerr := db.Close(); cerr != nil {
+			err = errors.Join(err, cerr)
 		}
-		// Running code later than S - 1. Ensure that we see
-		// the last v1 migration.
-		q := db.Exec("SELECT * FROM migrations WHERE id = ?", lastV1Migration)
-		if q.Error != nil {
-			return q.Error
-		}
-		if q.RowsAffected == 0 {
-			// Do not have the S-1 migration.
-			return errors.Errorf("Need to upgrade to chainlink version %v first before upgrading to version %v in order to run migrations", squashVersionMinus1, currentVersion)
-		}
+	}()
+	// DROP ... WITH (FORCE) requires PostgreSQL 13+; replaces pg_terminate_backend + DROP for older versions.
+	// Second parameter kept for ResetDatabase API compatibility (preparetest --force).
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	// PostgreSQL does not support bound parameters for database names; quotePostgresDBName validates and escapes.
+	if err = execDropDatabase(ctx, db, dbname); err != nil {
+		return fmt.Errorf("unable to drop postgres database: %w", err)
+	}
+	ctx, cancel = context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err = execCreateDatabase(ctx, db, dbname); err != nil {
+		return fmt.Errorf("unable to create postgres database: %w", err)
 	}
 	return nil
 }
 
-func initializeORM(config *orm.Config, shutdownSignal gracefulpanic.Signal) (*orm.ORM, error) {
-	dbURL := config.DatabaseURL()
-	dbOrm, err := orm.NewORM(dbURL.String(), config.DatabaseTimeout(), shutdownSignal, config.GetDatabaseDialectConfiguredOrDefault(), config.GetAdvisoryLockIDConfiguredOrDefault(), config.GlobalLockRetryInterval().Duration(), config.ORMMaxOpenConns(), config.ORMMaxIdleConns())
+func downAndUpDB(ctx context.Context, cfg Config, baseVersionID int64) error {
+	db, err := NewConnection(ctx, cfg)
 	if err != nil {
-		return nil, errors.Wrap(err, "initializeORM#NewORM")
+		return fmt.Errorf("failed to initialize orm: %w", err)
 	}
-	if config.DatabaseBackupMode() != orm.DatabaseBackupModeNone {
+	if err = migrate.Rollback(ctx, db.DB, null.IntFrom(baseVersionID)); err != nil {
+		return fmt.Errorf("test rollback failed: %w", err)
+	}
+	if err = migrate.Migrate(ctx, db.DB); err != nil {
+		return fmt.Errorf("second migrateDB failed: %w", err)
+	}
+	return db.Close()
+}
 
-		version, err2 := dbOrm.FindLatestNodeVersion()
-		if err2 != nil {
-			return nil, errors.Wrap(err2, "initializeORM#FindLatestNodeVersion")
-		}
-		var versionString string
-		if version != nil {
-			versionString = version.Version
-		}
-		databaseBackup := periodicbackup.NewDatabaseBackup(config, logger.Default)
-		databaseBackup.RunBackupGracefully(versionString)
+func dumpSchema(dbURL url.URL, restrictKey string) (string, error) {
+	args := []string{
+		dbURL.String(),
+		"--schema-only",
 	}
-	if err = CheckSquashUpgrade(dbOrm.DB); err != nil {
-		panic(err)
-	}
-	if config.MigrateDatabase() {
-		dbOrm.SetLogging(config.LogSQLStatements() || config.LogSQLMigrations())
 
-		err = dbOrm.RawDBWithAdvisoryLock(func(db *gorm.DB) error {
-			return migrations.Migrate(db)
-		})
+	// Only add restrict-key if it's supported (PostgreSQL v17+).
+	// This is used for deterministic schema dumps which CI runs to compare
+	// previous and new schemas.
+	if restrictKey != "" {
+		// Test if pg_dump supports --restrict-key
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		testCmd := exec.CommandContext(ctx, "pg_dump", "--help")
+		helpOutput, err := testCmd.Output()
+		if err == nil && strings.Contains(string(helpOutput), "--restrict-key") {
+			args = append(args, "--restrict-key="+restrictKey)
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx,
+		"pg_dump", args...,
+	)
+
+	schema, err := cmd.Output()
+	if err != nil {
+		if ee, ok := errors.AsType[*exec.ExitError](err); ok {
+			return "", fmt.Errorf("failed to dump schema: %w\n%s", err, string(ee.Stderr))
+		}
+		return "", fmt.Errorf("failed to dump schema: %w", err)
+	}
+	return string(schema), nil
+}
+
+func checkSchema(dbURL url.URL, prevSchema, restrictKey string) error {
+	newSchema, err := dumpSchema(dbURL, restrictKey)
+	if err != nil {
+		return err
+	}
+	df := diff.Diff(prevSchema, newSchema)
+	if len(df) > 0 {
+		fmt.Println(df)
+		return errors.New("schema pre- and post- rollback does not match (ctrl+f for '+' or '-' to find the changed lines)")
+	}
+	return nil
+}
+
+func insertFixtures(dbURL url.URL, fixtures string) (err error) {
+	db, err := sql.Open(pgcommon.DriverPostgres, dbURL.String())
+	if err != nil {
+		return fmt.Errorf("unable to open postgres database for creating test db: %w", err)
+	}
+	defer func() {
+		if cerr := db.Close(); cerr != nil {
+			err = errors.Join(err, cerr)
+		}
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	_, err = db.ExecContext(ctx, fixtures)
+	return err
+}
+
+func dropDanglingTestDBs(lggr logger.Logger, db *sqlx.DB) (err error) {
+	// Drop all old dangling databases
+	var dbs []string
+	if err = db.Select(&dbs, `SELECT datname FROM pg_database WHERE datistemplate = false;`); err != nil {
+		return err
+	}
+
+	// dropping database is very slow in postgres so we parallelise it here
+	nWorkers := 25
+	ch := make(chan string)
+	var wg sync.WaitGroup
+	wg.Add(nWorkers)
+	errCh := make(chan error, len(dbs))
+	for range nWorkers {
+		go func() {
+			defer wg.Done()
+			for dbname := range ch {
+				lggr.Infof("Dropping old, dangling test database: %q", dbname)
+				errCh <- func() error {
+					ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+					defer cancel()
+					return execDropDatabase(ctx, db.DB, dbname)
+				}()
+			}
+		}()
+	}
+	for _, dbname := range dbs {
+		if (strings.HasPrefix(dbname, "chainlink_test_") && !strings.HasSuffix(dbname, "_pristine")) ||
+			(strings.HasPrefix(dbname, "testdb_") && (!strings.HasPrefix(dbname, "testdb_tpl_") || strings.Contains(dbname, "_inst_"))) {
+			ch <- dbname
+		}
+	}
+	close(ch)
+	wg.Wait()
+	close(errCh)
+	for gerr := range errCh {
+		err = errors.Join(err, gerr)
+	}
+	return err
+}
+
+type failedToRandomizeTestDBSequencesError struct{}
+
+func (m *failedToRandomizeTestDBSequencesError) Error() string {
+	return "failed to randomize test db sequences"
+}
+
+// randomizeTestDBSequences randomizes sequenced table columns sequence
+// This is necessary as to avoid false positives in some test cases.
+func randomizeTestDBSequences(db *sqlx.DB) error {
+	// not ideal to hard code this, but also not safe to do it programmatically :(
+	schemas := pq.Array([]string{"public", "evm"})
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	seqRows, err := db.QueryContext(ctx, `SELECT sequence_schema, sequence_name, minimum_value FROM information_schema.sequences WHERE sequence_schema IN ($1)`, schemas)
+	if err != nil {
+		return fmt.Errorf("%s: error fetching sequences: %w", failedToRandomizeTestDBSequencesError{}, err)
+	}
+
+	defer seqRows.Close()
+	for seqRows.Next() {
+		var sequenceSchema, sequenceName string
+		var minimumSequenceValue int64
+		if err = seqRows.Scan(&sequenceSchema, &sequenceName, &minimumSequenceValue); err != nil {
+			return fmt.Errorf("%s: failed scanning sequence rows: %w", failedToRandomizeTestDBSequencesError{}, err)
+		}
+
+		if sequenceName == "goose_migrations_id_seq" || sequenceName == "configurations_id_seq" {
+			continue
+		}
+
+		var randNum *big.Int
+		randNum, err = crand.Int(crand.Reader, sqlutil.NewI(10000).ToInt())
 		if err != nil {
-			return nil, errors.Wrap(err, "initializeORM#Migrate")
+			return fmt.Errorf("%s: failed to generate random number", failedToRandomizeTestDBSequencesError{})
+		}
+		randNum.Add(randNum, big.NewInt(minimumSequenceValue))
+
+		if err = func() error {
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			return cutils.JustError(db.ExecContext(ctx, fmt.Sprintf("ALTER SEQUENCE %s.%s RESTART WITH %d", sequenceSchema, sequenceName, randNum)))
+		}(); err != nil {
+			return fmt.Errorf("%s: failed to alter and restart %s sequence: %w", failedToRandomizeTestDBSequencesError{}, sequenceName, err)
 		}
 	}
 
-	nodeVersion := static.Version
-	if nodeVersion == "unset" {
-		nodeVersion = fmt.Sprintf("random_%d", rand.Uint32())
+	if err = seqRows.Err(); err != nil {
+		return fmt.Errorf("%s: failed to iterate through sequences: %w", failedToRandomizeTestDBSequencesError{}, err)
 	}
-	version := models.NewNodeVersion(nodeVersion)
-	err = dbOrm.UpsertNodeVersion(version)
-	if err != nil {
-		return nil, errors.Wrap(err, "initializeORM#UpsertNodeVersion")
-	}
-	dbOrm.SetLogging(config.LogSQLStatements())
-	return dbOrm, nil
+
+	return nil
 }

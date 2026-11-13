@@ -1,0 +1,213 @@
+package web_test
+
+import (
+	"bytes"
+	_ "embed"
+	"encoding/json"
+	"io"
+	"net/http"
+	"strings"
+	"testing"
+
+	"github.com/gin-gonic/gin"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"github.com/smartcontractkit/chainlink/v2/core/internal/cltest"
+	"github.com/smartcontractkit/chainlink/v2/core/internal/testutils"
+	"github.com/smartcontractkit/chainlink/v2/core/internal/testutils/configtest"
+	"github.com/smartcontractkit/chainlink/v2/core/services/chainlink"
+	"github.com/smartcontractkit/chainlink/v2/core/services/mocks"
+)
+
+func TestHealthController_Readyz(t *testing.T) {
+	t.Parallel()
+	tt := []struct {
+		name   string
+		ready  bool
+		status int
+	}{
+		{
+			name:   "not ready",
+			ready:  false,
+			status: http.StatusServiceUnavailable,
+		},
+		{
+			name:   "ready",
+			ready:  true,
+			status: http.StatusOK,
+		},
+	}
+	for _, tc := range tt {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			app := cltest.NewApplicationWithKey(t)
+			healthChecker := new(mocks.Checker)
+			healthChecker.On("Start").Return(nil).Once()
+			healthChecker.On("IsReady").Return(tc.ready, nil).Once()
+			healthChecker.On("Close").Return(nil).Once()
+
+			app.HealthChecker = healthChecker
+			require.NoError(t, app.Start(t.Context()))
+
+			client := app.NewHTTPClient(nil)
+			resp, cleanup := client.Get("/readyz")
+			t.Cleanup(cleanup)
+			assert.Equal(t, tc.status, resp.StatusCode)
+		})
+	}
+}
+
+func TestHealthController_PublicReadyz(t *testing.T) {
+	t.Parallel()
+	tt := []struct {
+		name   string
+		ready  bool
+		status int
+	}{
+		{
+			name:   "not ready",
+			ready:  false,
+			status: http.StatusServiceUnavailable,
+		},
+		{
+			name:   "ready",
+			ready:  true,
+			status: http.StatusOK,
+		},
+	}
+	for _, tc := range tt {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			app := cltest.NewApplicationWithKey(t)
+			healthChecker := new(mocks.Checker)
+			healthChecker.On("Start").Return(nil).Once()
+			healthChecker.On("IsReady").Return(tc.ready, nil)
+			healthChecker.On("Close").Return(nil).Once()
+
+			app.HealthChecker = healthChecker
+			require.NoError(t, app.Start(t.Context()))
+
+			client := app.NewHTTPClient(nil)
+
+			// Base path returns status only, no body.
+			resp, cleanup := client.Get("/public-readyz")
+			t.Cleanup(cleanup)
+			assert.Equal(t, tc.status, resp.StatusCode)
+			body, err := io.ReadAll(resp.Body)
+			require.NoError(t, err)
+			assert.Empty(t, body)
+
+			// ?full=true must NOT expose per-check details on this endpoint.
+			respFull, cleanupFull := client.Get("/public-readyz?full=true")
+			t.Cleanup(cleanupFull)
+			assert.Equal(t, tc.status, respFull.StatusCode)
+			bodyFull, err := io.ReadAll(respFull.Body)
+			require.NoError(t, err)
+			assert.Empty(t, bodyFull)
+		})
+	}
+}
+
+func TestHealthController_Health_status(t *testing.T) {
+	t.Parallel()
+	tt := []struct {
+		name   string
+		ready  bool
+		status int
+	}{
+		{
+			name:   "not ready",
+			ready:  false,
+			status: http.StatusMultiStatus,
+		},
+		{
+			name:   "ready",
+			ready:  true,
+			status: http.StatusOK,
+		},
+	}
+	for _, tc := range tt {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			app := cltest.NewApplicationWithKey(t)
+			healthChecker := new(mocks.Checker)
+			healthChecker.On("Start").Return(nil).Once()
+			healthChecker.On("IsHealthy").Return(tc.ready, nil).Once()
+			healthChecker.On("Close").Return(nil).Once()
+
+			app.HealthChecker = healthChecker
+			require.NoError(t, app.Start(t.Context()))
+
+			client := app.NewHTTPClient(nil)
+			resp, cleanup := client.Get("/health")
+			t.Cleanup(cleanup)
+			assert.Equal(t, tc.status, resp.StatusCode)
+		})
+	}
+}
+
+var (
+	//go:embed testdata/body/health.json
+	bodyJSON string
+	//go:embed testdata/body/health.html
+	bodyHTML string
+	//go:embed testdata/body/health.txt
+	bodyTXT string
+	//go:embed testdata/body/health-failing.json
+	bodyJSONFailing string
+	//go:embed testdata/body/health-failing.html
+	bodyHTMLFailing string
+	//go:embed testdata/body/health-failing.txt
+	bodyTXTFailing string
+)
+
+func TestHealthController_Health_body(t *testing.T) {
+	t.Parallel()
+	bodyJSON = strings.ReplaceAll(bodyJSON, "1399100", testutils.FixtureChainID.String())
+	bodyHTML = strings.ReplaceAll(bodyHTML, "1399100", testutils.FixtureChainID.String())
+	bodyTXT = strings.ReplaceAll(bodyTXT, "1399100", testutils.FixtureChainID.String())
+	bodyJSONFailing = strings.ReplaceAll(bodyJSONFailing, "1399100", testutils.FixtureChainID.String())
+	bodyHTMLFailing = strings.ReplaceAll(bodyHTMLFailing, "1399100", testutils.FixtureChainID.String())
+	bodyTXTFailing = strings.ReplaceAll(bodyTXTFailing, "1399100", testutils.FixtureChainID.String())
+
+	for _, tc := range []struct {
+		name    string
+		path    string
+		headers map[string]string
+		expBody string
+	}{
+		{"default", "/health", nil, bodyJSON},
+		{"json", "/health", map[string]string{"Accept": gin.MIMEJSON}, bodyJSON},
+		{"html", "/health", map[string]string{"Accept": gin.MIMEHTML}, bodyHTML},
+		{"text", "/health", map[string]string{"Accept": gin.MIMEPlain}, bodyTXT},
+		{".txt", "/health.txt", nil, bodyTXT},
+
+		{"default-failing", "/health?failing", nil, bodyJSONFailing},
+		{"json-failing", "/health?failing", map[string]string{"Accept": gin.MIMEJSON}, bodyJSONFailing},
+		{"html-failing", "/health?failing", map[string]string{"Accept": gin.MIMEHTML}, bodyHTMLFailing},
+		{"text-failing", "/health?failing", map[string]string{"Accept": gin.MIMEPlain}, bodyTXTFailing},
+		{".txt-failing", "/health.txt?failing", nil, bodyTXTFailing},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			cfg := configtest.NewGeneralConfig(t, func(cfg *chainlink.Config, secrets *chainlink.Secrets) {})
+			app := cltest.NewApplicationWithConfigAndKey(t, cfg)
+			require.NoError(t, app.Start(t.Context()))
+
+			client := app.NewHTTPClient(nil)
+			resp, cleanup := client.Get(tc.path, tc.headers)
+			t.Cleanup(cleanup)
+			assert.Equal(t, http.StatusMultiStatus, resp.StatusCode)
+			body, err := io.ReadAll(resp.Body)
+			require.NoError(t, err)
+			if tc.expBody == bodyJSON {
+				// pretty print for comparison
+				var b bytes.Buffer
+				require.NoError(t, json.Indent(&b, body, "", "  "))
+				body = b.Bytes()
+			}
+			assert.Equal(t, strings.TrimSpace(tc.expBody), strings.TrimSpace(string(body)))
+		})
+	}
+}

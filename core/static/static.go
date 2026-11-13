@@ -3,20 +3,29 @@ package static
 import (
 	"fmt"
 	"net/url"
+	"time"
 
-	uuid "github.com/satori/go.uuid"
+	"github.com/google/uuid"
+
+	"github.com/smartcontractkit/chainlink-common/pkg/sqlutil/pg"
 )
 
-// Version the version of application
-var Version = "unset"
+// Version and Sha are set at compile time via build arguments.
+var (
+	// Version is the semantic version of the build or Unset.
+	Version = Unset
+	// VersionTag is the complete version string, including all suffixes (-ccip, -beta1, etc)
+	VersionTag = Unset
+	// Sha is the commit hash of the build or Unset.
+	Sha = Unset
+)
 
-// Sha string "unset"
-var Sha = "unset"
-
-// InstanceUUID is generated on startup and uniquely identifies this instance of Chainlink
-var InstanceUUID uuid.UUID
+// InitTime holds the initial start timestamp.
+var InitTime = time.Now()
 
 const (
+	// Unset is a sentinel value.
+	Unset = "unset"
 	// ExternalInitiatorAccessKeyHeader is the header name for the access key
 	// used by external initiators to authenticate
 	ExternalInitiatorAccessKeyHeader = "X-Chainlink-EA-AccessKey"
@@ -25,12 +34,8 @@ const (
 	ExternalInitiatorSecretHeader = "X-Chainlink-EA-Secret"
 )
 
-func init() {
-	InstanceUUID = uuid.NewV4()
-}
-
 func buildPrettyVersion() string {
-	if Version == "unset" {
+	if Version == Unset {
 		return " "
 	}
 	return fmt.Sprintf(" %s ", Version)
@@ -38,13 +43,27 @@ func buildPrettyVersion() string {
 
 // SetConsumerName sets a nicely formatted application_name on the
 // database uri
-func SetConsumerName(uri *url.URL, name string) {
-	q := uri.Query()
-
-	applicationName := fmt.Sprintf("Chainlink%s| %s | %s", buildPrettyVersion(), name, InstanceUUID)
-	if len(applicationName) > 63 {
-		applicationName = applicationName[:63]
+func SetConsumerName(uri *url.URL, name string, id *uuid.UUID) {
+	applicationName := fmt.Sprintf("Chainlink%s|%s", buildPrettyVersion(), name)
+	if id != nil {
+		applicationName += "|" + id.String()
 	}
-	q.Set("application_name", applicationName)
-	uri.RawQuery = q.Encode()
+	pg.SetApplicationName(uri, applicationName)
+}
+
+// Short returns a 7-character sha prefix and version, or Unset if blank.
+func Short() (shaPre string, ver string) {
+	return short(Sha, Version)
+}
+
+func short(sha, ver string) (string, string) {
+	if sha == "" {
+		sha = Unset
+	} else if len(sha) > 7 {
+		sha = sha[:7]
+	}
+	if ver == "" {
+		ver = Unset
+	}
+	return sha, ver
 }

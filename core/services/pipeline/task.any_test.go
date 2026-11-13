@@ -1,16 +1,18 @@
 package pipeline_test
 
 import (
-	"context"
 	"testing"
 
 	"github.com/pkg/errors"
 	"github.com/shopspring/decimal"
-	"github.com/smartcontractkit/chainlink/core/services/pipeline"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/smartcontractkit/chainlink/v2/core/logger"
+	"github.com/smartcontractkit/chainlink/v2/core/services/pipeline"
 )
 
-func TestAny(t *testing.T) {
+func TestAnyTask(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
@@ -56,17 +58,18 @@ func TestAny(t *testing.T) {
 	}
 
 	for _, test := range tests {
-		test := test
 		t.Run(test.name, func(t *testing.T) {
 			task := pipeline.AnyTask{}
-			output := task.Run(context.Background(), pipeline.JSONSerializable{}, test.inputs)
+			output, runInfo := task.Run(t.Context(), logger.TestLogger(t), pipeline.NewVarsFrom(nil), test.inputs)
+			assert.False(t, runInfo.IsPending)
+			assert.False(t, runInfo.IsRetryable)
 			if output.Error != nil {
 				require.Equal(t, test.want.Error, errors.Cause(output.Error))
 				require.Nil(t, output.Value)
 			} else {
-				switch test.want.Value.(type) {
+				switch v := test.want.Value.(type) {
 				case *decimal.Decimal:
-					require.Equal(t, test.want.Value.(*decimal.Decimal).String(), output.Value.(*decimal.Decimal).String())
+					require.Equal(t, v.String(), output.Value.(*decimal.Decimal).String())
 				default:
 					require.Equal(t, test.want.Value, output.Value)
 				}

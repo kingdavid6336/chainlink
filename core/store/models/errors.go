@@ -1,35 +1,13 @@
 package models
 
 import (
-	"fmt"
+	"errors"
 	"strings"
 )
 
-// DatabaseAccessError is an error that occurs during database access.
-type DatabaseAccessError struct {
-	msg string
-}
-
-func (e *DatabaseAccessError) Error() string { return e.msg }
-
-// NewDatabaseAccessError returns a database access error.
-func NewDatabaseAccessError(msg string) error {
-	return &DatabaseAccessError{msg}
-}
-
-// ValidationError is an error that occurs during validation.
-type ValidationError struct {
-	msg string
-}
-
-func (e *ValidationError) Error() string { return e.msg }
-
-// NewValidationError returns a validation error.
-func NewValidationError(msg string, values ...interface{}) error {
-	return &ValidationError{msg: fmt.Sprintf(msg, values...)}
-}
-
 // JSONAPIErrors holds errors conforming to the JSONAPI spec.
+//
+//nolint:errname // JSONAPIErrors is a collection of JSONAPIError items matching JSONAPI spec.
 type JSONAPIErrors struct {
 	Errors []JSONAPIError `json:"errors"`
 }
@@ -59,7 +37,7 @@ func NewJSONAPIErrorsWith(detail string) *JSONAPIErrors {
 // Error collapses the collection of errors into a collection of comma separated
 // strings.
 func (jae *JSONAPIErrors) Error() string {
-	var messages []string
+	messages := make([]string, 0, len(jae.Errors))
 	for _, e := range jae.Errors {
 		messages = append(messages, e.Detail)
 	}
@@ -74,12 +52,11 @@ func (jae *JSONAPIErrors) Add(detail string) {
 // Merge combines the arrays of the passed error if it is of type JSONAPIErrors,
 // otherwise simply adds a single error with the error string as detail.
 func (jae *JSONAPIErrors) Merge(e error) {
-	switch typed := e.(type) {
-	case *JSONAPIErrors:
-		jae.Errors = append(jae.Errors, typed.Errors...)
-	default:
-		jae.Add(e.Error())
+	if jsonErr, ok := errors.AsType[*JSONAPIErrors](e); ok {
+		jae.Errors = append(jae.Errors, jsonErr.Errors...)
+		return
 	}
+	jae.Add(e.Error())
 }
 
 // CoerceEmptyToNil will return nil if JSONAPIErrors has no errors.

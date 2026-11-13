@@ -1,109 +1,154 @@
 package cmd_test
 
 import (
+	"bytes"
+	"encoding/hex"
 	"flag"
 	"os"
 	"testing"
 
-	"github.com/smartcontractkit/chainlink/core/internal/cltest"
-	"github.com/smartcontractkit/chainlink/core/store"
-	"github.com/smartcontractkit/chainlink/core/store/models/ocrkey"
-	"github.com/smartcontractkit/chainlink/core/utils"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/urfave/cli"
+
+	"github.com/smartcontractkit/chainlink-common/keystore/corekeys/ocrkey"
+	"github.com/smartcontractkit/chainlink-common/pkg/utils"
+	"github.com/smartcontractkit/chainlink/v2/core/cmd"
+	"github.com/smartcontractkit/chainlink/v2/core/internal/cltest"
+	"github.com/smartcontractkit/chainlink/v2/core/services/chainlink"
+	"github.com/smartcontractkit/chainlink/v2/core/web/presenters"
 )
 
-func TestClient_ListOCRKeyBundles(t *testing.T) {
+func TestOCRKeyBundlePresenter_RenderTable(t *testing.T) {
 	t.Parallel()
 
-	app := startNewApplication(t)
-	client, r := app.NewClientAndRenderer()
+	var (
+		bundleID = "f5bf259689b26f1374efb3c9a9868796953a0f814bb2d39b968d0e61b58620a5"
+		buffer   = bytes.NewBufferString("")
+		r        = cmd.RendererTable{Writer: buffer}
+	)
 
-	app.Store.OCRKeyStore.Unlock(cltest.Password)
+	key := cltest.DefaultOCRKey
 
-	key, err := ocrkey.NewKeyBundle()
-	require.NoError(t, err)
-	encKey, err := key.Encrypt(cltest.Password, utils.FastScryptParams)
-	require.NoError(t, err)
-	err = app.Store.OCRKeyStore.CreateEncryptedOCRKeyBundle(encKey)
-	require.NoError(t, err)
+	p := cmd.OCRKeyBundlePresenter{
+		JAID: cmd.JAID{ID: bundleID},
+		OCRKeysBundleResource: presenters.OCRKeysBundleResource{
+			JAID:                  presenters.NewJAID(key.ID()),
+			OnChainSigningAddress: key.OnChainSigning.Address(),
+			OffChainPublicKey:     key.OffChainSigning.PublicKey(),
+			ConfigPublicKey:       key.PublicKeyConfig(),
+		},
+	}
 
-	requireOCRKeyCount(t, app.Store, 2) // Created key + fixture key
+	// Render a single resource
+	require.NoError(t, p.RenderTable(r))
 
-	assert.Nil(t, client.ListOCRKeyBundles(cltest.EmptyCLIContext()))
-	require.Equal(t, 1, len(r.Renders))
-	keys := *r.Renders[0].(*[]ocrkey.EncryptedKeyBundle)
-	assert.Equal(t, encKey.ID, keys[1].ID)
+	output := buffer.String()
+	assert.Contains(t, output, bundleID)
+	assert.Contains(t, output, key.OnChainSigning.Address().String())
+	assert.Contains(t, output, hex.EncodeToString(key.PublicKeyOffChain()))
+	pubKeyConfig := key.PublicKeyConfig()
+	assert.Contains(t, output, hex.EncodeToString(pubKeyConfig[:]))
+
+	// Render many resources
+	buffer.Reset()
+	ps := cmd.OCRKeyBundlePresenters{p}
+	require.NoError(t, ps.RenderTable(r))
+
+	output = buffer.String()
+	assert.Contains(t, output, bundleID)
+	assert.Contains(t, output, key.OnChainSigning.Address().String())
+	assert.Contains(t, output, hex.EncodeToString(key.PublicKeyOffChain()))
+	pubKeyConfig = key.PublicKeyConfig()
+	assert.Contains(t, output, hex.EncodeToString(pubKeyConfig[:]))
 }
 
-func TestClient_CreateOCRKeyBundle(t *testing.T) {
+func TestShell_ListOCRKeyBundles(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+
+	app := startNewApplicationV2(t, nil)
+	client, r := app.NewShellAndRenderer()
+
+	key, err := app.GetKeyStore().OCR().Create(ctx)
+	require.NoError(t, err)
+
+	requireOCRKeyCount(t, app, 1)
+
+	require.NoError(t, client.ListOCRKeyBundles(cltest.EmptyCLIContext()))
+	require.Len(t, r.Renders, 1)
+	output := *r.Renders[0].(*cmd.OCRKeyBundlePresenters)
+	require.Equal(t, key.ID(), output[0].ID)
+}
+
+func TestShell_CreateOCRKeyBundle(t *testing.T) {
 	t.Parallel()
 
-	app := startNewApplication(t)
-	client, _ := app.NewClientAndRenderer()
-	store := app.GetStore()
+	app := startNewApplicationV2(t, nil)
+	client, r := app.NewShellAndRenderer()
 
-	app.Store.OCRKeyStore.Unlock(cltest.Password)
-
-	requireOCRKeyCount(t, store, 1) // The initial fixture key
+	requireOCRKeyCount(t, app, 0)
 
 	require.NoError(t, client.CreateOCRKeyBundle(nilContext))
 
-	keys, err := app.GetStore().OCRKeyStore.FindEncryptedOCRKeyBundles()
+	keys, err := app.GetKeyStore().OCR().GetAll()
 	require.NoError(t, err)
-	require.Len(t, keys, 2)
+	require.Len(t, keys, 1)
 
-	for _, e := range keys {
-		_, err = e.Decrypt(cltest.Password)
-		require.NoError(t, err)
-	}
+	require.Len(t, r.Renders, 1)
+	output := *r.Renders[0].(*cmd.OCRKeyBundlePresenter)
+	require.Equal(t, output.ID, keys[0].ID())
 }
 
-func TestClient_DeleteOCRKeyBundle(t *testing.T) {
+func TestShell_DeleteOCRKeyBundle(t *testing.T) {
 	t.Parallel()
+	ctx := t.Context()
 
-	app := startNewApplication(t)
-	client, _ := app.NewClientAndRenderer()
+	app := startNewApplicationV2(t, nil)
+	client, r := app.NewShellAndRenderer()
 
-	app.Store.OCRKeyStore.Unlock(cltest.Password)
-
-	key, err := ocrkey.NewKeyBundle()
-	require.NoError(t, err)
-	encKey, err := key.Encrypt(cltest.Password, utils.FastScryptParams)
-	require.NoError(t, err)
-	err = app.Store.OCRKeyStore.CreateEncryptedOCRKeyBundle(encKey)
+	key, err := app.GetKeyStore().OCR().Create(ctx)
 	require.NoError(t, err)
 
-	requireOCRKeyCount(t, app.Store, 2) // Created key + fixture key
+	requireOCRKeyCount(t, app, 1)
 
 	set := flag.NewFlagSet("test", 0)
-	set.Parse([]string{key.ID.String()})
-	set.Bool("yes", true, "")
+	flagSetApplyFromAction(client.DeleteOCRKeyBundle, set, "")
+
+	require.NoError(t, set.Parse([]string{key.ID()}))
+	require.NoError(t, set.Set("yes", "true"))
+
 	c := cli.NewContext(nil, set, nil)
 
 	require.NoError(t, client.DeleteOCRKeyBundle(c))
-	requireOCRKeyCount(t, app.Store, 1) // Only fixture key remains
+	requireOCRKeyCount(t, app, 0) // Only fixture key remains
+
+	require.Len(t, r.Renders, 1)
+	output := *r.Renders[0].(*cmd.OCRKeyBundlePresenter)
+	assert.Equal(t, key.ID(), output.ID)
 }
 
-func TestClient_ImportExportOCRKeyBundle(t *testing.T) {
+func TestShell_ImportExportOCRKey(t *testing.T) {
 	defer deleteKeyExportFile(t)
+	ctx := t.Context()
 
-	app := startNewApplication(t)
-	client, _ := app.NewClientAndRenderer()
+	app := startNewApplicationV2(t, nil)
+	client, _ := app.NewShellAndRenderer()
 
-	store := app.GetStore()
-	store.OCRKeyStore.Unlock(cltest.Password)
+	require.NoError(t, app.KeyStore.OCR().Add(ctx, cltest.DefaultOCRKey))
 
-	keys := requireOCRKeyCount(t, store, 1)
+	keys := requireOCRKeyCount(t, app, 1)
 	key := keys[0]
 	keyName := keyNameForTest(t)
 
 	// Export test invalid id
 	set := flag.NewFlagSet("test OCR export", 0)
-	set.Parse([]string{"0"})
-	set.String("newpassword", "../internal/fixtures/apicredentials", "")
-	set.String("output", keyName, "")
+	flagSetApplyFromAction(client.ExportOCRKey, set, "")
+
+	require.NoError(t, set.Parse([]string{"0"}))
+	require.NoError(t, set.Set("new-password", "../internal/fixtures/new_password.txt"))
+	require.NoError(t, set.Set("output", keyName))
+
 	c := cli.NewContext(nil, set, nil)
 	err := client.ExportOCRKey(c)
 	require.Error(t, err, "Error exporting")
@@ -111,28 +156,34 @@ func TestClient_ImportExportOCRKeyBundle(t *testing.T) {
 
 	// Export
 	set = flag.NewFlagSet("test OCR export", 0)
-	set.Parse([]string{key.ID.String()})
-	set.String("newpassword", "../internal/fixtures/apicredentials", "")
-	set.String("output", keyName, "")
+	flagSetApplyFromAction(client.ExportOCRKey, set, "")
+
+	require.NoError(t, set.Parse([]string{key.ID()}))
+	require.NoError(t, set.Set("new-password", "../internal/fixtures/new_password.txt"))
+	require.NoError(t, set.Set("output", keyName))
+
 	c = cli.NewContext(nil, set, nil)
 
 	require.NoError(t, client.ExportOCRKey(c))
 	require.NoError(t, utils.JustError(os.Stat(keyName)))
 
-	require.NoError(t, store.OCRKeyStore.DeleteEncryptedOCRKeyBundle(&key))
-	requireOCRKeyCount(t, store, 0)
+	require.NoError(t, utils.JustError(app.GetKeyStore().OCR().Delete(ctx, key.ID())))
+	requireOCRKeyCount(t, app, 0)
 
 	set = flag.NewFlagSet("test OCR import", 0)
-	set.Parse([]string{keyName})
-	set.String("oldpassword", "../internal/fixtures/apicredentials", "")
+	flagSetApplyFromAction(client.ImportOCRKey, set, "")
+
+	require.NoError(t, set.Parse([]string{keyName}))
+	require.NoError(t, set.Set("old-password", "../internal/fixtures/new_password.txt"))
+
 	c = cli.NewContext(nil, set, nil)
 	require.NoError(t, client.ImportOCRKey(c))
 
-	requireOCRKeyCount(t, store, 1)
+	requireOCRKeyCount(t, app, 1)
 }
 
-func requireOCRKeyCount(t *testing.T, store *store.Store, length int) []ocrkey.EncryptedKeyBundle {
-	keys, err := store.OCRKeyStore.FindEncryptedOCRKeyBundles()
+func requireOCRKeyCount(t *testing.T, app chainlink.Application, length int) []ocrkey.KeyV2 {
+	keys, err := app.GetKeyStore().OCR().GetAll()
 	require.NoError(t, err)
 	require.Len(t, keys, length)
 	return keys

@@ -4,54 +4,28 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/smartcontractkit/chainlink/core/services/job"
-
+	"github.com/google/uuid"
 	"github.com/stretchr/testify/require"
 
-	"github.com/smartcontractkit/chainlink/core/store/models"
+	"github.com/smartcontractkit/chainlink-common/keystore/corekeys/p2pkey"
+	"github.com/smartcontractkit/chainlink-common/pkg/sqlutil"
+	"github.com/smartcontractkit/chainlink-evm/pkg/types"
+	"github.com/smartcontractkit/chainlink/v2/core/bridges"
+	"github.com/smartcontractkit/chainlink/v2/core/internal/testutils"
+	"github.com/smartcontractkit/chainlink/v2/core/internal/testutils/configtest"
+	"github.com/smartcontractkit/chainlink/v2/core/logger"
+	"github.com/smartcontractkit/chainlink/v2/core/services/job"
+	"github.com/smartcontractkit/chainlink/v2/core/services/pipeline"
 )
 
 const (
-	ocrJobSpecText = `
-type               = "offchainreporting"
-schemaVersion      = 1
-contractAddress    = "%s"
-p2pPeerID          = "%s"
-p2pBootstrapPeers  = [
-    "/dns4/chain.link/tcp/1234/p2p/16Uiu2HAm58SP7UL8zsnpeuwHfytLocaqgnyaYKP8wu7qRdrixLju",
-]
-isBootstrapPeer    = false
-keyBundleID        = "%s"
-transmitterAddress = "%s"
-observationTimeout = "10s"
-blockchainTimeout  = "20s"
-contractConfigTrackerSubscribeInterval = "2m"
-contractConfigTrackerPollInterval = "1m"
-contractConfigConfirmations = 3
-observationSource = """
-    // data source 1
-    ds1          [type=bridge name=voter_turnout];
-    ds1_parse    [type=jsonparse path="one,two"];
-    ds1_multiply [type=multiply times=1.23];
-
-    // data source 2
-    ds2          [type=http method=GET url="https://chain.link/voter_turnout/USA-2020" requestData="{\\"hi\\": \\"hello\\"}"];
-    ds2_parse    [type=jsonparse path="three,four"];
-    ds2_multiply [type=multiply times=4.56];
-
-    ds1 -> ds1_parse -> ds1_multiply -> answer1;
-    ds2 -> ds2_parse -> ds2_multiply -> answer1;
-
-    answer1 [type=median                      index=0];
-    answer2 [type=bridge name=election_winner index=1];
-"""
-`
 	minimalOCRNonBootstrapTemplate = `
 			type               = "offchainreporting"
 			schemaVersion      = 1
 			contractAddress    = "%s"
+			evmChainID		   = "%s"
 			p2pPeerID          = "%s"
-			p2pBootstrapPeers  = ["/dns4/chain.link/tcp/1234/p2p/16Uiu2HAm58SP7UL8zsnpeuwHfytLocaqgnyaYKP8wu7qRdrixLju"]
+			p2pv2Bootstrappers = ["12D3KooWHfYFQ8hGttAYbMCevQVESEQhzJAqFZokMVtom8bNxwGq@127.0.0.1:5001"]
 			isBootstrapPeer    = false
 			transmitterAddress = "%s"
 			keyBundleID = "%s"
@@ -64,25 +38,41 @@ observationSource = """
 	`
 )
 
-func MinimalOCRNonBootstrapSpec(contractAddress, transmitterAddress models.EIP55Address, peerID models.PeerID, keyBundleID models.Sha256Hash) string {
-	return fmt.Sprintf(minimalOCRNonBootstrapTemplate, contractAddress, peerID, transmitterAddress.Hex(), keyBundleID)
+func MinimalOCRNonBootstrapSpec(contractAddress, transmitterAddress types.EIP55Address, peerID p2pkey.PeerID, keyBundleID string) string {
+	return fmt.Sprintf(minimalOCRNonBootstrapTemplate, contractAddress, testutils.FixtureChainID.String(), peerID, transmitterAddress.Hex(), keyBundleID)
 }
 
-// `require.Equal` currently has broken handling of `time.Time` values, so we have
-// to do equality comparisons of these structs manually.
-//
-// https://github.com/stretchr/testify/issues/984
-func CompareOCRJobSpecs(t *testing.T, expected, actual job.Job) {
-	t.Helper()
-	require.Equal(t, expected.OffchainreportingOracleSpec.ContractAddress, actual.OffchainreportingOracleSpec.ContractAddress)
-	require.Equal(t, expected.OffchainreportingOracleSpec.P2PPeerID, actual.OffchainreportingOracleSpec.P2PPeerID)
-	require.Equal(t, expected.OffchainreportingOracleSpec.P2PBootstrapPeers, actual.OffchainreportingOracleSpec.P2PBootstrapPeers)
-	require.Equal(t, expected.OffchainreportingOracleSpec.IsBootstrapPeer, actual.OffchainreportingOracleSpec.IsBootstrapPeer)
-	require.Equal(t, expected.OffchainreportingOracleSpec.EncryptedOCRKeyBundleID, actual.OffchainreportingOracleSpec.EncryptedOCRKeyBundleID)
-	require.Equal(t, expected.OffchainreportingOracleSpec.TransmitterAddress, actual.OffchainreportingOracleSpec.TransmitterAddress)
-	require.Equal(t, expected.OffchainreportingOracleSpec.ObservationTimeout, actual.OffchainreportingOracleSpec.ObservationTimeout)
-	require.Equal(t, expected.OffchainreportingOracleSpec.BlockchainTimeout, actual.OffchainreportingOracleSpec.BlockchainTimeout)
-	require.Equal(t, expected.OffchainreportingOracleSpec.ContractConfigTrackerSubscribeInterval, actual.OffchainreportingOracleSpec.ContractConfigTrackerSubscribeInterval)
-	require.Equal(t, expected.OffchainreportingOracleSpec.ContractConfigTrackerPollInterval, actual.OffchainreportingOracleSpec.ContractConfigTrackerPollInterval)
-	require.Equal(t, expected.OffchainreportingOracleSpec.ContractConfigConfirmations, actual.OffchainreportingOracleSpec.ContractConfigConfirmations)
+func MustInsertWebhookSpec(t *testing.T, ds sqlutil.DataSource, externalJobID ...uuid.UUID) (job.Job, job.WebhookSpec) {
+	ctx := t.Context()
+	jobORM, pipelineORM := getORMs(t, ds)
+	webhookSpec := job.WebhookSpec{}
+	require.NoError(t, jobORM.InsertWebhookSpec(ctx, &webhookSpec))
+
+	pSpec := pipeline.Pipeline{}
+	pipelineSpecID, err := pipelineORM.CreateSpec(ctx, pSpec, 0)
+	require.NoError(t, err)
+
+	extID := uuid.New()
+	if len(externalJobID) > 0 {
+		extID = externalJobID[0]
+	}
+
+	createdJob := job.Job{
+		WebhookSpecID: &webhookSpec.ID, WebhookSpec: &webhookSpec, SchemaVersion: 1, Type: "webhook",
+		ExternalJobID: extID, PipelineSpecID: pipelineSpecID, //nolint:staticcheck // SA1019: InsertJob persists the legacy jobs.pipeline_spec_id column
+	}
+	require.NoError(t, jobORM.InsertJob(ctx, &createdJob))
+
+	return createdJob, webhookSpec
+}
+
+func getORMs(t *testing.T, ds sqlutil.DataSource) (jobORM job.ORM, pipelineORM pipeline.ORM) {
+	config := configtest.NewTestGeneralConfig(t)
+	keyStore := NewKeyStore(t, ds)
+	lggr := logger.TestLogger(t)
+	pipelineORM = pipeline.NewORM(ds, lggr, config.JobPipeline().MaxSuccessfulRuns())
+	bridgeORM := bridges.NewORM(ds)
+	jobORM = job.NewORM(ds, pipelineORM, bridgeORM, keyStore, lggr)
+	t.Cleanup(func() { jobORM.Close() })
+	return jobORM, pipelineORM
 }

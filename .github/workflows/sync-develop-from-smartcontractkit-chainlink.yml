@@ -3,15 +3,16 @@ name: Sync develop from smartcontractkit/chainlink
 on:
   schedule:
     # * is a special character in YAML so you have to quote this string
-    - cron: '*/30 * * * *'
+    - cron: "*/30 * * * *"
 
 jobs:
   sync:
     name: Sync
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v7
         with:
+          persist-credentials: false
           ref: develop
         if: env.GITHUB_REPOSITORY != 'smartcontractkit/chainlink'
       - name: Sync

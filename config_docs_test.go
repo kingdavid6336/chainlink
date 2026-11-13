@@ -1,0 +1,30 @@
+package main
+
+import (
+	_ "embed"
+	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"github.com/smartcontractkit/chainlink/v2/core/config/docs"
+)
+
+var (
+	//go:embed docs/CONFIG.md
+	configMD string
+	//go:embed docs/SECRETS.md
+	secretsMD string
+)
+
+func TestConfigDocs(t *testing.T) {
+	t.Parallel()
+
+	config, err := docs.GenerateConfig()
+	require.NoError(t, err, "invalid config docs")
+	assert.Equal(t, configMD, config, "docs/CONFIG.md is out of date. Run 'make config-docs' to regenerate.")
+
+	secrets, err := docs.GenerateSecrets()
+	require.NoError(t, err, "invalid secrets docs")
+	assert.Equal(t, secretsMD, secrets, "docs/SECRETS.md is out of date. Run 'make config-docs' to regenerate.")
+}

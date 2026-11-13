@@ -2,18 +2,29 @@ package pipeline
 
 import (
 	"context"
+	stderrors "errors"
+	"math"
 	"sort"
 
 	"github.com/pkg/errors"
 	"github.com/shopspring/decimal"
-	"go.uber.org/multierr"
 
-	"github.com/smartcontractkit/chainlink/core/utils"
+	"github.com/smartcontractkit/chainlink-common/pkg/logger"
 )
 
+// Return types:
+//
+//	*decimal.Decimal
 type MedianTask struct {
 	BaseTask      `mapstructure:",squash"`
-	AllowedFaults uint64 `json:"allowedFaults"`
+	Values        string `json:"values"`
+	AllowedFaults string `json:"allowedFaults"`
+	// Lax when disabled (default) will return an error if there are no values to medianize or if the input includes nil values.
+	// Lax when enabled will return nil with no error if there are no valid values to medianize. If the input includes nil values, they will be excluded from the median calculation and do not count as a fault.
+	Lax string
+	// CountNilsAsFaults when enabled treats nil values as faults (counted toward allowedFaults) but filters them out before median calculation.
+	// This is mutually exclusive with Lax.
+	CountNilsAsFaults string
 }
 
 var _ Task = (*MedianTask)(nil)
@@ -22,50 +33,77 @@ func (t *MedianTask) Type() TaskType {
 	return TaskTypeMedian
 }
 
-func (t *MedianTask) SetDefaults(inputValues map[string]string, g TaskDAG, self taskDAGNode) error {
-	if _, exists := inputValues["allowedFaults"]; !exists {
-		if len(self.inputs()) == 0 {
-			return errors.Wrapf(ErrWrongInputCardinality, "MedianTask requires at least 1 input")
+func (t *MedianTask) Run(_ context.Context, _ logger.Logger, vars Vars, inputs []Result) (result Result, runInfo RunInfo) {
+	var (
+		maybeAllowedFaults MaybeUint64Param
+		valuesAndErrs      SliceParam
+		decimalValues      DecimalSliceParam
+		allowedFaults      int
+		faults             int
+		lax                BoolParam
+		countNilsAsFaults  BoolParam
+	)
+	err := stderrors.Join(
+		errors.Wrap(ResolveParam(&maybeAllowedFaults, From(t.AllowedFaults)), "allowedFaults"),
+		errors.Wrap(ResolveParam(&valuesAndErrs, From(VarExpr(t.Values, vars), JSONWithVarExprs(t.Values, vars, true), Inputs(inputs))), "values"),
+		errors.Wrap(ResolveParam(&lax, From(NonemptyString(t.Lax), false)), "lax"),
+		errors.Wrap(ResolveParam(&countNilsAsFaults, From(NonemptyString(t.CountNilsAsFaults), false)), "countNilsAsFaults"),
+	)
+	if err != nil {
+		return Result{Error: err}, runInfo
+	}
+
+	if bool(lax) && bool(countNilsAsFaults) {
+		return Result{Error: errors.New("lax and countNilsAsFaults cannot both be enabled")}, runInfo
+	}
+
+	// if lax is enabled, filter out nil values
+	// nil values are not included in the fault calculations
+	if bool(lax) {
+		valuesAndErrs, _ = valuesAndErrs.FilterNils()
+	}
+
+	if allowed, isSet := maybeAllowedFaults.Uint64(); isSet {
+		if allowed > math.MaxInt {
+			allowedFaults = math.MaxInt
+		} else {
+			allowedFaults = int(allowed)
 		}
-		t.AllowedFaults = uint64(len(self.inputs()) - 1)
-	}
-	return nil
-}
-
-func (t *MedianTask) Run(_ context.Context, _ JSONSerializable, inputs []Result) (result Result) {
-	if len(inputs) == 0 {
-		return Result{Error: errors.Wrapf(ErrWrongInputCardinality, "MedianTask requires at least 1 input")}
+	} else {
+		allowedFaults = max(len(valuesAndErrs)-1, 0)
 	}
 
-	answers := []decimal.Decimal{}
-	fetchErrors := []error{}
+	values, faults := valuesAndErrs.FilterErrors()
 
-	for _, input := range inputs {
-		if input.Error != nil {
-			fetchErrors = append(fetchErrors, input.Error)
-			continue
-		}
-
-		answer, err := utils.ToDecimal(input.Value)
-		if err != nil {
-			fetchErrors = append(fetchErrors, err)
-			continue
-		}
-
-		answers = append(answers, answer)
+	// If countNilsAsFaults is enabled, filter nils AFTER fault counting
+	// so that nils are counted toward allowedFaults
+	if bool(countNilsAsFaults) {
+		var nilCount int
+		values, nilCount = values.FilterNils()
+		faults += nilCount
 	}
 
-	if uint64(len(fetchErrors)) > t.AllowedFaults {
-		return Result{Error: errors.Wrapf(ErrBadInput, "Number of faulty inputs %v to median task > number allowed faults %v. Fetch errors: %v", len(fetchErrors), t.AllowedFaults, multierr.Combine(fetchErrors...).Error())}
+	switch {
+	case faults > allowedFaults:
+		return Result{Error: errors.Wrapf(ErrTooManyErrors, "Number of faulty inputs %v to median task > number allowed faults %v", faults, allowedFaults)}, runInfo
+	case len(values) == 0 && (bool(lax) || bool(countNilsAsFaults)):
+		return Result{}, runInfo // if lax is enabled, return nil result with no error
+	case len(values) == 0:
+		return Result{Error: errors.Wrap(ErrWrongInputCardinality, "no values to medianize")}, runInfo
 	}
 
-	sort.Slice(answers, func(i, j int) bool {
-		return answers[i].LessThan(answers[j])
+	err = decimalValues.UnmarshalPipelineParam(values)
+	if err != nil {
+		return Result{Error: err}, runInfo
+	}
+
+	sort.Slice(decimalValues, func(i, j int) bool {
+		return decimalValues[i].LessThan(decimalValues[j])
 	})
-	k := len(answers) / 2
-	if len(answers)%2 == 1 {
-		return Result{Value: answers[k]}
+	k := len(decimalValues) / 2
+	if len(decimalValues)%2 == 1 {
+		return Result{Value: decimalValues[k]}, runInfo
 	}
-	median := answers[k].Add(answers[k-1]).Div(decimal.NewFromInt(2))
-	return Result{Value: median}
+	median := decimalValues[k].Add(decimalValues[k-1]).Div(decimal.NewFromInt(2))
+	return Result{Value: median}, runInfo
 }

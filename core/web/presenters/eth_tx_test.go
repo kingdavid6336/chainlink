@@ -1,31 +1,35 @@
 package presenters
 
 import (
+	"math/big"
 	"testing"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/common/hexutil"
 	"github.com/manyminds/api2go/jsonapi"
-	"github.com/smartcontractkit/chainlink/core/assets"
-	"github.com/smartcontractkit/chainlink/core/store/models"
-	"github.com/smartcontractkit/chainlink/core/utils"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/smartcontractkit/chainlink-evm/pkg/assets"
+	"github.com/smartcontractkit/chainlink-evm/pkg/gas"
+	"github.com/smartcontractkit/chainlink-evm/pkg/txmgr"
+	evmtypes "github.com/smartcontractkit/chainlink-evm/pkg/types"
+	txmgrcommon "github.com/smartcontractkit/chainlink-framework/chains/txmgr"
 )
 
 func TestEthTxResource(t *testing.T) {
 	t.Parallel()
 
-	from := common.HexToAddress("0x1")
-	to := common.HexToAddress("0x2")
-	tx := models.EthTx{
+	chainID := big.NewInt(54321)
+	tx := txmgr.Tx{
 		ID:             1,
 		EncodedPayload: []byte(`{"data": "is wilding out"}`),
-		FromAddress:    from,
-		ToAddress:      to,
-		GasLimit:       uint64(5000),
-		State:          models.EthTxConfirmed,
-		Value:          assets.NewEthValue(1),
+		FromAddress:    common.HexToAddress("0x1"),
+		ToAddress:      common.HexToAddress("0x2"),
+		FeeLimit:       uint64(5000),
+		ChainID:        chainID,
+		State:          txmgrcommon.TxConfirmed,
+		Value:          big.Int(assets.NewEthValue(1)),
 	}
 
 	r := NewEthTxResource(tx)
@@ -36,7 +40,7 @@ func TestEthTxResource(t *testing.T) {
 	expected := `
 	{
 		"data": {
-		  "type": "transactions",
+		  "type": "evm_transactions",
 		  "id": "",
 		  "attributes": {
 			"state": "confirmed",
@@ -49,7 +53,8 @@ func TestEthTxResource(t *testing.T) {
 			"nonce": "",
 			"sentAt": "",
 			"to": "0x0000000000000000000000000000000000000002",
-			"value": "0.000000000000000001"
+			"value": "0.000000000000000001",
+			"evmChainID": "54321"
 		  }
 		}
 	  }
@@ -58,17 +63,17 @@ func TestEthTxResource(t *testing.T) {
 	assert.JSONEq(t, expected, string(b))
 
 	var (
-		nonce           = int64(100)
+		nonce           = evmtypes.Nonce(100)
 		hash            = common.BytesToHash([]byte{1, 2, 3})
-		gasPrice        = utils.NewBigI(1000)
+		gasPrice        = assets.NewWeiI(1000)
 		broadcastBefore = int64(300)
 	)
 
-	tx.Nonce = &nonce
-	txa := models.EthTxAttempt{
-		EthTx:                   tx,
+	tx.Sequence = &nonce
+	txa := txmgr.TxAttempt{
+		Tx:                      tx,
 		Hash:                    hash,
-		GasPrice:                *gasPrice,
+		TxFee:                   gas.EvmFee{GasPrice: gasPrice},
 		SignedRawTx:             hexutil.MustDecode("0xcafe"),
 		BroadcastBeforeBlockNum: &broadcastBefore,
 	}
@@ -81,8 +86,8 @@ func TestEthTxResource(t *testing.T) {
 	expected = `
 	{
 		"data": {
-		  "type": "transactions",
-		  "id": "0x0000000000000000000000000000000000000000000000000000000000010203",
+		  "type": "evm_transactions",
+		  "id": "54321/0x0000000000000000000000000000000000000000000000000000000000010203",
 		  "attributes": {
 			"state": "confirmed",
 			"data": "0x7b2264617461223a202269732077696c64696e67206f7574227d",
@@ -94,7 +99,8 @@ func TestEthTxResource(t *testing.T) {
 			"nonce": "100",
 			"sentAt": "300",
 			"to": "0x0000000000000000000000000000000000000002",
-			"value": "0.000000000000000001"
+			"value": "0.000000000000000001",
+			"evmChainID": "54321"
 		  }
 		}
 	  }

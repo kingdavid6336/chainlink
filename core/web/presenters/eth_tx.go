@@ -5,28 +5,32 @@ import (
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/common/hexutil"
-	"github.com/smartcontractkit/chainlink/core/store/models"
+
+	"github.com/smartcontractkit/chainlink-common/pkg/sqlutil"
+	"github.com/smartcontractkit/chainlink-evm/pkg/assets"
+	"github.com/smartcontractkit/chainlink-evm/pkg/txmgr"
 )
 
 // EthTxResource represents a Ethereum Transaction JSONAPI resource.
 type EthTxResource struct {
 	JAID
-	State    string          `json:"state"`
-	Data     hexutil.Bytes   `json:"data"`
-	From     *common.Address `json:"from"`
-	GasLimit string          `json:"gasLimit"`
-	GasPrice string          `json:"gasPrice"`
-	Hash     common.Hash     `json:"hash"`
-	Hex      string          `json:"rawHex"`
-	Nonce    string          `json:"nonce"`
-	SentAt   string          `json:"sentAt"`
-	To       *common.Address `json:"to"`
-	Value    string          `json:"value"`
+	State      string          `json:"state"`
+	Data       hexutil.Bytes   `json:"data"`
+	From       *common.Address `json:"from"`
+	GasLimit   string          `json:"gasLimit"`
+	GasPrice   string          `json:"gasPrice"`
+	Hash       common.Hash     `json:"hash"`
+	Hex        string          `json:"rawHex"`
+	Nonce      string          `json:"nonce"`
+	SentAt     string          `json:"sentAt"`
+	To         *common.Address `json:"to"`
+	Value      string          `json:"value"`
+	EVMChainID sqlutil.Big     `json:"evmChainID"`
 }
 
 // GetName implements the api2go EntityNamer interface
 func (EthTxResource) GetName() string {
-	return "transactions"
+	return "evm_transactions"
 }
 
 // NewEthTxResource generates a EthTxResource from an Eth.Tx.
@@ -34,31 +38,42 @@ func (EthTxResource) GetName() string {
 // For backwards compatibility, there is no id set when initializing from an
 // EthTx as the id being used was the EthTxAttempt Hash.
 // This should really use it's proper id
-func NewEthTxResource(tx models.EthTx) EthTxResource {
-	return EthTxResource{
+func NewEthTxResource(tx txmgr.Tx) EthTxResource {
+	v := assets.Eth(tx.Value)
+	r := EthTxResource{
 		Data:     hexutil.Bytes(tx.EncodedPayload),
 		From:     &tx.FromAddress,
-		GasLimit: strconv.FormatUint(tx.GasLimit, 10),
+		GasLimit: strconv.FormatUint(tx.FeeLimit, 10),
 		State:    string(tx.State),
 		To:       &tx.ToAddress,
-		Value:    tx.Value.String(),
+		Value:    v.String(),
 	}
+
+	if tx.ChainID != nil {
+		r.EVMChainID = *sqlutil.New(tx.ChainID)
+	}
+	return r
 }
 
-func NewEthTxResourceFromAttempt(txa models.EthTxAttempt) EthTxResource {
-	tx := txa.EthTx
+func NewEthTxResourceFromAttempt(txa txmgr.TxAttempt) EthTxResource {
+	tx := txa.Tx
 
 	r := NewEthTxResource(tx)
-	r.JAID = NewJAID(txa.Hash.Hex())
-	r.GasPrice = txa.GasPrice.String()
+	r.JAID = NewJAID(txa.Hash.String())
+	r.GasPrice = txa.TxFee.GasPrice.ToInt().String()
 	r.Hash = txa.Hash
 	r.Hex = hexutil.Encode(txa.SignedRawTx)
 
-	if tx.Nonce != nil {
-		r.Nonce = strconv.FormatUint(uint64(*tx.Nonce), 10)
+	if txa.Tx.ChainID != nil {
+		r.EVMChainID = *sqlutil.New(txa.Tx.ChainID)
+		r.JAID = NewPrefixedJAID(r.ID, txa.Tx.ChainID.String())
+	}
+
+	if tx.Sequence != nil {
+		r.Nonce = strconv.FormatInt(int64(*tx.Sequence), 10)
 	}
 	if txa.BroadcastBeforeBlockNum != nil {
-		r.SentAt = strconv.FormatUint(uint64(*txa.BroadcastBeforeBlockNum), 10)
+		r.SentAt = strconv.FormatInt(*txa.BroadcastBeforeBlockNum, 10)
 	}
 	return r
 }

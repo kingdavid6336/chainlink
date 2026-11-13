@@ -1,0 +1,183 @@
+package audit_test
+
+import (
+	"encoding/json"
+	"errors"
+	"flag"
+	"io"
+	"net/http"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"github.com/urfave/cli"
+
+	commonconfig "github.com/smartcontractkit/chainlink-common/pkg/config"
+	"github.com/smartcontractkit/chainlink-common/pkg/logger"
+	"github.com/smartcontractkit/chainlink/v2/core/internal/cltest"
+	"github.com/smartcontractkit/chainlink/v2/core/logger/audit"
+	"github.com/smartcontractkit/chainlink/v2/core/store/models"
+)
+
+type MockedHTTPEvent struct {
+	body string
+}
+
+type MockHTTPClient struct {
+	audit.HTTPAuditLoggerInterface
+
+	loggingChannel chan MockedHTTPEvent
+}
+
+type LoginData struct {
+	Email string `json:"email"`
+}
+
+type LoginLogItem struct {
+	EventID string    `json:"eventID"`
+	Env     string    `json:"env"`
+	Data    LoginData `json:"data"`
+}
+
+func (mock *MockHTTPClient) Do(req *http.Request) (*http.Response, error) {
+	b, err := io.ReadAll(req.Body)
+	if err != nil {
+		return nil, err
+	}
+
+	message := MockedHTTPEvent{
+		body: string(b),
+	}
+
+	mock.loggingChannel <- message
+
+	return &http.Response{}, nil
+}
+
+type Config struct{}
+
+func (c Config) Enabled() bool {
+	return true
+}
+
+func (c Config) Environment() string {
+	return "test"
+}
+
+func (c Config) ForwardToUrl() (commonconfig.URL, error) { //nolint:revive // method name required by interface
+	url, err := commonconfig.ParseURL("http://localhost:9898")
+	if err != nil {
+		return commonconfig.URL{}, err
+	}
+	return *url, nil
+}
+
+func (c Config) Headers() (models.ServiceHeaders, error) {
+	return make(models.ServiceHeaders, 0), nil
+}
+
+func (c Config) JsonWrapperKey() string { //nolint:revive // method name required by interface
+	return ""
+}
+
+// badForwardToURLConfig fails ForwardToUrl(), all other methods delegate to Config.
+type badForwardToURLConfig struct {
+	Config
+}
+
+func (c badForwardToURLConfig) ForwardToUrl() (commonconfig.URL, error) { //nolint:revive // method name required by interface
+	return commonconfig.URL{}, errors.New("bad forward-to url")
+}
+
+// badHeadersConfig fails Headers(), all other methods delegate to Config.
+type badHeadersConfig struct {
+	Config
+}
+
+func (c badHeadersConfig) Headers() (models.ServiceHeaders, error) {
+	return nil, errors.New("bad headers")
+}
+
+func TestNewAuditLogger_ConfigErrors(t *testing.T) {
+	t.Parallel()
+
+	lggr := logger.TestSugared(t)
+
+	t.Run("returns error when ForwardToUrl fails", func(t *testing.T) {
+		t.Parallel()
+
+		_, err := audit.NewAuditLogger(lggr, badForwardToURLConfig{})
+		require.ErrorContains(t, err, "bad forward-to url")
+	})
+
+	t.Run("returns error when Headers fails", func(t *testing.T) {
+		t.Parallel()
+
+		_, err := audit.NewAuditLogger(lggr, badHeadersConfig{})
+		require.ErrorContains(t, err, "bad headers")
+	})
+}
+
+func TestCheckLoginAuditLog(t *testing.T) {
+	t.Parallel()
+
+	// Create a channel that will be used instead of an HTTP client
+	loggingChannel := make(chan MockedHTTPEvent, 2048)
+
+	// Create the mock structure that will be used
+	mockHTTPClient := MockHTTPClient{
+		loggingChannel: loggingChannel,
+	}
+
+	// Create a test logger because the audit logger relies on this logger
+	// as well
+	lggr := logger.TestSugared(t)
+
+	auditLoggerTestConfig := Config{}
+
+	// Create new AuditLoggerService
+	auditLogger, err := audit.NewAuditLogger(lggr.Named("AuditLogger"), &auditLoggerTestConfig)
+	require.NoError(t, err)
+
+	// Cast to concrete type so we can swap out the internals
+	auditLoggerService, ok := auditLogger.(*audit.LoggerService)
+	assert.True(t, ok)
+
+	// Swap the internals with a testing handler
+	auditLoggerService.SetLoggingClient(&mockHTTPClient)
+	require.NoError(t, auditLoggerService.Ready())
+
+	// Create a new chainlink test application passing in our test logger
+	// and audit logger
+	app := cltest.NewApplication(t, lggr, auditLogger)
+	require.NoError(t, app.Start(t.Context()))
+
+	enteredStrings := []string{cltest.APIEmailAdmin, cltest.Password}
+	prompter := &cltest.MockCountingPrompter{T: t, EnteredStrings: enteredStrings}
+	client := app.NewAuthenticatingShell(prompter)
+
+	set := flag.NewFlagSet("test", 0)
+	set.Bool("bypass-version-check", true, "")
+	set.String("admin-credentials-file", "", "")
+	c := cli.NewContext(nil, set, nil)
+
+	// Login
+	err = client.RemoteLogin(c)
+	require.NoError(t, err)
+
+	select {
+	case event := <-loggingChannel:
+		deserialized := &LoginLogItem{}
+		require.NoError(t, json.Unmarshal([]byte(event.body), deserialized))
+
+		assert.Equal(t, cltest.APIEmailAdmin, deserialized.Data.Email)
+		assert.Equal(t, "test", deserialized.Env)
+
+		assert.Equal(t, "AUTH_LOGIN_SUCCESS_NO_2FA", deserialized.EventID)
+		return
+	case <-time.After(5 * time.Second):
+	}
+
+	assert.Fail(t, "timed out waiting for login audit log event")
+}

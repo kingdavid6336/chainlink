@@ -1,393 +1,1065 @@
 package chainlink
 
 import (
+	"bytes"
 	"context"
-	stderr "errors"
+	stderrors "errors"
 	"fmt"
+	"math/big"
+	"net/http"
 	"os"
-	"os/signal"
-	"reflect"
+	"slices"
+	"strconv"
 	"sync"
-	"syscall"
+	"time"
 
+	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/core/types"
+	"github.com/google/uuid"
+	otelpyroscope "github.com/grafana/otel-profiling-go"
+	"github.com/grafana/pyroscope-go"
+	"github.com/jonboulle/clockwork"
+	"github.com/pelletier/go-toml/v2"
 	"github.com/pkg/errors"
-	"github.com/smartcontractkit/chainlink/core/services/fluxmonitorv2"
-	"github.com/smartcontractkit/chainlink/core/services/gasupdater"
-	"github.com/smartcontractkit/chainlink/core/services/keeper"
-	"github.com/smartcontractkit/chainlink/core/services/periodicbackup"
-	"github.com/smartcontractkit/chainlink/core/services/telemetry"
-	"gorm.io/gorm"
+	"github.com/prometheus/client_golang/prometheus"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
+	"go.uber.org/zap/zapcore"
 
-	"github.com/gobuffalo/packr"
-	"github.com/smartcontractkit/chainlink/core/gracefulpanic"
-	"github.com/smartcontractkit/chainlink/core/logger"
-	"github.com/smartcontractkit/chainlink/core/services"
-	"github.com/smartcontractkit/chainlink/core/services/bulletprooftxmanager"
-	"github.com/smartcontractkit/chainlink/core/services/directrequest"
-	"github.com/smartcontractkit/chainlink/core/services/eth"
-	"github.com/smartcontractkit/chainlink/core/services/fluxmonitor"
-	"github.com/smartcontractkit/chainlink/core/services/job"
-	"github.com/smartcontractkit/chainlink/core/services/log"
-	"github.com/smartcontractkit/chainlink/core/services/offchainreporting"
-	"github.com/smartcontractkit/chainlink/core/services/pipeline"
-	"github.com/smartcontractkit/chainlink/core/services/postgres"
-	"github.com/smartcontractkit/chainlink/core/services/synchronization"
-	strpkg "github.com/smartcontractkit/chainlink/core/store"
-	"github.com/smartcontractkit/chainlink/core/store/models"
-	"github.com/smartcontractkit/chainlink/core/store/models/p2pkey"
-	"github.com/smartcontractkit/chainlink/core/store/orm"
-	"github.com/smartcontractkit/chainlink/core/utils"
-	ocrtypes "github.com/smartcontractkit/libocr/offchainreporting/types"
-	"go.uber.org/multierr"
-	"gopkg.in/guregu/null.v4"
+	ocrcommontypes "github.com/smartcontractkit/libocr/commontypes"
+	"github.com/smartcontractkit/libocr/offchainreporting2plus/ocr3_1types"
+
+	"github.com/smartcontractkit/chainlink-common/pkg/beholder"
+	"github.com/smartcontractkit/chainlink-common/pkg/capabilities/registry"
+	"github.com/smartcontractkit/chainlink-common/pkg/durableemitter"
+	"github.com/smartcontractkit/chainlink-common/pkg/loop"
+	nodeauthjwt "github.com/smartcontractkit/chainlink-common/pkg/nodeauth/jwt"
+	commonsrv "github.com/smartcontractkit/chainlink-common/pkg/services"
+	"github.com/smartcontractkit/chainlink-common/pkg/services/beholderhealth"
+	"github.com/smartcontractkit/chainlink-common/pkg/services/otelhealth"
+	"github.com/smartcontractkit/chainlink-common/pkg/services/promhealth"
+	"github.com/smartcontractkit/chainlink-common/pkg/settings"
+	commoncresettings "github.com/smartcontractkit/chainlink-common/pkg/settings/cresettings"
+	"github.com/smartcontractkit/chainlink-common/pkg/settings/limits"
+	"github.com/smartcontractkit/chainlink-common/pkg/sqlutil"
+	commontypes "github.com/smartcontractkit/chainlink-common/pkg/types"
+	"github.com/smartcontractkit/chainlink-common/pkg/utils"
+	"github.com/smartcontractkit/chainlink-common/pkg/utils/mailbox"
+	"github.com/smartcontractkit/chainlink-common/pkg/workflows/dontime"
+	"github.com/smartcontractkit/chainlink-data-streams/llo/retirement"
+	"github.com/smartcontractkit/chainlink-data-streams/mercury/wsrpc"
+	"github.com/smartcontractkit/chainlink-evm/pkg/chains/legacyevm"
+	"github.com/smartcontractkit/chainlink-evm/pkg/logpoller"
+	"github.com/smartcontractkit/chainlink-evm/pkg/txmgr"
+	evmutils "github.com/smartcontractkit/chainlink-evm/pkg/utils"
+	"github.com/smartcontractkit/chainlink/v2/core/bridges"
+	"github.com/smartcontractkit/chainlink/v2/core/build"
+	"github.com/smartcontractkit/chainlink/v2/core/capabilities/ccip"
+	"github.com/smartcontractkit/chainlink/v2/core/capabilities/confidentialrelay"
+	"github.com/smartcontractkit/chainlink/v2/core/capabilities/globalconfig"
+	"github.com/smartcontractkit/chainlink/v2/core/config"
+	configtoml "github.com/smartcontractkit/chainlink/v2/core/config/toml"
+	"github.com/smartcontractkit/chainlink/v2/core/logger"
+	"github.com/smartcontractkit/chainlink/v2/core/logger/audit"
+	"github.com/smartcontractkit/chainlink/v2/core/services"
+	"github.com/smartcontractkit/chainlink/v2/core/services/blockhashstore"
+	"github.com/smartcontractkit/chainlink/v2/core/services/blockheaderfeeder"
+	"github.com/smartcontractkit/chainlink/v2/core/services/ccv/ccvcommitteeverifier"
+	"github.com/smartcontractkit/chainlink/v2/core/services/ccv/ccvexecutor"
+	"github.com/smartcontractkit/chainlink/v2/core/services/cre"
+	"github.com/smartcontractkit/chainlink/v2/core/services/cresettings"
+	"github.com/smartcontractkit/chainlink/v2/core/services/cron"
+	"github.com/smartcontractkit/chainlink/v2/core/services/feeds"
+	"github.com/smartcontractkit/chainlink/v2/core/services/gateway"
+	"github.com/smartcontractkit/chainlink/v2/core/services/headreporter"
+	"github.com/smartcontractkit/chainlink/v2/core/services/job"
+	"github.com/smartcontractkit/chainlink/v2/core/services/keystore"
+	"github.com/smartcontractkit/chainlink/v2/core/services/nodestatusreporter/bridgestatus"
+	"github.com/smartcontractkit/chainlink/v2/core/services/nodestatusreporter/jobspec"
+	"github.com/smartcontractkit/chainlink/v2/core/services/ocr"
+	"github.com/smartcontractkit/chainlink/v2/core/services/ocr2"
+	"github.com/smartcontractkit/chainlink/v2/core/services/ocrbootstrap"
+	"github.com/smartcontractkit/chainlink/v2/core/services/ocrcommon"
+	"github.com/smartcontractkit/chainlink/v2/core/services/periodicbackup"
+	"github.com/smartcontractkit/chainlink/v2/core/services/pipeline"
+	"github.com/smartcontractkit/chainlink/v2/core/services/relay"
+	"github.com/smartcontractkit/chainlink/v2/core/services/ring"
+	"github.com/smartcontractkit/chainlink/v2/core/services/shardorchestrator"
+	"github.com/smartcontractkit/chainlink/v2/core/services/standardcapabilities"
+	"github.com/smartcontractkit/chainlink/v2/core/services/streams"
+	"github.com/smartcontractkit/chainlink/v2/core/services/telemetry"
+	"github.com/smartcontractkit/chainlink/v2/core/services/vrf"
+	workflowstore "github.com/smartcontractkit/chainlink/v2/core/services/workflows/store"
+	"github.com/smartcontractkit/chainlink/v2/core/sessions"
+	"github.com/smartcontractkit/chainlink/v2/core/sessions/ldapauth"
+	"github.com/smartcontractkit/chainlink/v2/core/sessions/localauth"
+	"github.com/smartcontractkit/chainlink/v2/core/sessions/oidcauth"
+	"github.com/smartcontractkit/chainlink/v2/core/static"
+	"github.com/smartcontractkit/chainlink/v2/plugins"
 )
-
-//go:generate mockery --name ExternalInitiatorManager --output ../../internal/mocks/ --case=underscore
-type (
-	// headTrackableCallback is a simple wrapper around an On Connect callback
-	headTrackableCallback struct {
-		onConnect func()
-	}
-
-	StartCloser interface {
-		Start() error
-		Close() error
-	}
-
-	// ExternalInitiatorManager manages HTTP requests to remote external initiators
-	ExternalInitiatorManager interface {
-		Notify(models.JobSpec, *strpkg.Store) error
-		DeleteJob(db *gorm.DB, jobID models.JobID) error
-	}
-)
-
-func (c *headTrackableCallback) Connect(*models.Head) error {
-	c.onConnect()
-	return nil
-}
-
-func (c *headTrackableCallback) Disconnect()                                    {}
-func (c *headTrackableCallback) OnNewLongestChain(context.Context, models.Head) {}
-
-//go:generate mockery --name Application --output ../../internal/mocks/ --case=underscore
 
 // Application implements the common functions used in the core node.
 type Application interface {
-	Start() error
+	Start(ctx context.Context) error
 	Stop() error
-	GetStore() *strpkg.Store
-	GetJobORM() job.ORM
-	GetExternalInitiatorManager() ExternalInitiatorManager
-	GetStatsPusher() synchronization.StatsPusher
+	GetLogger() logger.SugaredLogger
+	GetAuditLogger() audit.AuditLogger
+	GetHealthChecker() services.Checker
+	GetDB() sqlutil.DataSource
+	GetConfig() GeneralConfig
+	SetLogLevel(lvl zapcore.Level) error
+	GetKeyStore() keystore.Master
 	WakeSessionReaper()
-	AddJob(job models.JobSpec) error
-	AddJobV2(ctx context.Context, job job.Job, name null.String) (int32, error)
-	ArchiveJob(models.JobID) error
-	DeleteJobV2(ctx context.Context, jobID int32) error
-	RunJobV2(ctx context.Context, jobID int32, meta map[string]interface{}) (int64, error)
-	AddServiceAgreement(*models.ServiceAgreement) error
-	NewBox() packr.Box
-	services.RunManager
+	GetWebAuthnConfiguration() sessions.WebAuthnConfiguration
+
+	GetCapabilitiesRegistry() *registry.Registry
+
+	GetRelayers() RelayerChainInteroperators
+	GetLoopRegistry() *plugins.LoopRegistry
+	GetLoopRegistrarConfig() plugins.RegistrarConfig
+
+	// V2 Jobs (TOML specified)
+	JobSpawner() job.Spawner
+	JobORM() job.ORM
+	PipelineORM() pipeline.ORM
+	BridgeORM() bridges.ORM
+	BasicAdminUsersORM() sessions.BasicAdminUsersORM
+	AuthenticationProvider() sessions.AuthenticationProvider
+	TxmStorageService() txmgr.EvmTxStore
+	AddJobV2(ctx context.Context, job *job.Job) error
+	DeleteJob(ctx context.Context, jobID int32) error
+	ResumeJobV2(ctx context.Context, taskID uuid.UUID, result pipeline.Result) error
+	// Testing only
+	RunJobV2(ctx context.Context, jobID int32, meta map[string]any) (int64, error)
+
+	// Feeds
+	GetFeedsService() feeds.Service
+
+	// ReplayFromBlock replays logs from on or after the given block number. If forceBroadcast (evm only)
+	// is set to true, consumers will reprocess data even if it has already been processed.
+	ReplayFromBlock(ctx context.Context, chainFamily, chainID string, number uint64, forceBroadcast bool) error
+
+	// ID is unique to this particular application instance
+	ID() uuid.UUID
+
+	SecretGenerator() SecretGenerator
+
+	// FindLCA - finds last common ancestor for LogPoller's chain available in the database and RPC chain
+	FindLCA(ctx context.Context, chainID *big.Int) (*logpoller.Block, error)
+	// DeleteLogPollerDataAfter - delete LogPoller state starting from the specified block
+	DeleteLogPollerDataAfter(ctx context.Context, chainID *big.Int, start int64) error
+	// LPSkipToBlock repositions the LogPoller to start processing from the given block number.
+	LPSkipToBlock(ctx context.Context, chainFamily, chainID string, blockNumber int64) error
 }
 
-// ChainlinkApplication contains fields for the JobSubscriber, Scheduler,
+// Node contains fields for the JobSubscriber, Scheduler,
 // and Store. The JobSubscriber and Scheduler are also available
 // in the services package, but the Store has its own package.
-type ChainlinkApplication struct {
-	Exiter          func(int)
-	HeadTracker     *services.HeadTracker
-	HeadBroadcaster *services.HeadBroadcaster
-	StatsPusher     synchronization.StatsPusher
-	services.RunManager
-	RunQueue                 services.RunQueue
-	JobSubscriber            services.JobSubscriber
-	EthBroadcaster           bulletprooftxmanager.EthBroadcaster
-	LogBroadcaster           log.Broadcaster
-	EventBroadcaster         postgres.EventBroadcaster
-	JobORM                   job.ORM
-	jobSpawner               job.Spawner
-	pipelineRunner           pipeline.Runner
-	FluxMonitor              fluxmonitor.Service
-	Scheduler                *services.Scheduler
-	Store                    *strpkg.Store
-	ExternalInitiatorManager ExternalInitiatorManager
-	SessionReaper            utils.SleeperTask
-	pendingConnectionResumer *pendingConnectionResumer
-	shutdownOnce             sync.Once
-	shutdownSignal           gracefulpanic.Signal
-	balanceMonitor           services.BalanceMonitor
-	explorerClient           synchronization.ExplorerClient
-	subservices              []StartCloser
+type Node struct {
+	relayers                *CoreRelayerChainInteroperators
+	jobORM                  job.ORM
+	jobSpawner              job.Spawner
+	pipelineORM             pipeline.ORM
+	pipelineRunner          pipeline.Runner
+	bridgeORM               bridges.ORM
+	localAdminUsersORM      sessions.BasicAdminUsersORM
+	authenticationProvider  sessions.AuthenticationProvider // Note: this will be OIDC instance
+	txmStorageService       txmgr.EvmTxStore
+	FeedsService            feeds.Service
+	Config                  GeneralConfig
+	KeyStore                keystore.Master
+	SessionReaper           *utils.SleeperTask
+	shutdownOnce            sync.Once
+	srvcs                   []services.ServiceCtx
+	HealthChecker           services.Checker
+	logger                  logger.SugaredLogger
+	AuditLogger             audit.AuditLogger
+	closeLogger             func() error
+	ds                      sqlutil.DataSource
+	secretGenerator         SecretGenerator
+	profiler                *pyroscope.Profiler
+	loopRegistry            *plugins.LoopRegistry
+	loopRegistrarConfig     plugins.RegistrarConfig
+	capabilitiesRegistry    *registry.Registry
+	shardOrchestratorClient shardorchestrator.ClientInterface
 
 	started     bool
 	startStopMu sync.Mutex
+}
+
+type ChainlinkApplication = Node //nolint:revive // alias needed for backward compatibility
+
+type ApplicationOpts struct {
+	// CREOpts is the options for the CRE services
+	cre.Opts
+
+	Config                 GeneralConfig
+	Logger                 logger.Logger
+	Registerer             prometheus.Registerer
+	DS                     sqlutil.DataSource
+	KeyStore               keystore.Master
+	AuditLogger            audit.AuditLogger
+	CloseLogger            func() error
+	Version                string
+	VersionTag             string
+	DockerTag              string
+	RestrictedHTTPClient   *http.Client
+	UnrestrictedHTTPClient *http.Client
+	SecretGenerator        SecretGenerator
+	GRPCOpts               loop.GRPCOpts
+	MercuryPool            wsrpc.Pool
+	RetirementReportCache  retirement.RetirementReportCache
+	LLOTransmissionReaper  services.ServiceCtx
+	NewOracleFactoryFn     standardcapabilities.NewOracleFactoryFn
+	EVMFactoryConfigFn     func(*EVMFactoryConfig)
+	DonTimeStore           *dontime.Store
+	// LLOKeyValueDatabaseFactory replaces the on-disk store LLO v31 jobs use.
+	// Tests only.
+	LLOKeyValueDatabaseFactory ocr3_1types.KeyValueDatabaseFactory
+	// LLONetworkEndpointWrapper wraps the network endpoint factories LLO jobs
+	// use. Tests only.
+	LLONetworkEndpointWrapper ocr2.LLONetworkEndpointWrapper
+}
+
+// safeDefaultBootstrappers returns the configured default bootstrappers from
+// P2P.V2, or nil when the config or sub-configs are not set.
+func safeDefaultBootstrappers(cfg GeneralConfig) []ocrcommontypes.BootstrapperLocator {
+	if cfg == nil || cfg.P2P() == nil || cfg.P2P().V2() == nil {
+		return nil
+	}
+	return cfg.P2P().V2().DefaultBootstrappers()
+}
+
+// safeExternalRegistryAddress returns the Capabilities ExternalRegistry address,
+// or empty string when the config or sub-configs are not set.
+func safeExternalRegistryAddress(cfg GeneralConfig) string {
+	if cfg == nil || cfg.Capabilities() == nil || cfg.Capabilities().ExternalRegistry() == nil {
+		return ""
+	}
+	return cfg.Capabilities().ExternalRegistry().Address()
+}
+
+// safeExternalRegistryChainID returns the Capabilities ExternalRegistry chain ID,
+// or empty string when the config or sub-configs are not set.
+func safeExternalRegistryChainID(cfg GeneralConfig) string {
+	if cfg == nil || cfg.Capabilities() == nil || cfg.Capabilities().ExternalRegistry() == nil {
+		return ""
+	}
+	return cfg.Capabilities().ExternalRegistry().ChainID()
+}
+
+// localShardIndex returns this node's shard index, or 0 when sharding is disabled.
+func localShardIndex(s config.Sharding) uint32 {
+	if s == nil || !s.ShardingEnabled() {
+		return 0
+	}
+	return uint32(s.ShardIndex())
 }
 
 // NewApplication initializes a new store if one is not already
 // present at the configured root directory (default: ~/.chainlink),
 // the logger at the same directory and returns the Application to
 // be used by the node.
-func NewApplication(config *orm.Config, ethClient eth.Client, advisoryLocker postgres.AdvisoryLocker, keyStoreGenerator strpkg.KeyStoreGenerator, externalInitiatorManager ExternalInitiatorManager, onConnectCallbacks ...func(Application)) (Application, error) {
-	var subservices []StartCloser
-	var headTrackables []strpkg.HeadTrackable
+// TODO: Inject more dependencies here to save booting up useless stuff in tests
+func NewApplication(ctx context.Context, opts ApplicationOpts) (Application, error) {
+	var srvcs []services.ServiceCtx
 
-	shutdownSignal := gracefulpanic.NewSignal()
-	store, err := strpkg.NewStore(config, ethClient, advisoryLocker, shutdownSignal, keyStoreGenerator)
-	if err != nil {
-		return nil, err
+	heartbeat := NewHeartbeat(NewHeartbeatConfig(opts))
+	nodePlatformBuildInfo := NewNodePlatformBuildInfoService(NewNodePlatformBuildInfoConfig(opts))
+	srvcs = append(srvcs, &heartbeat, &nodePlatformBuildInfo)
+
+	auditLogger := opts.AuditLogger
+	cfg := opts.Config
+	globalLogger := logger.Sugared(opts.Logger)
+	keyStore := opts.KeyStore
+	restrictedHTTPClient := opts.RestrictedHTTPClient
+	unrestrictedHTTPClient := opts.UnrestrictedHTTPClient
+	meter := beholder.GetMeter()
+
+	mailMon := mailbox.NewMonitor(cfg.AppID().String(), globalLogger.Named("Mailbox"))
+
+	if opts.CapabilitiesRegistry == nil {
+		// for tests only, in prod Registry should always be set at this point
+		opts.CapabilitiesRegistry = registry.NewRegistry(globalLogger)
 	}
 
-	setupConfig(config, store)
-
-	explorerClient := synchronization.ExplorerClient(&synchronization.NoopExplorerClient{})
-	statsPusher := synchronization.StatsPusher(&synchronization.NoopStatsPusher{})
-	monitoringEndpoint := ocrtypes.MonitoringEndpoint(&telemetry.NoopAgent{})
-
-	if config.ExplorerURL() != nil {
-		explorerClient = synchronization.NewExplorerClient(config.ExplorerURL(), config.ExplorerAccessKey(), config.ExplorerSecret(), config.StatsPusherLogging())
-		statsPusher = synchronization.NewStatsPusher(store.DB, explorerClient)
-		monitoringEndpoint = telemetry.NewAgent(explorerClient)
+	if opts.ExecutionHandlers == nil {
+		opts.ExecutionHandlers = &confidentialrelay.ExecutionHandlers{}
 	}
 
-	if store.Config.GasUpdaterEnabled() {
-		logger.Debugw("GasUpdater: dynamic gas updates are enabled", "ethGasPriceDefault", store.Config.EthGasPriceDefault())
-		gasUpdater := gasupdater.NewGasUpdater(store.EthClient, store.Config)
-		subservices = append(subservices, gasUpdater)
-		headTrackables = append(headTrackables, gasUpdater)
-	} else {
-		logger.Debugw("GasUpdater: dynamic gas updating is disabled", "ethGasPriceDefault", store.Config.EthGasPriceDefault())
+	if opts.DonTimeStore == nil {
+		opts.DonTimeStore = dontime.NewStore(dontime.DefaultRequestTimeout)
 	}
 
-	if store.Config.DatabaseBackupMode() != orm.DatabaseBackupModeNone && store.Config.DatabaseBackupFrequency() > 0 {
-		logger.Infow("DatabaseBackup: periodic database backups are enabled", "frequency", store.Config.DatabaseBackupFrequency())
-
-		databaseBackup := periodicbackup.NewDatabaseBackup(store.Config, logger.Default)
-		subservices = append(subservices, databaseBackup)
-	} else {
-		logger.Info("DatabaseBackup: periodic database backups are disabled")
-	}
-
-	runExecutor := services.NewRunExecutor(store, statsPusher)
-	runQueue := services.NewRunQueue(runExecutor)
-	runManager := services.NewRunManager(runQueue, config, store.ORM, statsPusher, store.Clock)
-	jobSubscriber := services.NewJobSubscriber(store, runManager)
-	promReporter := services.NewPromReporter(store.MustSQLDB())
-	logBroadcaster := log.NewBroadcaster(log.NewORM(store.DB), ethClient, store.Config)
-	eventBroadcaster := postgres.NewEventBroadcaster(config.DatabaseURL(), config.DatabaseListenerMinReconnectInterval(), config.DatabaseListenerMaxReconnectDuration())
-	fluxMonitor := fluxmonitor.New(store, runManager, logBroadcaster)
-	ethBroadcaster := bulletprooftxmanager.NewEthBroadcaster(store, config, eventBroadcaster)
-	ethConfirmer := bulletprooftxmanager.NewEthConfirmer(store, config)
-	headBroadcaster := services.NewHeadBroadcaster()
-	var balanceMonitor services.BalanceMonitor
-	if config.BalanceMonitorEnabled() {
-		balanceMonitor = services.NewBalanceMonitor(store)
-	} else {
-		balanceMonitor = &services.NullBalanceMonitor{}
-	}
-
-	var (
-		pipelineORM    = pipeline.NewORM(store.ORM.DB, store.Config, eventBroadcaster)
-		pipelineRunner = pipeline.NewRunner(pipelineORM, store.Config)
-		jobORM         = job.NewORM(store.ORM.DB, store.Config, pipelineORM, eventBroadcaster, advisoryLocker)
-	)
-
-	var (
-		delegates = map[job.Type]job.Delegate{
-			job.DirectRequest: directrequest.NewDelegate(
-				logBroadcaster,
-				headBroadcaster,
-				pipelineRunner,
-				pipelineORM,
-				ethClient,
-				store.DB,
-				config,
-			),
-			job.Keeper: keeper.NewDelegate(store.DB, store.EthClient, headBroadcaster, logBroadcaster, config),
-		}
-	)
-
-	if config.Dev() || config.FeatureFluxMonitorV2() {
-		delegates[job.FluxMonitor] = fluxmonitorv2.NewDelegate(
-			store,
-			jobORM,
-			pipelineORM,
-			pipelineRunner,
-			store.DB,
-			ethClient,
-			logBroadcaster,
-			fluxmonitorv2.Config{
-				DefaultHTTPTimeout:         store.Config.DefaultHTTPTimeout().Duration(),
-				FlagsContractAddress:       store.Config.FlagsContractAddress(),
-				MinContractPayment:         store.Config.MinimumContractPayment(),
-				EthGasLimit:                store.Config.EthGasLimitDefault(),
-				MaxUnconfirmedTransactions: store.Config.EthMaxUnconfirmedTransactions(),
-			},
-		)
-	}
-
-	if (config.Dev() && config.P2PListenPort() > 0) || config.FeatureOffchainReporting() {
-		logger.Debug("Off-chain reporting enabled")
-		concretePW := offchainreporting.NewSingletonPeerWrapper(store.OCRKeyStore, config, store.DB)
-		subservices = append(subservices, concretePW)
-		delegates[job.OffchainReporting] = offchainreporting.NewDelegate(
-			store.DB,
-			jobORM,
-			config,
-			store.OCRKeyStore,
-			pipelineRunner,
-			ethClient,
-			logBroadcaster,
-			concretePW,
-			monitoringEndpoint,
-		)
-	} else {
-		logger.Debug("Off-chain reporting disabled")
-	}
-	jobSpawner := job.NewSpawner(jobORM, store.Config, delegates)
-	subservices = append(subservices, jobSpawner, pipelineRunner, ethBroadcaster, ethConfirmer, headBroadcaster)
-
-	store.NotifyNewEthTx = ethBroadcaster
-
-	pendingConnectionResumer := newPendingConnectionResumer(runManager)
-
-	app := &ChainlinkApplication{
-		HeadBroadcaster:          headBroadcaster,
-		JobSubscriber:            jobSubscriber,
-		EthBroadcaster:           ethBroadcaster,
-		LogBroadcaster:           logBroadcaster,
-		EventBroadcaster:         eventBroadcaster,
-		JobORM:                   jobORM,
-		jobSpawner:               jobSpawner,
-		pipelineRunner:           pipelineRunner,
-		FluxMonitor:              fluxMonitor,
-		StatsPusher:              statsPusher,
-		RunManager:               runManager,
-		RunQueue:                 runQueue,
-		Scheduler:                services.NewScheduler(store, runManager),
-		Store:                    store,
-		SessionReaper:            services.NewStoreReaper(store),
-		Exiter:                   os.Exit,
-		ExternalInitiatorManager: externalInitiatorManager,
-		pendingConnectionResumer: pendingConnectionResumer,
-		shutdownSignal:           shutdownSignal,
-		balanceMonitor:           balanceMonitor,
-		explorerClient:           explorerClient,
-		// NOTE: Can keep things clean by putting more things in subservices
-		// instead of manually start/closing
-		subservices: subservices,
-	}
-
-	headTrackables = append(
-		headTrackables,
-		ethConfirmer,
-		jobSubscriber,
-		pendingConnectionResumer,
-		balanceMonitor,
-		promReporter,
-		headBroadcaster,
-	)
-
-	for _, onConnectCallback := range onConnectCallbacks {
-		headTrackable := &headTrackableCallback{func() {
-			onConnectCallback(app)
-		}}
-		headTrackables = append(headTrackables, headTrackable)
-	}
-	app.HeadTracker = services.NewHeadTracker(store, headTrackables)
-
-	return app, nil
-}
-
-func setupConfig(config *orm.Config, store *strpkg.Store) {
-	config.SetRuntimeStore(store.ORM)
-
-	if !config.P2PPeerIDIsSet() {
-		var keys []p2pkey.EncryptedP2PKey
-		err := store.DB.Order("created_at asc, id asc").Find(&keys).Error
-		if err != nil {
-			logger.Warnw("Failed to load keys", "err", err)
+	var ringStoreForShard0 *ring.Store
+	var shardOrchestratorClient shardorchestrator.ClientInterface
+	if cfg.Sharding().ShardingEnabled() {
+		assignmentMode := cfg.Sharding().ShardAssignmentMode()
+		if assignmentMode == configtoml.ShardAssignmentModeManualOnly {
+			globalLogger.Infow("Sharding enabled in manual-only mode; skipping ShardOrchestrator infrastructure")
 		} else {
-			if len(keys) > 0 {
-				peerID := keys[0].PeerID
-				logger.Debugw("P2P_PEER_ID was not set, using the first available key", "peerID", peerID.String())
-				config.Set("P2P_PEER_ID", peerID)
-				if len(keys) > 1 {
-					logger.Warnf("Found more than one P2P key in the database, but no P2P_PEER_ID was specified. Defaulting to first key: %s. Please consider setting P2P_PEER_ID explicitly.", peerID.String())
+			shardIdx := cfg.Sharding().ShardIndex()
+			if shardIdx == 0 {
+				ringStoreForShard0 = ring.NewStore()
+				server := shardorchestrator.NewServer(ringStoreForShard0, globalLogger)
+				shardOrchestratorClient = shardorchestrator.NewLocalClient(server, globalLogger)
+				globalLogger.Infow("ShardOrchestrator in-process client created", "shardIndex", shardIdx)
+			} else {
+				shardOrchestratorAddr := cfg.Sharding().ShardOrchestratorAddress()
+				if shardOrchestratorAddr == nil {
+					return nil, fmt.Errorf("shard %d requires ShardOrchestratorAddress when sharding is enabled", shardIdx)
 				}
+				client, err := shardorchestrator.NewClient(shardOrchestratorAddr.String(), globalLogger.Named("ShardOrchestratorClient"))
+				if err != nil {
+					return nil, fmt.Errorf("failed to create ShardOrchestrator gRPC client: %w", err)
+				}
+				shardOrchestratorClient = client
+				globalLogger.Infow("ShardOrchestrator gRPC client created", "shardIndex", shardIdx, "serverAddress", shardOrchestratorAddr.String())
 			}
 		}
+	} else {
+		globalLogger.Debug("Sharding not enabled, running without shard orchestrator client")
 	}
+
+	creSettingsTOML, err := toml.Marshal(commoncresettings.Default)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal cre settings TOML: %w", err)
+	}
+	globalLogger.Debugf("# CRESettings defaults: \n%s", creSettingsTOML)
+	atomicSettings := &settings.Atomic{}
+	atomicSettings.SetGetter(commoncresettings.DefaultGetter)
+	shardAssignmentSettings := &settings.Atomic{}
+	offchainCapRegistry := globalconfig.New()
+	limitsFactory := limits.Factory{
+		Meter:    meter,
+		Logger:   globalLogger.Named("Limits"),
+		Settings: atomicSettings,
+	}
+
+	csaKeystore := &keystore.CSASigner{CSA: keyStore.CSA()}
+	beholderAuthHeaders, csaPubKeyHex, err := keystore.BuildBeholderAuth(ctx, keyStore.CSA())
+	if err != nil {
+		return nil, fmt.Errorf("failed to build Beholder auth: %w", err)
+	}
+	loopRegistry := plugins.NewLoopRegistry(globalLogger, cfg.AppID().String(), cfg.Feature().LogPoller(),
+		cfg.Database(), cfg.Mercury(), cfg.Pyroscope(), cfg.AutoPprof(), cfg.Tracing(), cfg,
+		cfg.Metering(), beholderAuthHeaders, csaPubKeyHex, cfg.LOOPP())
+
+	relayerFactory := RelayerFactory{
+		Logger:                opts.Logger,
+		Registerer:            opts.Registerer,
+		LoopRegistry:          loopRegistry,
+		GRPCOpts:              opts.GRPCOpts,
+		MercuryPool:           opts.MercuryPool,
+		CapabilitiesRegistry:  opts.CapabilitiesRegistry,
+		HTTPClient:            opts.UnrestrictedHTTPClient,
+		RetirementReportCache: opts.RetirementReportCache,
+	}
+
+	evmFactoryCfg := EVMFactoryConfig{
+		ChainOpts: legacyevm.ChainOpts{
+			ChainConfigs:   cfg.EVMConfigs(),
+			DatabaseConfig: cfg.Database(),
+			ListenerConfig: cfg.Database().Listener(),
+			FeatureConfig:  cfg.Feature(),
+			MailMon:        mailMon,
+			DS:             opts.DS,
+			// The global beholder client is initialized before this point
+			// (initGlobals, during BeforeNode), so chains get a real meter.
+			Meter: beholder.GetMeter(),
+		},
+		EthKeystore:   keyStore.Eth(),
+		CSAKeystore:   csaKeystore,
+		MercuryConfig: cfg.Mercury(),
+	}
+
+	if opts.EVMFactoryConfigFn != nil {
+		opts.EVMFactoryConfigFn(&evmFactoryCfg)
+	}
+
+	// evm always enabled for backward compatibility
+	// TODO BCF-2510 this needs to change in order to clear the path for EVM extraction
+	initOps := []CoreRelayerChainInitFunc{InitDummy(relayerFactory), InitEVM(relayerFactory, evmFactoryCfg)}
+
+	if cfg.SolanaEnabled() {
+		initOps = append(initOps, InitSolana(relayerFactory, keyStore.Solana(), keyStore.CSA(), cfg.SolanaConfigs()))
+	}
+	if cfg.StarkNetEnabled() {
+		initOps = append(initOps, InitStarknet(relayerFactory, keyStore.StarkNet(), keyStore.CSA(), cfg.StarknetConfigs()))
+	}
+	if cfg.AptosEnabled() {
+		initOps = append(initOps, InitAptos(relayerFactory, keyStore.Aptos(), keyStore.CSA(), cfg.AptosConfigs()))
+	}
+	if cfg.TronEnabled() {
+		initOps = append(initOps, InitTron(relayerFactory, keyStore.Tron(), keyStore.CSA(), cfg.TronConfigs()))
+	}
+	if cfg.TONEnabled() {
+		initOps = append(initOps, InitTON(relayerFactory, keyStore.TON(), keyStore.CSA(), cfg.TONConfigs()))
+	}
+	if cfg.SuiEnabled() {
+		initOps = append(initOps, InitSui(relayerFactory, keyStore.Sui(), keyStore.CSA(), cfg.SuiConfigs()))
+	}
+	if cfg.StellarEnabled() {
+		initOps = append(initOps, InitStellar(relayerFactory, keyStore.Stellar(), keyStore.CSA(), cfg.StellarConfigs()))
+	}
+
+	relayChainInterops, err := NewCoreRelayerChainInteroperators(initOps...)
+	if err != nil {
+		return nil, fmt.Errorf("failed to initialize relayer chain interoperators: %w", err)
+	}
+
+	var peerWrapper *ocrcommon.SingletonPeerWrapper
+	if !cfg.OCR().Enabled() && !cfg.OCR2().Enabled() {
+		globalLogger.Debug("P2P stack not needed")
+	} else {
+		if !cfg.P2P().Enabled() {
+			return nil, errors.New("P2P stack required for OCR or OCR2")
+		}
+		if err2 := ocrcommon.ValidatePeerWrapperConfig(cfg.P2P()); err != nil {
+			return nil, fmt.Errorf("invalid P2P config: %w", err2)
+		}
+		peerWrapper = ocrcommon.NewSingletonPeerWrapper(keyStore, cfg.P2P(), cfg.OCR(), opts.DS, globalLogger)
+		srvcs = append(srvcs, peerWrapper)
+	}
+
+	workflowKey, err := keystore.GetDefault(ctx, keyStore.Workflow())
+	if err != nil {
+		return nil, fmt.Errorf("failed to get default workflow key: %w", err)
+	}
+
+	csaSigner, csaPubKey, err := keystore.BuildNodeAuth(ctx, csaKeystore)
+	if err != nil {
+		return nil, fmt.Errorf("failed to build node auth: %w", err)
+	}
+	jwtGenerator := nodeauthjwt.NewNodeJWTGenerator(csaSigner, csaPubKey)
+
+	// Wire DurableEmitter for persistent chip ingress delivery when enabled
+	var durableEmit func(ctx context.Context, body []byte, attrKVs ...any) error
+	if cfg.Telemetry().DurableEmitterEnabled() && cfg.Telemetry().ChipIngressEndpoint() != "" {
+		emitterCfg := durableemitter.DefaultConfig()
+		emitterCfg.Metrics = &durableemitter.DurableEmitterMetricsConfig{
+			MaxQueuePayloadBytes: cfg.Telemetry().DurableEmitterMaxQueuePayloadBytes(),
+		}
+		emitterCfg.InsertBatchSize = 500
+		emitterCfg.InsertBatchWorkers = 6
+		emitterCfg.InsertBatchFlushInterval = cfg.Telemetry().DurableEmitterInsertBatchFlushInterval() // default 50ms, configurable via [Telemetry]
+		emitterCfg.DeleteBatchSize = 500
+		emitterCfg.DeleteBatchWorkers = 6
+		emitterCfg.DeleteBatchFlushInterval = 100 * time.Millisecond
+		// Recovery profile: retransmit replays the post-outage backlog while the
+		// primary path keeps delivering live emits — both feed the same BatchEmitter,
+		// which has ample headroom (BatchSize × MaxConcurrentSends) for live + backlog.
+		//   - RetransmitInterval = 1s, so RetransmitBatchSize is literally the backlog
+		//     replay rate in events/s. Keep it below BatchEmitter capacity minus the
+		//     live rate, so live emits are never starved out of the buffer.
+		//   - RetransmitAfter MUST exceed delivery latency so an in-flight event is
+		//     never re-queued (the real storm guard — the rate itself is safe because
+		//     MaxConcurrentSends bounds actual downstream load).
+		//   - EventTTL MUST exceed the recovery duration, or the backlog EXPIRES
+		//     (rows dropped by the 1-min expiry loop) before it can be delivered — a
+		//     fake "drain". 6h gives a wide margin for the test.
+		emitterCfg.RetransmitAfter = 60 * time.Second                                        // > PublishTimeout/MaxPublishTimeout (20s) + buffering
+		emitterCfg.RetransmitBatchSize = cfg.Telemetry().DurableEmitterRetransmitBatchSize() // events/s replayed (interval = 1s); default 500, configurable via [Telemetry]
+		emitterCfg.RetransmitInterval = 1 * time.Second
+		emitterCfg.EventTTL = cfg.Telemetry().DurableEmitterEventTTL() // default 1h, configurable via [Telemetry]
+		emitterCfg.PublishTimeout = 20 * time.Second
+		durableCfg := durableemitter.SetupConfig{
+			Endpoint:           cfg.Telemetry().ChipIngressEndpoint(),
+			InsecureConnection: cfg.Telemetry().ChipIngressInsecureConnection(),
+			Auth: durableemitter.AuthConfig{
+				AuthHeaders:      beholderAuthHeaders,
+				AuthHeadersTTL:   cfg.Telemetry().AuthHeadersTTL(),
+				AuthPublicKeyHex: csaPubKeyHex,
+				AuthKeySigner:    csaKeystore,
+			},
+			RetransmitEnabled:  true, // host process owns retransmit
+			EmitterConfig:      &emitterCfg,
+			Meter:              meter,
+			MaxPublishTimeout:  10 * time.Second, // batch emitter rpc timeout
+			BatchSize:          1000,
+			BatchInterval:      100 * time.Millisecond,
+			MaxConcurrentSends: 8,
+			MessageBufferSize:  50_000,
+		}
+		pgStore := durableemitter.NewPgDurableEventStore(opts.DS)
+		durableEmitter, setupErr := durableemitter.Setup(pgStore, durableCfg, globalLogger)
+		if setupErr != nil {
+			return nil, fmt.Errorf("failed to set up chip durable emitter: %w", setupErr)
+		}
+		srvcs = append(srvcs, durableEmitter)
+		// Wrap durableEmitter to return ErrEmitFailed on error.
+		durableEmit = func(ctx context.Context, body []byte, attrKVs ...any) error {
+			if emitErr := durableEmitter.Emit(ctx, body, attrKVs...); emitErr != nil {
+				return fmt.Errorf("%w: %w", durableemitter.ErrEmitFailed, emitErr)
+			}
+			return nil
+		}
+	}
+
+	creServices, err := cre.NewServices(
+		globalLogger,
+		opts.DS,
+		keyStore,
+		cfg,
+		relayChainInterops,
+		peerWrapper,
+		cre.Opts{
+			CapabilitiesRegistry:         opts.CapabilitiesRegistry,
+			ExecutionHandlers:            &confidentialrelay.ExecutionHandlers{},
+			CapabilitiesDispatcher:       opts.CapabilitiesDispatcher,
+			CapabilitiesSharedPeer:       opts.CapabilitiesSharedPeer,
+			FetcherFunc:                  opts.FetcherFunc,
+			BillingClient:                opts.BillingClient,
+			LinkingClient:                opts.LinkingClient,
+			Meter:                        meter,
+			DurableEmit:                  durableEmit,
+			StorageClient:                opts.StorageClient,
+			DonTimeStore:                 opts.DonTimeStore,
+			LimitsFactory:                limitsFactory,
+			UseLocalTimeProvider:         opts.UseLocalTimeProvider,
+			WorkflowKey:                  workflowKey,
+			JWTGenerator:                 jwtGenerator,
+			ShardOrchestratorClient:      shardOrchestratorClient,
+			ShardAssignmentSettings:      shardAssignmentSettings,
+			OffchainCapabilitiesRegistry: offchainCapRegistry,
+		},
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to initialize CRE: %w", err)
+	}
+	srvcs = append(srvcs, creServices)
+
+	// If the audit logger is enabled
+	if auditLogger.Ready() == nil {
+		srvcs = append(srvcs, auditLogger)
+	}
+
+	var profiler *pyroscope.Profiler
+	if cfg.Pyroscope().ServerAddress() != "" {
+		globalLogger.Debug("Pyroscope (automatic pprof profiling) is enabled")
+		var err2 error
+		profiler, err2 = logger.StartPyroscope(cfg.Pyroscope(), cfg.AutoPprof())
+		if err2 != nil {
+			return nil, errors.Wrap(err2, "starting pyroscope (automatic pprof profiling) failed")
+		}
+
+		if cfg.Pyroscope().LinkTracesToProfiles() && cfg.Tracing().Enabled() {
+			// Enable span profiling - link OTel traces to Pyroscope profiles
+			// This wraps the global tracer provider to record span IDs alongside profile samples
+			otel.SetTracerProvider(
+				otelpyroscope.NewTracerProvider(
+					otel.GetTracerProvider(),
+					otelpyroscope.WithAppName("chainlink-node"),
+					otelpyroscope.WithPyroscopeURL(cfg.Pyroscope().ServerAddress()),
+				),
+			)
+		}
+	} else {
+		globalLogger.Debug("Pyroscope (automatic pprof profiling) is disabled")
+	}
+
+	ap := cfg.AutoPprof()
+	if ap.Enabled() {
+		globalLogger.Info("Nurse service (automatic pprof profiling) is enabled")
+		srvcs = append(srvcs, services.NewNurse(ap, globalLogger))
+	} else {
+		globalLogger.Info("Nurse service (automatic pprof profiling) is disabled")
+	}
+
+	telemetryManager := telemetry.NewManager(cfg.TelemetryIngress(), csaKeystore, globalLogger)
+	srvcs = append(srvcs, telemetryManager)
+
+	backupCfg := cfg.Database().Backup()
+	if backupCfg.Mode() != config.DatabaseBackupModeNone && backupCfg.Frequency() > 0 {
+		globalLogger.Infow("DatabaseBackup: periodic database backups are enabled", "frequency", backupCfg.Frequency())
+
+		databaseBackup, err2 := periodicbackup.NewDatabaseBackup(cfg.Database().URL(), cfg.RootDir(), backupCfg, globalLogger)
+		if err2 != nil {
+			return nil, errors.Wrap(err2, "NewApplication: failed to initialize database backup")
+		}
+		srvcs = append(srvcs, databaseBackup)
+	} else {
+		globalLogger.Info("DatabaseBackup: periodic database backups are disabled. To enable automatic backups, set Database.Backup.Mode=lite or Database.Backup.Mode=full")
+	}
+
+	// pool must be started before all relayers and stopped after them
+	if opts.MercuryPool != nil {
+		srvcs = append(srvcs, opts.MercuryPool)
+	}
+	if opts.RetirementReportCache != nil {
+		srvcs = append(srvcs, opts.RetirementReportCache)
+	}
+	if opts.LLOTransmissionReaper != nil {
+		srvcs = append(srvcs, opts.LLOTransmissionReaper)
+	}
+
+	// EVM chains are used all over the place. This will need to change for fully EVM extraction
+	// TODO: BCF-2510, BCF-2511
+
+	legacyEVMChains := relayChainInterops.LegacyEVMChains()
+	if legacyEVMChains == nil {
+		return nil, errors.New("no evm chains found")
+	}
+
+	srvcs = append(srvcs, mailMon)
+	srvcs = append(srvcs, relayChainInterops.Services()...)
+
+	// Initialize Local Users ORM and Authentication Provider specified in config
+	// BasicAdminUsersORM is initialized and required regardless of separate Authentication Provider
+	localAdminUsersORM := localauth.NewORM(opts.DS, cfg.WebServer().SessionTimeout().Duration(), globalLogger, auditLogger)
+
+	// Initialize Sessions ORM based on environment configured authenticator
+	// localDB auth, LDAP auth, or OIDC auth
+	authMethod := cfg.WebServer().AuthenticationMethod()
+	var authenticationProvider sessions.AuthenticationProvider
+	var sessionReaper *utils.SleeperTask
+
+	switch sessions.AuthenticationProviderName(authMethod) {
+	case sessions.LDAPAuth:
+		var err2 error
+		authenticationProvider, err2 = ldapauth.NewLDAPAuthenticator(
+			opts.DS, cfg.WebServer().LDAP(), cfg.Insecure().DevWebServer(), globalLogger, auditLogger,
+		)
+		if err2 != nil {
+			return nil, errors.Wrap(err2, "NewApplication: failed to initialize LDAP Authentication module")
+		}
+		syncer := ldapauth.NewLDAPServerStateSyncer(opts.DS, cfg.WebServer().LDAP(), globalLogger)
+		srvcs = append(srvcs, syncer)
+		sessionReaper = utils.NewSleeperTaskCtx(syncer)
+	case sessions.OIDCAuth:
+		var err2 error
+		authenticationProvider, err2 = oidcauth.NewOIDCAuthenticator(
+			opts.DS, cfg.WebServer().OIDC(), globalLogger, auditLogger,
+		)
+		if err2 != nil {
+			return nil, errors.Wrap(err2, "NewApplication: failed to initialize OIDC Authentication module")
+		}
+		sessionReaper = oidcauth.NewSessionReaper(opts.DS, cfg.WebServer(), globalLogger)
+	case sessions.LocalAuth:
+		authenticationProvider = localauth.NewORM(opts.DS, cfg.WebServer().SessionTimeout().Duration(), globalLogger, auditLogger)
+		sessionReaper = localauth.NewSessionReaper(opts.DS, cfg.WebServer(), globalLogger)
+	default:
+		return nil, errors.Errorf("NewApplication: Unexpected 'AuthenticationMethod': %s supported values: %s, %s", authMethod, sessions.LocalAuth, sessions.LDAPAuth)
+	}
+
+	var (
+		pipelineORM    = pipeline.NewORM(opts.DS, globalLogger, cfg.JobPipeline().MaxSuccessfulRuns())
+		bridgeORM      = bridges.NewORM(opts.DS)
+		pipelineRunner = pipeline.NewRunner(pipelineORM, bridgeORM, cfg.JobPipeline(), cfg.WebServer(), legacyEVMChains, keyStore.Eth(), keyStore.VRF(), globalLogger, restrictedHTTPClient, unrestrictedHTTPClient)
+		jobORM         = job.NewORM(opts.DS, pipelineORM, bridgeORM, keyStore, globalLogger)
+		txmORM         = txmgr.NewTxStore(opts.DS, globalLogger)
+		streamRegistry = streams.NewRegistry(globalLogger, pipelineRunner)
+		workflowORM    = workflowstore.NewInMemoryStore(globalLogger, clockwork.NewRealClock())
+	)
+	srvcs = append(srvcs, workflowORM)
+
+	nodePlatformJobInfo := NewNodePlatformJobInfoService(NewNodePlatformJobInfoConfig(opts, jobORM, relayChainInterops))
+	srvcs = append(srvcs, &nodePlatformJobInfo)
+
+	promReporter := headreporter.NewLegacyEVMPrometheusReporter(opts.DS, legacyEVMChains)
+	evmChainIDs := make([]*big.Int, len(cfg.EVMConfigs()))
+	for i, chain := range cfg.EVMConfigs() {
+		evmChainIDs[i] = chain.ChainID.ToInt()
+	}
+
+	legacyEVMTelemReporter := headreporter.NewLegacyEVMTelemetryReporter(telemetryManager, globalLogger, evmChainIDs...)
+	loopTelemReporter := headreporter.NewTelemetryReporter(telemetryManager, globalLogger, relayChainInterops.GetIDToRelayerMap())
+	headReporters := []headreporter.HeadReporter{promReporter, legacyEVMTelemReporter, loopTelemReporter}
+	if headMetrics, metricsErr := headreporter.NewBeholderHeadMetrics(); metricsErr != nil {
+		globalLogger.Errorw("Failed to initialize head reporter Beholder metrics; skipping head metrics reporters", "err", metricsErr)
+	} else {
+		headReporters = append(headReporters, headreporter.NewEVMMetricsReporter(headMetrics, globalLogger, evmChainIDs...))
+		if relayerMetricsReporter := headreporter.NewRelayerMetricsReporter(headMetrics, globalLogger, relayChainInterops.GetIDToRelayerMap()); relayerMetricsReporter != nil {
+			headReporters = append(headReporters, relayerMetricsReporter)
+		}
+	}
+	headReporter := headreporter.NewHeadReporterService(opts.DS, globalLogger, headReporters...)
+	srvcs = append(srvcs, headReporter)
+	for _, chain := range legacyEVMChains.Slice() {
+		legacyChain, ok := chain.(legacyevm.Chain)
+		if !ok {
+			continue
+		}
+		legacyChain.HeadBroadcaster().Subscribe(headReporter)
+		legacyChain.TxManager().RegisterResumeCallback(pipelineRunner.ResumeRun)
+	}
+
+	srvcs = append(srvcs, pipelineORM)
+
+	loopRegistrarConfig := plugins.NewRegistrarConfig(opts.GRPCOpts, loopRegistry.Register, loopRegistry.Unregister)
+
+	delegates := map[job.Type]job.Delegate{
+		job.DirectRequest: &job.DeprecatedDelegate{Type: job.DirectRequest},
+		job.VRF: vrf.NewDelegate(
+			opts.DS,
+			keyStore,
+			pipelineRunner,
+			pipelineORM,
+			legacyEVMChains,
+			globalLogger,
+			mailMon,
+		),
+		job.Webhook: &job.DeprecatedDelegate{Type: job.Webhook},
+		job.Cron: cron.NewDelegate(
+			pipelineRunner,
+			globalLogger,
+		),
+		job.BlockhashStore: blockhashstore.NewDelegate(
+			cfg,
+			globalLogger,
+			legacyEVMChains,
+			keyStore.Eth(),
+		),
+		job.BlockHeaderFeeder: blockheaderfeeder.NewDelegate(
+			cfg,
+			globalLogger,
+			legacyEVMChains,
+			keyStore.Eth(),
+		),
+		job.Gateway: gateway.NewDelegate(
+			legacyEVMChains,
+			keyStore.Eth(),
+			opts.DS,
+			opts.CapabilitiesRegistry,
+			creServices.WorkflowRegistrySyncer,
+			globalLogger,
+			limitsFactory,
+			creServices.OrgResolver,
+		),
+		job.Stream: streams.NewDelegate(
+			globalLogger,
+			streamRegistry,
+			pipelineRunner,
+			cfg.JobPipeline(),
+		),
+		job.CCVCommitteeVerifier: ccvcommitteeverifier.NewDelegate(
+			globalLogger,
+			opts.DS,
+			cfg.CCV(),
+			keyStore.OCR2(),
+			relayChainInterops.LegacyEVMChains().Slice(),
+		),
+		job.CCVExecutor: ccvexecutor.NewDelegate(
+			globalLogger,
+			cfg.CCV(),
+			keyStore.Eth(),
+			relayChainInterops.LegacyEVMChains().Slice(),
+		),
+	}
+
+	// Workflow job type has been removed; use a deprecated delegate so existing jobs
+	// surface a visible error in the UI rather than silently doing nothing.
+	delegates[job.Workflow] = &job.DeprecatedDelegate{Type: job.Workflow}
+
+	// FluxMonitor has been removed; use a deprecated delegate so existing jobs
+	// surface a visible error in the UI rather than silently doing nothing.
+	delegates[job.FluxMonitor] = &job.DeprecatedDelegate{Type: job.FluxMonitor}
+
+	delegates[job.CRESettings] = cresettings.NewDelegate(globalLogger, atomicSettings, shardAssignmentSettings, offchainCapRegistry)
+	// If peer wrapper is initialized, Oracle Factory dependency will be available to standard capabilities
+	stdcapDelegate, err := standardcapabilities.NewDelegate(
+		globalLogger,
+		opts.DS, jobORM,
+		opts.CapabilitiesRegistry,
+		loopRegistrarConfig,
+		relayChainInterops,
+		creServices.GatewayConnectorWrapper,
+		keyStore,
+		creServices.GetPeerID,
+		peerWrapper,
+		opts.NewOracleFactoryFn,
+		creServices.OrgResolver,
+		atomicSettings,
+		creServices.OCRConfigService,
+		cfg.Capabilities().Local(),
+		safeDefaultBootstrappers(cfg),
+		safeExternalRegistryAddress(cfg),
+		safeExternalRegistryChainID(cfg),
+		localShardIndex(cfg.Sharding()),
+		limitsFactory,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create standard capabilities delegate: %w", err)
+	}
+	delegates[job.StandardCapabilities] = stdcapDelegate
+	if creServices.SetDelegatesDeps != nil {
+		depSvc, depErr := creServices.SetDelegatesDeps(stdcapDelegate)
+		if depErr != nil {
+			return nil, fmt.Errorf("failed to set CRE delegates dependencies: %w", depErr)
+		}
+		if depSvc != nil {
+			srvcs = append(srvcs, depSvc)
+		}
+	}
+
+	if cfg.OCR().Enabled() {
+		delegates[job.OffchainReporting] = ocr.NewDelegate(
+			opts.DS,
+			jobORM,
+			keyStore.Eth(),
+			keyStore.OCR(),
+			pipelineRunner,
+			peerWrapper,
+			telemetryManager,
+			legacyEVMChains,
+			globalLogger,
+			cfg,
+			mailMon,
+		)
+	} else {
+		globalLogger.Debug("Off-chain reporting disabled")
+	}
+
+	if cfg.OCR2().Enabled() {
+		globalLogger.Debug("Off-chain reporting v2 enabled")
+
+		ocr2DelegateConfig := ocr2.NewDelegateConfig(cfg.OCR2(), cfg.Mercury(), cfg.Threshold(), cfg.Insecure(), cfg.JobPipeline(), loopRegistrarConfig, cfg.Sharding(), ringStoreForShard0)
+
+		ocr2Delegate := ocr2.NewDelegate(
+			ocr2.DelegateOpts{
+				Ds:                             opts.DS,
+				JobORM:                         jobORM,
+				BridgeORM:                      bridgeORM,
+				PipelineRunner:                 pipelineRunner,
+				StreamRegistry:                 streamRegistry,
+				PeerWrapper:                    peerWrapper,
+				MonitoringEndpointGen:          telemetryManager,
+				LegacyChains:                   legacyEVMChains,
+				Lggr:                           globalLogger,
+				Ks:                             keyStore.OCR2(),
+				EthKs:                          keyStore.Eth(),
+				WorkflowKs:                     keyStore.Workflow(),
+				DKGRecipientKs:                 keyStore.DKGRecipient(),
+				Relayers:                       relayChainInterops,
+				MailMon:                        mailMon,
+				CapabilitiesRegistry:           opts.CapabilitiesRegistry,
+				DonTimeStore:                   opts.DonTimeStore,
+				RetirementReportCache:          opts.RetirementReportCache,
+				GatewayConnectorServiceWrapper: creServices.GatewayConnectorWrapper,
+				WorkflowRegistrySyncer:         creServices.WorkflowRegistrySyncer,
+				OrgResolver:                    creServices.OrgResolver,
+				LimitsFactory:                  limitsFactory,
+				OCRConfigService:               creServices.OCRConfigService,
+				DefaultBootstrappers:           safeDefaultBootstrappers(cfg),
+				CapRegistryAddress:             safeExternalRegistryAddress(cfg),
+				CapRegistryChainID:             safeExternalRegistryChainID(cfg),
+				LocalCfg:                       cfg.Capabilities().Local(),
+				LLOKeyValueDatabaseFactory:     opts.LLOKeyValueDatabaseFactory,
+				LLONetworkEndpointWrapper:      opts.LLONetworkEndpointWrapper,
+			},
+			ocr2DelegateConfig,
+		)
+		if ocr2Delegate == nil {
+			return nil, errors.New("ocr2.NewDelegate() returned nil")
+		}
+		delegates[job.OffchainReporting2] = ocr2Delegate
+		if creServices.SetOCR2DelegatesDeps != nil {
+			depSvc, depErr := creServices.SetOCR2DelegatesDeps(ocr2Delegate)
+			if depErr != nil {
+				return nil, fmt.Errorf("failed to set CRE OCR2 delegates dependencies: %w", depErr)
+			}
+			if depSvc != nil {
+				srvcs = append(srvcs, depSvc)
+			}
+		}
+		delegates[job.Bootstrap] = ocrbootstrap.NewDelegateBootstrap(
+			opts.DS,
+			jobORM,
+			peerWrapper,
+			globalLogger,
+			cfg.OCR2(),
+			cfg.Insecure(),
+			relayChainInterops,
+		)
+		delegates[job.CCIP] = ccip.NewDelegate(
+			globalLogger,
+			loopRegistrarConfig,
+			pipelineRunner,
+			relayChainInterops,
+			opts.KeyStore,
+			opts.DS,
+			peerWrapper,
+			telemetryManager,
+			cfg.Capabilities(),
+			cfg.EVMConfigs(),
+		)
+	} else {
+		globalLogger.Debug("Off-chain reporting v2 disabled")
+	}
+
+	bridgeStatusReporter := bridgestatus.NewBridgeStatusReporter(
+		cfg.BridgeStatusReporter(),
+		bridgeORM,
+		jobORM,
+		unrestrictedHTTPClient,
+		beholder.GetEmitter(),
+		globalLogger,
+	)
+	srvcs = append(srvcs, bridgeStatusReporter)
+
+	healthCfg := commonsrv.HealthCheckerConfig{
+		Ver: static.Version,
+		Sha: static.Sha,
+	}
+	healthCfg = promhealth.ConfigureHooks(healthCfg)
+	healthCfg, err = beholderhealth.ConfigureHooks(healthCfg, opts.Logger, beholder.GetEmitter())
+	if err != nil {
+		return nil, fmt.Errorf("failed to configure health checker beholder hooks: %w", err)
+	}
+	healthCfg, err = otelhealth.ConfigureHooks(healthCfg, meter)
+	if err != nil {
+		return nil, fmt.Errorf("failed to configure health checker otel hooks: %w", err)
+	}
+	healthChecker := healthCfg.New()
+
+	var lbs []utils.DependentAwaiter
+	for _, c := range legacyEVMChains.Slice() {
+		legacyChain, ok := c.(legacyevm.Chain)
+		if !ok {
+			continue
+		}
+		lbs = append(lbs, legacyChain.LogBroadcaster())
+	}
+	jobSpawner := job.NewSpawner(jobORM, cfg.Database(), healthChecker, delegates, globalLogger, lbs)
+	srvcs = append(srvcs, jobSpawner, pipelineRunner)
+
+	var feedsService feeds.Service
+	var feedsORM feeds.ORM
+	if cfg.Feature().FeedsManager() {
+		feedsORM = feeds.NewORM(opts.DS, globalLogger)
+		feedsService = feeds.NewService(
+			feedsORM,
+			jobORM,
+			opts.DS,
+			jobSpawner,
+			keyStore,
+			cfg,
+			cfg.JobDistributor(),
+			cfg.Feature(),
+			cfg.Insecure(),
+			cfg.JobPipeline(),
+			cfg.OCR(),
+			cfg.OCR2(),
+			legacyEVMChains,
+			globalLogger,
+			opts.VersionTag,
+			loopRegistrarConfig,
+		)
+	} else {
+		feedsService = &feeds.NullService{}
+	}
+
+	hostname, _ := os.Hostname()
+	jobSpecReporter := jobspec.NewJobSpecReporter(
+		cfg.JobSpecReporter(),
+		jobSpawner,
+		feedsORM,
+		beholder.GlobalEmitter(),
+		csaPubKeyHex,
+		static.Version,
+		hostname,
+		globalLogger,
+	)
+	srvcs = append(srvcs, jobSpecReporter)
+
+	for _, s := range srvcs {
+		if s == nil {
+			panic("service unexpectedly nil")
+		}
+		if err := healthChecker.Register(s); err != nil {
+			return nil, fmt.Errorf("failed to register health check for service %T: %w", s, err)
+		}
+	}
+
+	return &Node{
+		relayers:                relayChainInterops,
+		jobORM:                  jobORM,
+		jobSpawner:              jobSpawner,
+		pipelineRunner:          pipelineRunner,
+		pipelineORM:             pipelineORM,
+		bridgeORM:               bridgeORM,
+		localAdminUsersORM:      localAdminUsersORM,
+		authenticationProvider:  authenticationProvider,
+		txmStorageService:       txmORM,
+		FeedsService:            feedsService,
+		Config:                  cfg,
+		KeyStore:                keyStore,
+		SessionReaper:           sessionReaper,
+		HealthChecker:           healthChecker,
+		logger:                  globalLogger,
+		AuditLogger:             auditLogger,
+		closeLogger:             opts.CloseLogger,
+		secretGenerator:         opts.SecretGenerator,
+		profiler:                profiler,
+		loopRegistry:            loopRegistry,
+		loopRegistrarConfig:     loopRegistrarConfig,
+		capabilitiesRegistry:    opts.CapabilitiesRegistry,
+		ds:                      opts.DS,
+		shardOrchestratorClient: shardOrchestratorClient,
+
+		srvcs: srvcs,
+	}, nil
 }
 
-// Start all necessary services. If successful, nil will be returned.  Also
-// listens for interrupt signals from the operating system so that the
-// application can be properly closed before the application exits.
-func (app *ChainlinkApplication) Start() error {
+func (app *Node) SetLogLevel(lvl zapcore.Level) error {
+	if err := app.Config.SetLogLevel(lvl); err != nil {
+		return err
+	}
+	app.logger.SetLogLevel(lvl)
+	return nil
+}
+
+// Start all necessary services. If successful, nil will be returned.
+// Start sequence is aborted if the context gets cancelled.
+func (app *Node) Start(ctx context.Context) error {
 	app.startStopMu.Lock()
 	defer app.startStopMu.Unlock()
 	if app.started {
 		panic("application is already started")
 	}
 
-	sigs := make(chan os.Signal, 1)
-	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
-	go func() {
-		select {
-		case <-sigs:
-		case <-app.shutdownSignal.Wait():
+	var span trace.Span
+	ctx, span = otel.Tracer("").Start(ctx, "Start", trace.WithAttributes(
+		attribute.String("app-id", app.ID().String()),
+		attribute.String("version", static.Version),
+		attribute.String("commit", static.Sha),
+	))
+	defer span.End()
+
+	if app.FeedsService != nil {
+		if err := app.FeedsService.Start(ctx); err != nil {
+			app.logger.Errorf("[Feeds Service] Failed to start %v", err)
+			app.FeedsService = &feeds.NullService{} // so we don't try to Close() later
 		}
-		logger.ErrorIf(app.Stop())
-		app.Exiter(0)
-	}()
-
-	// EthClient must be dialled first because it is required in subtasks
-	if err := app.Store.EthClient.Dial(context.TODO()); err != nil {
-		return err
 	}
 
-	subtasks := []func() error{
-		app.Store.Start,
-		app.explorerClient.Start,
-		app.StatsPusher.Start,
-		app.RunQueue.Start,
-		app.RunManager.ResumeAllInProgress,
-		app.LogBroadcaster.Start,
-		app.EventBroadcaster.Start,
-		app.FluxMonitor.Start,
-	}
+	var ms services.MultiStart
+	for _, service := range app.srvcs {
+		if ctx.Err() != nil {
+			err := errors.Wrap(ctx.Err(), "aborting start")
+			return stderrors.Join(err, ms.Close())
+		}
 
-	for _, task := range subtasks {
-		if err := task(); err != nil {
+		app.logger.Infow("Starting service...", "name", service.Name())
+
+		if err := ms.Start(ctx, service); err != nil {
 			return err
 		}
 	}
 
-	for _, subservice := range app.subservices {
-		if err := subservice.Start(); err != nil {
-			return err
-		}
-	}
-
-	// HeadTracker deliberately started afterwards since several tasks are
-	// registered as callbacks and it's sensible to have started them before
-	// calling the first OnNewHead
-	// For example:
-	// RunManager.ResumeAllInProgress since it Connects JobSubscriber
-	// which leads to writes of JobRuns RunStatus to the db.
-	// https://www.pivotaltracker.com/story/show/162230780
-	if err := app.HeadTracker.Start(); err != nil {
-		return err
-	}
-
-	if err := app.Scheduler.Start(); err != nil {
+	// Start HealthChecker last, so that the other services had the chance to
+	// start enough to immediately pass the readiness check.
+	if err := app.HealthChecker.Start(); err != nil {
 		return err
 	}
 
 	app.started = true
+
 	return nil
 }
 
-func (app *ChainlinkApplication) StopIfStarted() error {
+func (app *Node) StopIfStarted() error {
 	app.startStopMu.Lock()
 	defer app.startStopMu.Unlock()
 	if app.started {
@@ -396,183 +1068,355 @@ func (app *ChainlinkApplication) StopIfStarted() error {
 	return nil
 }
 
+func (app *Node) GetLoopRegistry() *plugins.LoopRegistry {
+	return app.loopRegistry
+}
+
+func (app *Node) GetLoopRegistrarConfig() plugins.RegistrarConfig {
+	return app.loopRegistrarConfig
+}
+
 // Stop allows the application to exit by halting schedules, closing
 // logs, and closing the DB connection.
-func (app *ChainlinkApplication) Stop() error {
+func (app *Node) Stop() error {
 	app.startStopMu.Lock()
 	defer app.startStopMu.Unlock()
 	return app.stop()
 }
 
-func (app *ChainlinkApplication) stop() error {
+func (app *Node) stop() (err error) {
 	if !app.started {
 		panic("application is already stopped")
 	}
-	var merr error
 	app.shutdownOnce.Do(func() {
+		shutdownStart := time.Now()
 		defer func() {
-			if err := logger.Sync(); err != nil {
-				if stderr.Unwrap(err).Error() != os.ErrInvalid.Error() &&
-					stderr.Unwrap(err).Error() != "inappropriate ioctl for device" &&
-					stderr.Unwrap(err).Error() != "bad file descriptor" {
-					merr = multierr.Append(merr, err)
-				}
+			if app.closeLogger == nil {
+				return
+			}
+			if lerr := app.closeLogger(); lerr != nil {
+				err = stderrors.Join(err, lerr)
 			}
 		}()
-		logger.Info("Gracefully exiting...")
+		app.logger.Info("Gracefully exiting...")
 
 		// Stop services in the reverse order from which they were started
-
-		logger.Debug("Stopping Scheduler...")
-		app.Scheduler.Stop()
-
-		logger.Debug("Stopping HeadTracker...")
-		merr = multierr.Append(merr, app.HeadTracker.Stop())
-
-		for i := len(app.subservices) - 1; i >= 0; i-- {
-			service := app.subservices[i]
-			logger.Debugw(fmt.Sprintf("Closing service %v...", i), "serviceType", reflect.TypeOf(service))
-			merr = multierr.Append(merr, service.Close())
+		for _, service := range slices.Backward(app.srvcs) {
+			app.logger.Debugw("Closing service...", "name", service.Name())
+			err = stderrors.Join(err, service.Close())
 		}
 
-		logger.Debug("Stopping Scheduler...")
-		app.Scheduler.Stop()
-		logger.Debug("Stopping balanceMonitor...")
-		merr = multierr.Append(merr, app.balanceMonitor.Stop())
-		logger.Debug("Stopping JobSubscriber...")
-		merr = multierr.Append(merr, app.JobSubscriber.Stop())
-		logger.Debug("Stopping FluxMonitor...")
-		app.FluxMonitor.Stop()
-		logger.Debug("Stopping EventBroadcaster...")
-		merr = multierr.Append(merr, app.EventBroadcaster.Stop())
-		logger.Debug("Stopping LogBroadcaster...")
-		merr = multierr.Append(merr, app.LogBroadcaster.Stop())
-		logger.Debug("Stopping RunQueue...")
-		app.RunQueue.Stop()
-		logger.Debug("Stopping StatsPusher...")
-		merr = multierr.Append(merr, app.StatsPusher.Close())
-		logger.Debug("Stopping explorerClient...")
-		merr = multierr.Append(merr, app.explorerClient.Close())
-		logger.Debug("Stopping SessionReaper...")
-		merr = multierr.Append(merr, app.SessionReaper.Stop())
-		logger.Debug("Closing Store...")
-		merr = multierr.Append(merr, app.Store.Close())
+		app.logger.Debug("Stopping SessionReaper...")
+		err = stderrors.Join(err, app.SessionReaper.Stop())
+		app.logger.Debug("Closing HealthChecker...")
+		err = stderrors.Join(err, app.HealthChecker.Close())
+		if app.FeedsService != nil {
+			app.logger.Debug("Closing Feeds Service...")
+			err = stderrors.Join(err, app.FeedsService.Close())
+		}
 
-		logger.Info("Exited all services")
+		if app.profiler != nil {
+			err = stderrors.Join(err, app.profiler.Stop())
+		}
+
+		app.logger.Debugf("Closed application in %v", time.Since(shutdownStart))
 
 		app.started = false
 	})
-	return merr
+	return err
 }
 
-// GetStore returns the pointer to the store for the ChainlinkApplication.
-func (app *ChainlinkApplication) GetStore() *strpkg.Store {
-	return app.Store
+func (app *Node) GetConfig() GeneralConfig {
+	return app.Config
 }
 
-func (app *ChainlinkApplication) GetJobORM() job.ORM {
-	return app.JobORM
+func (app *Node) GetKeyStore() keystore.Master {
+	return app.KeyStore
 }
 
-func (app *ChainlinkApplication) GetExternalInitiatorManager() ExternalInitiatorManager {
-	return app.ExternalInitiatorManager
+func (app *Node) GetLogger() logger.SugaredLogger {
+	return app.logger
 }
 
-func (app *ChainlinkApplication) GetStatsPusher() synchronization.StatsPusher {
-	return app.StatsPusher
+func (app *Node) GetAuditLogger() audit.AuditLogger {
+	return app.AuditLogger
+}
+
+func (app *Node) GetHealthChecker() services.Checker {
+	return app.HealthChecker
+}
+
+func (app *Node) JobSpawner() job.Spawner {
+	return app.jobSpawner
+}
+
+func (app *Node) JobORM() job.ORM {
+	return app.jobORM
+}
+
+func (app *Node) BridgeORM() bridges.ORM {
+	return app.bridgeORM
+}
+
+func (app *Node) BasicAdminUsersORM() sessions.BasicAdminUsersORM {
+	return app.localAdminUsersORM
+}
+
+func (app *Node) AuthenticationProvider() sessions.AuthenticationProvider {
+	return app.authenticationProvider
+}
+
+func (app *Node) PipelineORM() pipeline.ORM {
+	return app.pipelineORM
+}
+
+func (app *Node) TxmStorageService() txmgr.EvmTxStore {
+	return app.txmStorageService
+}
+
+func (app *Node) GetCapabilitiesRegistry() *registry.Registry {
+	return app.capabilitiesRegistry
+}
+
+func (app *Node) SecretGenerator() SecretGenerator {
+	return app.secretGenerator
 }
 
 // WakeSessionReaper wakes up the reaper to do its reaping.
-func (app *ChainlinkApplication) WakeSessionReaper() {
+func (app *Node) WakeSessionReaper() {
 	app.SessionReaper.WakeUp()
 }
 
-// AddJob adds a job to the store and the scheduler. If there was
-// an error from adding the job to the store, the job will not be
-// added to the scheduler.
-func (app *ChainlinkApplication) AddJob(job models.JobSpec) error {
-	err := app.Store.CreateJob(&job)
+func (app *Node) AddJobV2(ctx context.Context, j *job.Job) error {
+	return app.jobSpawner.CreateJob(ctx, nil, j)
+}
+
+func (app *Node) DeleteJob(ctx context.Context, jobID int32) error {
+	// Do not allow the job to be deleted if it is managed by the Feeds Manager
+	isManaged, err := app.FeedsService.IsJobManaged(ctx, int64(jobID))
 	if err != nil {
 		return err
 	}
 
-	app.Scheduler.AddJob(job)
-	logger.ErrorIf(app.FluxMonitor.AddJob(job))
-	logger.ErrorIf(app.JobSubscriber.AddJob(job, nil))
-	return nil
+	if isManaged {
+		return errors.New("job must be deleted in the feeds manager")
+	}
+
+	return app.jobSpawner.DeleteJob(ctx, nil, jobID)
 }
 
-func (app *ChainlinkApplication) AddJobV2(ctx context.Context, job job.Job, name null.String) (int32, error) {
-	return app.jobSpawner.CreateJob(ctx, job, name)
-}
-
-// Only used for testing, not supported by the UI.
-func (app *ChainlinkApplication) RunJobV2(ctx context.Context, jobID int32, meta map[string]interface{}) (int64, error) {
-	jb, err := app.JobORM.FindJob(jobID)
+// Only used for local testing, not supported by the UI.
+func (app *Node) RunJobV2(
+	ctx context.Context,
+	jobID int32,
+	meta map[string]any,
+) (int64, error) {
+	if build.IsProd() {
+		return 0, errors.New("manual job runs not supported on secure builds")
+	}
+	jb, err := app.jobORM.FindJob(ctx, jobID)
 	if err != nil {
 		return 0, errors.Wrapf(err, "job ID %v", jobID)
 	}
-	runID, _, err := app.pipelineRunner.ExecuteAndInsertNewRun(ctx, *jb.PipelineSpec, pipeline.JSONSerializable{
-		Val:  meta,
-		Null: false,
-	}, *logger.Default, false)
+	var runID int64
+
+	// Some jobs are special in that they do not have a task graph.
+	isBootstrap := jb.Type == job.OffchainReporting && jb.OCROracleSpec != nil && jb.OCROracleSpec.IsBootstrapPeer
+	if jb.Type.RequiresPipelineSpec() || !isBootstrap {
+		var vars map[string]any
+		var saveTasks bool
+		if jb.Type == job.VRF {
+			saveTasks = true
+			// Create a dummy log to trigger a run
+			testLog := types.Log{
+				Data: bytes.Join([][]byte{
+					jb.VRFSpec.PublicKey.MustHash().Bytes(),  // key hash
+					common.BigToHash(big.NewInt(42)).Bytes(), // seed
+					evmutils.NewHash().Bytes(),               // sender
+					evmutils.NewHash().Bytes(),               // fee
+					evmutils.NewHash().Bytes(),
+				}, // requestID
+					[]byte{}),
+				Topics:      []common.Hash{{}, jb.ExternalIDEncodeBytesToTopic()}, // jobID BYTES
+				TxHash:      evmutils.NewHash(),
+				BlockNumber: 10,
+				BlockHash:   evmutils.NewHash(),
+			}
+			vars = map[string]any{
+				"jobSpec": map[string]any{
+					"databaseID":    jb.ID,
+					"externalJobID": jb.ExternalJobID,
+					"name":          jb.Name.ValueOrZero(),
+					"publicKey":     jb.VRFSpec.PublicKey[:],
+					"evmChainID":    jb.VRFSpec.EVMChainID.String(),
+				},
+				"jobRun": map[string]any{
+					"meta":           meta,
+					"logBlockHash":   testLog.BlockHash[:],
+					"logBlockNumber": testLog.BlockNumber,
+					"logTxHash":      testLog.TxHash,
+					"logTopics":      testLog.Topics,
+					"logData":        testLog.Data,
+				},
+			}
+		} else {
+			vars = map[string]any{
+				"jobRun": map[string]any{
+					"meta": meta,
+				},
+			}
+		}
+		runID, _, err = app.pipelineRunner.ExecuteAndInsertFinishedRun(ctx, *jb.PipelineSpec, pipeline.NewVarsFrom(vars), saveTasks)
+	}
 	return runID, err
 }
 
-// ArchiveJob silences the job from the system, preventing future job runs.
-// It is idempotent and can be run as many times as you like.
-func (app *ChainlinkApplication) ArchiveJob(ID models.JobID) error {
-	err := app.JobSubscriber.RemoveJob(ID)
+func (app *Node) ResumeJobV2(
+	ctx context.Context,
+	taskID uuid.UUID,
+	result pipeline.Result,
+) error {
+	return app.pipelineRunner.ResumeRun(ctx, taskID, result.Value, result.Error)
+}
+
+func (app *Node) GetFeedsService() feeds.Service {
+	return app.FeedsService
+}
+
+// ReplayFromBlock implements the Application interface.
+func (app *Node) ReplayFromBlock(ctx context.Context, chainFamily, chainID string, number uint64, forceBroadcast bool) error {
+	if chainFamily == relay.NetworkEVM {
+		// TODO: Implement EVM Replay on Relayer instead of using LegacyChains - BCFR-1160
+		chain, err := app.GetRelayers().LegacyEVMChains().Get(chainID)
+		if err != nil {
+			return err
+		}
+		//nolint:gosec // this won't overflow
+		fromBlock := int64(number)
+
+		if legacyChain, ok := chain.(legacyevm.Chain); ok {
+			legacyChain.LogBroadcaster().ReplayFromBlock(fromBlock, forceBroadcast)
+			if app.Config.Feature().LogPoller() {
+				legacyChain.LogPoller().ReplayAsync(fromBlock)
+			}
+			return nil
+		}
+		// else LOOPP mode, so fall back to default
+	}
+	relayer, err := app.GetRelayers().Get(commontypes.RelayID{
+		Network: chainFamily,
+		ChainID: chainID,
+	})
 	if err != nil {
-		logger.Warnw("Error removing job from JobSubscriber", "error", err)
+		return err
 	}
-	app.FluxMonitor.RemoveJob(ID)
-
-	if err = app.ExternalInitiatorManager.DeleteJob(app.Store.DB, ID); err != nil {
-		err = errors.Wrapf(err, "failed to delete job with id %s from external initiator", ID)
-	}
-	return multierr.Combine(err, app.Store.ArchiveJob(ID))
+	return relayer.Replay(ctx, strconv.FormatUint(number, 10), map[string]any{})
 }
 
-func (app *ChainlinkApplication) DeleteJobV2(ctx context.Context, jobID int32) error {
-	return app.jobSpawner.DeleteJob(ctx, jobID)
+func (app *Node) GetRelayers() RelayerChainInteroperators {
+	return app.relayers
 }
 
-// AddServiceAgreement adds a Service Agreement which includes a job that needs
-// to be scheduled.
-func (app *ChainlinkApplication) AddServiceAgreement(sa *models.ServiceAgreement) error {
-	err := app.Store.CreateServiceAgreement(sa)
+func (app *Node) GetDB() sqlutil.DataSource {
+	return app.ds
+}
+
+// Returns the configuration to use for creating and authenticating
+// new WebAuthn credentials
+func (app *Node) GetWebAuthnConfiguration() sessions.WebAuthnConfiguration {
+	rpid := app.Config.WebServer().MFA().RPID()
+	rporigin := app.Config.WebServer().MFA().RPOrigin()
+	if rpid == "" {
+		app.GetLogger().Errorf("RPID is not set, WebAuthn will likely not work as intended")
+	}
+
+	if rporigin == "" {
+		app.GetLogger().Errorf("RPOrigin is not set, WebAuthn will likely not work as intended")
+	}
+
+	return sessions.WebAuthnConfiguration{
+		RPID:     rpid,
+		RPOrigin: rporigin,
+	}
+}
+
+func (app *Node) ID() uuid.UUID {
+	return app.Config.AppID()
+}
+
+var ErrUnsupportedInLOOPPMode = fmt.Errorf("legacy command not available in LOOP Plugin mode: %w", stderrors.ErrUnsupported)
+
+// FindLCA - finds last common ancestor
+func (app *Node) FindLCA(ctx context.Context, chainID *big.Int) (*logpoller.Block, error) {
+	chain, err := app.GetRelayers().LegacyEVMChains().Get(chainID.String())
+	if err != nil {
+		return nil, err
+	}
+
+	if !app.Config.Feature().LogPoller() {
+		return nil, errors.New("FindLCA is only available if LogPoller is enabled")
+	}
+	legacyChain, ok := chain.(legacyevm.Chain)
+	if !ok {
+		return nil, ErrUnsupportedInLOOPPMode
+	}
+
+	lca, err := legacyChain.LogPoller().FindLCA(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to find lca: %w", err)
+	}
+
+	return lca, nil
+}
+
+// LPSkipToBlock repositions the LogPoller to start processing from the given block number.
+func (app *Node) LPSkipToBlock(ctx context.Context, chainFamily, chainID string, blockNumber int64) error {
+	if chainFamily != relay.NetworkEVM {
+		return fmt.Errorf("LPSkipToBlock is only supported for %s chain family", relay.NetworkEVM)
+	}
+	if !app.Config.Feature().LogPoller() {
+		return errors.New("LPSkipToBlock is only available if LogPoller is enabled")
+	}
+	if blockNumber < 2 {
+		return fmt.Errorf("invalid skip block number %d, must be >= 2", blockNumber)
+	}
+
+	relayer, err := app.GetRelayers().Get(commontypes.RelayID{
+		Network: chainFamily,
+		ChainID: chainID,
+	})
+	if err != nil {
+		return err
+	}
+	evmService, err := relayer.EVM()
 	if err != nil {
 		return err
 	}
 
-	app.Scheduler.AddJob(sa.JobSpec)
-
-	// XXX: Add mechanism to asynchronously communicate when a job spec has
-	// an ethereum interaction error.
-	// https://www.pivotaltracker.com/story/show/170349568
-	logger.ErrorIf(app.FluxMonitor.AddJob(sa.JobSpec))
-	logger.ErrorIf(app.JobSubscriber.AddJob(sa.JobSpec, nil))
+	if err = evmService.LPSkipToBlock(ctx, blockNumber); err != nil {
+		return fmt.Errorf("failed to skip log poller to block %d: %w", blockNumber, err)
+	}
 	return nil
 }
 
-// NewBox returns the packr.Box instance that holds the static assets to
-// be delivered by the router.
-func (app *ChainlinkApplication) NewBox() packr.Box {
-	return packr.NewBox("../../../operator_ui/dist")
-}
+// DeleteLogPollerDataAfter - delete LogPoller state starting from the specified block
+func (app *Node) DeleteLogPollerDataAfter(ctx context.Context, chainID *big.Int, start int64) error {
+	chain, err := app.GetRelayers().LegacyEVMChains().Get(chainID.String())
+	if err != nil {
+		return err
+	}
+	if !app.Config.Feature().LogPoller() {
+		return errors.New("DeleteLogPollerDataAfter is only available if LogPoller is enabled")
+	}
+	legacyChain, ok := chain.(legacyevm.Chain)
+	if !ok {
+		return ErrUnsupportedInLOOPPMode
+	}
 
-type pendingConnectionResumer struct {
-	runManager services.RunManager
-}
+	err = legacyChain.LogPoller().DeleteLogsAndBlocksAfter(ctx, start)
+	if err != nil {
+		return fmt.Errorf("failed to recover LogPoller: %w", err)
+	}
 
-func newPendingConnectionResumer(runManager services.RunManager) *pendingConnectionResumer {
-	return &pendingConnectionResumer{runManager: runManager}
+	return nil
 }
-
-func (p *pendingConnectionResumer) Connect(head *models.Head) error {
-	return p.runManager.ResumeAllPendingConnection()
-}
-
-func (p *pendingConnectionResumer) Disconnect()                                    {}
-func (p *pendingConnectionResumer) OnNewLongestChain(context.Context, models.Head) {}

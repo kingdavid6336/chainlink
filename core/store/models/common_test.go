@@ -3,14 +3,15 @@ package models_test
 import (
 	"encoding/json"
 	"net/url"
+	"strings"
 	"testing"
-	"time"
 
-	"github.com/smartcontractkit/chainlink/core/internal/cltest"
-	"github.com/smartcontractkit/chainlink/core/store/models"
-
+	"github.com/ethereum/go-ethereum/common"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/smartcontractkit/chainlink/v2/core/internal/cltest"
+	"github.com/smartcontractkit/chainlink/v2/core/store/models"
 )
 
 func TestJSON_Merge(t *testing.T) {
@@ -31,7 +32,7 @@ func TestJSON_Merge(t *testing.T) {
 			false,
 		},
 		{
-			"overwritting fields",
+			"overwriting fields",
 			`{"value":"OLD","other":1}`,
 			`{"value":["new","new"],"extra":2}`,
 			`{"value":["new","new"],"other":1,"extra":2}`,
@@ -76,6 +77,7 @@ func TestJSON_Merge(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
 			j1 := cltest.JSONFromString(t, test.original)
 			j2 := cltest.JSONFromString(t, test.input)
 
@@ -92,6 +94,7 @@ func TestJSON_Merge(t *testing.T) {
 }
 
 func TestJSON_MergeNull(t *testing.T) {
+	t.Parallel()
 	merged, err := models.Merge(models.JSON{}, models.JSON{})
 	require.NoError(t, err)
 	assert.Equal(t, `{}`, merged.String())
@@ -111,6 +114,7 @@ func TestJSON_UnmarshalJSON(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
 			var j models.JSON
 			err := json.Unmarshal([]byte(test.json), &j)
 			assert.Equal(t, test.wantErrored, (err != nil))
@@ -134,60 +138,10 @@ func TestJSON_ParseJSON(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
 			json, err := models.ParseJSON([]byte(test.in))
 			assert.Equal(t, test.want, json)
 			assert.Equal(t, test.wantErrored, (err != nil))
-		})
-	}
-}
-
-func TestJSON_Add(t *testing.T) {
-	t.Parallel()
-
-	tests := []struct {
-		name    string
-		key     string
-		value   interface{}
-		errored bool
-		want    string
-	}{
-		{"adding string", "b", "2", false, `{"a":"1","b":"2"}`},
-		{"adding int", "b", 2, false, `{"a":"1","b":2}`},
-		{"overriding", "a", "2", false, `{"a":"2"}`},
-		{"escaped quote", "a", `"2"`, false, `{"a":"\"2\""}`},
-	}
-
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			json := cltest.JSONFromString(t, `{"a":"1"}`)
-
-			json, err := json.Add(test.key, test.value)
-			assert.Equal(t, test.errored, (err != nil))
-			assert.Equal(t, test.want, json.String())
-		})
-	}
-}
-
-func TestJSON_Delete(t *testing.T) {
-	t.Parallel()
-
-	tests := []struct {
-		name string
-		key  string
-		want string
-	}{
-		{"remove existing key", "b", `{"a":"1"}`},
-		{"remove non-existing key", "c", `{"a":"1","b":2}`},
-	}
-
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			json := cltest.JSONFromString(t, `{"a":"1","b":2}`)
-
-			json, err := json.Delete(test.key)
-
-			assert.NoError(t, err)
-			assert.Equal(t, test.want, json.String())
 		})
 	}
 }
@@ -213,10 +167,10 @@ func TestWebURL_MarshalJSON(t *testing.T) {
 
 	str := "http://www.duckduckgo.com"
 	parsed, err := url.ParseRequestURI(str)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 	wurl := models.WebURL(*parsed)
 	b, err := json.Marshal(wurl)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 	assert.Equal(t, `"`+str+`"`, string(b))
 }
 
@@ -234,90 +188,7 @@ func TestWebURL_String_HasNilURL(t *testing.T) {
 
 	w := models.WebURL{}
 
-	assert.Equal(t, "", w.String())
-}
-
-func TestAnyTime_UnmarshalJSON_Valid(t *testing.T) {
-	tests := []struct {
-		name  string
-		input string
-		want  time.Time
-	}{
-		{"unix string", `"1529445491"`, time.Unix(1529445491, 0).UTC()},
-		{"unix int", `1529445491`, time.Unix(1529445491, 0).UTC()},
-		{"iso8601 time", `"2018-06-19T22:17:19Z"`, time.Unix(1529446639, 0).UTC()},
-		{"iso8601 date", `"2018-06-19"`, time.Unix(1529366400, 0).UTC()},
-		{"iso8601 year", `"2018"`, time.Unix(1514764800, 0).UTC()},
-		{"null", `null`, time.Time{}},
-		{"empty", `""`, time.Time{}},
-	}
-
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			var actual models.AnyTime
-			err := json.Unmarshal([]byte(test.input), &actual)
-			require.NoError(t, err)
-			assert.Equal(t, test.want, actual.Time)
-		})
-	}
-}
-
-func TestAnyTime_UnmarshalJSON_Error(t *testing.T) {
-	tests := []struct {
-		name  string
-		input string
-	}{
-		{"invalid string", `"1000h"`},
-		{"float", `"1000.123"`},
-	}
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			var actual models.AnyTime
-			err := json.Unmarshal([]byte(test.input), &actual)
-			assert.Error(t, err)
-		})
-	}
-}
-
-func TestAnyTime_MarshalJSON(t *testing.T) {
-	t.Parallel()
-
-	tests := []struct {
-		name  string
-		input models.AnyTime
-		want  string
-	}{
-		{"valid", models.NewAnyTime(time.Unix(1529446639, 0).UTC()), `"2018-06-19T22:17:19Z"`},
-		{"invalid", models.AnyTime{}, `null`},
-	}
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			b, err := json.Marshal(&test.input)
-			assert.NoError(t, err)
-			assert.Equal(t, test.want, string(b))
-		})
-	}
-}
-
-func TestDuration_MarshalJSON(t *testing.T) {
-	tests := []struct {
-		name  string
-		input models.Duration
-		want  string
-	}{
-		{"zero", models.MustMakeDuration(0), `"0s"`},
-		{"one second", models.MustMakeDuration(time.Second), `"1s"`},
-		{"one minute", models.MustMakeDuration(time.Minute), `"1m0s"`},
-		{"one hour", models.MustMakeDuration(time.Hour), `"1h0m0s"`},
-		{"one hour thirty minutes", models.MustMakeDuration(time.Hour + 30*time.Minute), `"1h30m0s"`},
-	}
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			b, err := json.Marshal(&test.input)
-			assert.NoError(t, err)
-			assert.Equal(t, test.want, string(b))
-		})
-	}
+	assert.Empty(t, w.String())
 }
 
 func TestCron_UnmarshalJSON_Success(t *testing.T) {
@@ -332,6 +203,7 @@ func TestCron_UnmarshalJSON_Success(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
 			var actual models.Cron
 			err := json.Unmarshal([]byte(test.input), &actual)
 			assert.NoError(t, err)
@@ -351,9 +223,119 @@ func TestCron_UnmarshalJSON_Invalid(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
 			var actual models.Cron
 			err := json.Unmarshal([]byte(test.input), &actual)
 			assert.EqualError(t, err, test.wantError)
 		})
 	}
+}
+
+func TestAddressCollection_Scan_Value(t *testing.T) {
+	t.Parallel()
+
+	ac := models.AddressCollection{
+		common.HexToAddress(strings.Repeat("AA", 20)),
+		common.HexToAddress(strings.Repeat("BB", 20)),
+	}
+
+	val, err := ac.Value()
+	require.NoError(t, err)
+
+	var acNew models.AddressCollection
+	err = acNew.Scan(val)
+	require.NoError(t, err)
+
+	require.Equal(t, ac, acNew)
+}
+
+func TestAddressCollection_ToStrings(t *testing.T) {
+	t.Parallel()
+
+	hex1 := "0xaAaAaAaaAaAaAaaAaAAAAAAAAaaaAaAaAaaAaaAa"
+	hex2 := "0xbBbBBBBbbBBBbbbBbbBbbbbBBbBbbbbBbBbbBBbB"
+
+	ac := models.AddressCollection{
+		common.HexToAddress(hex1),
+		common.HexToAddress(hex2),
+	}
+
+	acStrings := ac.ToStrings()
+	require.Len(t, acStrings, 2)
+	require.Equal(t, hex1, acStrings[0])
+	require.Equal(t, hex2, acStrings[1])
+}
+
+func TestWebURL_Scan_Value(t *testing.T) {
+	t.Parallel()
+
+	u, err := url.Parse("https://chain.link")
+	require.NoError(t, err)
+
+	w := models.WebURL(*u)
+
+	val, err := w.Value()
+	require.NoError(t, err)
+
+	var wNew models.WebURL
+	err = wNew.Scan(val)
+	require.NoError(t, err)
+
+	require.Equal(t, w, wNew)
+}
+
+func TestJSON_Scan_Value(t *testing.T) {
+	t.Parallel()
+
+	js, err := models.ParseJSON([]byte(`{"foo":123}`))
+	require.NoError(t, err)
+
+	val, err := js.Value()
+	require.NoError(t, err)
+
+	var jsNew models.JSON
+	err = jsNew.Scan(val)
+	require.NoError(t, err)
+
+	require.Equal(t, js, jsNew)
+}
+
+func TestJSON_Bytes(t *testing.T) {
+	t.Parallel()
+
+	jsBytes := []byte(`{"foo":123}`)
+
+	js, err := models.ParseJSON(jsBytes)
+	require.NoError(t, err)
+
+	require.Equal(t, jsBytes, js.Bytes())
+}
+
+func TestJSON_MarshalJSON(t *testing.T) {
+	t.Parallel()
+
+	jsBytes := []byte(`{"foo":123}`)
+
+	js, err := models.ParseJSON(jsBytes)
+	require.NoError(t, err)
+
+	bs, err := js.MarshalJSON()
+	require.NoError(t, err)
+
+	require.Equal(t, jsBytes, bs)
+}
+
+func TestJSON_UnmarshalTOML(t *testing.T) {
+	t.Parallel()
+
+	jsBytes := []byte(`{"foo":123}`)
+
+	var js models.JSON
+	err := js.UnmarshalTOML(jsBytes)
+	require.NoError(t, err)
+	require.Equal(t, jsBytes, js.Bytes())
+
+	err = js.UnmarshalTOML(string(jsBytes))
+	require.NoError(t, err)
+	require.Equal(t, jsBytes, js.Bytes())
 }

@@ -1,86 +1,195 @@
-# MAKE ALL CHANGES WITHIN THE DEFAULT WORKDIR FOR YARN AND GO DEP CACHE HITS
-ARG BUILDER=smartcontract/builder
-FROM ${BUILDER}:1.0.39
-WORKDIR /chainlink
-# Have to reintroduce ENV vars from builder image
-ENV PATH /go/bin:/usr/local/go/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+# syntax=docker/dockerfile:1@sha256:ecfaec9ed6d810b56388c508f4121597bfbba70d41a6dfeee4d8cad5f295fc32
+##
+# Build image: Chainlink binary with plugins.
+##
 
-COPY GNUmakefile VERSION ./
-COPY tools/bin/ldflags tools/bin/ldflags
-ARG COMMIT_SHA
+# Stage: deps-base — module downloads, no source tree.
+# Stages that don't need the full source (remote plugins, delve) branch from
+# here so that source-only changes never invalidate their layer cache.
+FROM golang:1.27.3-bookworm@sha256:5c3e9b43cfd3bb95c7937462e29d87ada57b481a96fa23ad0eb61778d7a00110 AS deps-base
+# Build-only tooling; never shipped, so versions are intentionally unpinned.
+# hadolint ignore=DL3008
+RUN apt-get update && apt-get install -y --no-install-recommends jq && rm -rf /var/lib/apt/lists/*
 
-# Install yarn dependencies
-COPY yarn.lock package.json .yarnrc ./
-COPY patches patches
-COPY solc_bin solc_bin
-COPY .yarn .yarn
-COPY operator_ui/package.json ./operator_ui/
-COPY belt/package.json ./belt/
-COPY belt/bin ./belt/bin
-COPY evm-test-helpers/package.json ./evm-test-helpers/
-COPY evm-contracts/package.json ./evm-contracts/
-COPY tools/bin/restore-solc-cache ./tools/bin/restore-solc-cache
-RUN make yarndep
-
-
-COPY tsconfig.cjs.json tsconfig.es6.json ./
-COPY operator_ui ./operator_ui
-COPY belt ./belt
-COPY belt/bin ./belt/bin
-COPY evm-test-helpers ./evm-test-helpers
-COPY evm-contracts ./evm-contracts
-
-# Build operator-ui and the smart contracts
-RUN make contracts-operator-ui-build
-
-# Build the golang binary
-
-FROM ${BUILDER}:1.0.39
 WORKDIR /chainlink
 
-# Have to reintroduce ENV vars from builder image
-ENV PATH /go/bin:/usr/local/go/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+COPY go.mod go.sum ./
+COPY plugins/scripts/setup_git_auth.sh ./plugins/scripts/
 
-COPY GNUmakefile VERSION ./
+# CL_GOPRIVATE: set to "github.com/smartcontractkit/*" when building images
+# that depend on private Go modules (e.g. chainlink-internal-solana). When
+# empty (the default), go mod download uses the public module proxy as usual.
+ARG CL_GOPRIVATE=""
+ENV GOPRIVATE="${CL_GOPRIVATE}" \
+    GOCACHE=/root/.cache/go-build \
+    GOMODCACHE=/go/pkg/mod
+RUN --mount=type=secret,id=GIT_AUTH_TOKEN \
+    --mount=type=cache,id=go-mod-cache,target=/go/pkg/mod \
+    --mount=type=cache,id=go-build-cache,target=/root/.cache/go-build \
+    set -e \
+    && export GIT_CONFIG_GLOBAL=/tmp/gitconfig-go-mod-download \
+    && trap 'rm -f "$GIT_CONFIG_GLOBAL"' EXIT \
+    && ./plugins/scripts/setup_git_auth.sh \
+    && go mod download
+
+COPY GNUmakefile package.json ./
 COPY tools/bin/ldflags ./tools/bin/
 
-# Env vars needed for chainlink build
-ADD go.mod go.sum ./
-RUN go mod download
 
-# Env vars needed for chainlink build
+# Stage: deps — Go source tree for stages that compile chainlink code.
+# `COPY . .` relies on .dockerignore excluding everything not needed for the
+# build (docs, CI config, test infra, non-Go tooling) so unrelated workspace
+# churn doesn't invalidate the layer.
+FROM deps-base AS deps
+COPY . .
+
+# Stage: Delve debugger (no source needed, branches from deps-base)
+FROM deps-base AS build-delve
+RUN --mount=type=cache,id=go-mod-cache,target=/go/pkg/mod \
+    --mount=type=cache,id=go-build-cache,target=/root/.cache/go-build \
+    go install github.com/go-delve/delve/cmd/dlv@v1.24.2
+
+# Stage: Remote plugins — only manifest YAMLs, no source tree.
+# Cached as long as go.mod/go.sum and plugin manifests are unchanged,
+# so typical source-only PRs skip the entire ~160s remote plugin build.
+# Uses `go tool loopinstall` via the Makefile (resolved from the `tool`
+# directive in go.mod). If this fails without the full source tree, fall back
+# to installing loopinstall standalone:
+#   RUN go install github.com/smartcontractkit/chainlink-common/pkg/loop/cmd/loopinstall@v0.11.1
+# and invoke `loopinstall` directly instead of `make install-plugins-*`.
+FROM deps-base AS build-remote-plugins
+ARG CL_INSTALL_PRIVATE_PLUGINS=true
+ARG CL_INSTALL_TESTING_PLUGINS=false
+
+COPY plugins/plugins.public.yaml plugins/plugins.private.yaml plugins/plugins.testing.yaml ./plugins/
+COPY plugins/scripts/ ./plugins/scripts/
+
+ENV CL_LOOPINSTALL_OUTPUT_DIR=/tmp/loopinstall-output \
+    GIT_CONFIG_GLOBAL=/tmp/gitconfig-github-token
+RUN --mount=type=secret,id=GIT_AUTH_TOKEN \
+    --mount=type=cache,id=go-mod-cache,target=/go/pkg/mod \
+    --mount=type=cache,id=go-build-cache,target=/root/.cache/go-build \
+    set -e && \
+    trap 'rm -f "$GIT_CONFIG_GLOBAL"' EXIT && \
+    ./plugins/scripts/setup_git_auth.sh && \
+    mkdir -p /gobins "${CL_LOOPINSTALL_OUTPUT_DIR}" && \
+    GOBIN=/gobins CL_LOOPINSTALL_OUTPUT_DIR=${CL_LOOPINSTALL_OUTPUT_DIR} make install-plugins-public && \
+    if [ "${CL_INSTALL_PRIVATE_PLUGINS}" = "true" ]; then \
+      GOBIN=/gobins CL_LOOPINSTALL_OUTPUT_DIR=${CL_LOOPINSTALL_OUTPUT_DIR} make install-plugins-private; \
+    fi && \
+    if [ "${CL_INSTALL_TESTING_PLUGINS}" = "true" ]; then \
+      GOBIN=/gobins CL_LOOPINSTALL_OUTPUT_DIR=${CL_LOOPINSTALL_OUTPUT_DIR} make install-plugins-testing; \
+    fi && \
+    mkdir -p /tmp/lib && \
+    ./plugins/scripts/copy_loopinstall_libs.sh \
+    "$CL_LOOPINSTALL_OUTPUT_DIR" \
+    /tmp/lib
+
+# Stage: Local plugins (needs source tree for ./plugins/cmd/...)
+FROM deps AS build-local-plugins
+RUN --mount=type=cache,id=go-mod-cache,target=/go/pkg/mod \
+    --mount=type=cache,id=go-build-cache,target=/root/.cache/go-build \
+    mkdir -p /gobins \
+    && GOBIN=/gobins make install-plugins-local
+
+# Stage: Chainlink binary (needs source tree)
+FROM deps AS build-chainlink
 ARG COMMIT_SHA
-ARG ENVIRONMENT
+ARG VERSION_TAG
+ARG CL_IS_PROD_BUILD=true
 
-COPY --from=0 /chainlink/evm-contracts/abi ./evm-contracts/abi
-COPY --from=0 /chainlink/operator_ui/dist ./operator_ui/dist
-COPY core core
-COPY packr packr
+RUN --mount=type=cache,id=go-mod-cache,target=/go/pkg/mod \
+    --mount=type=cache,id=go-build-cache,target=/root/.cache/go-build \
+    mkdir -p /gobins && \
+    if [ "$CL_IS_PROD_BUILD" = "false" ]; then \
+          GOBIN=/gobins make install-chainlink-dev; \
+    else \
+          GOBIN=/gobins make install-chainlink; \
+    fi
 
-RUN make chainlink-build
-
-# Final layer: ubuntu with chainlink binary
-FROM ubuntu:18.04
+##
+# Final Image
+##
+FROM ubuntu:24.04@sha256:008173c23f95b170204355c12626cb5a965d779a7e1283b09e9cffbb1bf33ca3 AS final
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
 ARG CHAINLINK_USER=root
-ENV DEBIAN_FRONTEND noninteractive
-RUN apt-get update && apt-get install -y ca-certificates wget gnupg lsb-release
+ENV DEBIAN_FRONTEND=noninteractive
+# Postgres apt signing key (fingerprint B97B0AFCAA1A47F044F244A07FCC7D46ACCC4CF8), vendored from
+# https://www.postgresql.org/media/keys/ACCC4CF8.asc so builds don't break when upstream
+# reissues the file, and gnupg isn't needed in the image.
+COPY --link --chmod=644 tools/docker/postgresql-archive-keyring.asc /usr/share/keyrings/postgresql-archive-keyring.asc
 
-# Install Postgres for CLI tools, needed specifically for DB backups
-RUN wget --quiet -O - https://packages.cloud.google.com/apt/doc/apt-key.gpg | apt-key add - \
- && wget --quiet -O - https://www.postgresql.org/media/keys/ACCC4CF8.asc | apt-key add - \
- && echo "deb http://apt.postgresql.org/pub/repos/apt/ `lsb_release -cs`-pgdg main" |tee /etc/apt/sources.list.d/pgdg.list \
- && apt-get update && apt-get install -y postgresql-client-13 \
- && apt-get clean all
+# Package versions are intentionally NOT pinned. Ubuntu only serves the newest
+# build in noble-updates/-security, so exact pins break every time a security
+# fix ships (#23461, #23521, #23645, #23818). Instead we take the latest patched
+# packages at build time (incl. `upgrade` for base-image packages); apt verifies
+# archive signatures, and CI scans the image for fixable CVEs.
+# Install Postgres client for CLI tools, needed specifically for DB backups.
+# APT_CACHE_BUST: CI passes the current UTC date so this layer (and its upgrade)
+# is rebuilt at least daily instead of being served stale from the layer cache.
+ARG APT_CACHE_BUST=unset
+# hadolint ignore=DL3005,DL3008
+RUN echo "apt cache bust: ${APT_CACHE_BUST}" \
+    && apt-get update \
+    && apt-get upgrade -y \
+    && apt-get install -y --no-install-recommends ca-certificates curl \
+    && . /etc/os-release \
+    && echo "deb [signed-by=/usr/share/keyrings/postgresql-archive-keyring.asc] https://apt.postgresql.org/pub/repos/apt ${VERSION_CODENAME}-pgdg main" \
+        >/etc/apt/sources.list.d/pgdg.list \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends postgresql-client-18 \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
 
-COPY --from=1 /go/bin/chainlink /usr/local/bin/
-
+# Prod images (CHAINLINK_USER=chainlink) run as UID:GID 14933:14933 for deterministic
+# ownership on bind mounts in Docker/Compose deployments without K8s securityContext overrides.
 RUN if [ ${CHAINLINK_USER} != root ]; then \
-  useradd --uid 14933 --create-home ${CHAINLINK_USER}; \
-  fi
+      groupadd --gid 14933 ${CHAINLINK_USER} && \
+      useradd --uid 14933 --gid 14933 --create-home ${CHAINLINK_USER}; \
+    fi
 USER ${CHAINLINK_USER}
+
+# Expose image metadata to the running node.
+ARG CL_AUTO_DOCKER_TAG=unset
+ENV CL_DOCKER_TAG=${CL_AUTO_DOCKER_TAG}
+
+# Set plugin environment variable configuration.
+ENV CL_SOLANA_CMD=chainlink-solana
+
+ARG CL_MEDIAN_CMD
+ENV CL_MEDIAN_CMD=${CL_MEDIAN_CMD}
+ARG CL_EVM_CMD
+ENV CL_EVM_CMD=${CL_EVM_CMD}
+
+# CCIP specific
+COPY --link ./cci[p]/confi[g] /ccip-config
+ARG CL_CHAIN_DEFAULTS
+ENV CL_CHAIN_DEFAULTS=${CL_CHAIN_DEFAULTS}
+
+# Copy binaries from the parallel build stages.
+COPY --link --from=build-remote-plugins /gobins/ /usr/local/bin/
+COPY --link --from=build-local-plugins /gobins/ /usr/local/bin/
+COPY --link --from=build-chainlink /gobins/ /usr/local/bin/
+# Copy shared libraries from the remote plugins build stage.
+COPY --link --from=build-remote-plugins /tmp/lib /usr/lib/
+
 WORKDIR /home/${CHAINLINK_USER}
+
+# Explicitly set the cache dir. Needed so both root and non-root user has an explicit location.
+ENV XDG_CACHE_HOME=/home/${CHAINLINK_USER}/.cache
+RUN mkdir -p ${XDG_CACHE_HOME}
+
+# Set up env and dir for go coverage profiling https://go.dev/doc/build-cover#FAQ
+ARG GO_COVER_DIR="/var/tmp/go-coverage"
+ENV GOCOVERDIR=${GO_COVER_DIR}
+RUN mkdir -p $GO_COVER_DIR
 
 EXPOSE 6688
 ENTRYPOINT ["chainlink"]
+HEALTHCHECK CMD curl -f http://localhost:6688/health || exit 1
 CMD ["local", "node"]
+
+FROM final AS debug
+
+COPY --link --from=build-delve /go/bin/dlv /usr/local/bin/

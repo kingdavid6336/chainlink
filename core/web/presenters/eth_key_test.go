@@ -1,65 +1,106 @@
 package presenters
 
 import (
+	"fmt"
 	"testing"
 	"time"
 
+	"github.com/ethereum/go-ethereum/common"
 	"github.com/manyminds/api2go/jsonapi"
-	"github.com/smartcontractkit/chainlink/core/assets"
-	"github.com/smartcontractkit/chainlink/core/store/models"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/smartcontractkit/chainlink-common/keystore/corekeys/ethkey"
+	commonassets "github.com/smartcontractkit/chainlink-common/pkg/assets"
+	"github.com/smartcontractkit/chainlink-common/pkg/sqlutil"
+	"github.com/smartcontractkit/chainlink-evm/pkg/assets"
+	"github.com/smartcontractkit/chainlink-evm/pkg/types"
 )
 
 func TestETHKeyResource(t *testing.T) {
+	t.Parallel()
 	var (
-		now       = time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC)
-		nextNonce = int64(1)
+		now        = time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC)
+		addressStr = "0x2aCFF2ec69aa9945Ed84f4F281eCCF6911A3B0eD"
+		address    = common.HexToAddress(addressStr)
 	)
-	address, err := models.NewEIP55Address("0x2aCFF2ec69aa9945Ed84f4F281eCCF6911A3B0eD")
+	eip55address, err := types.NewEIP55Address(addressStr)
 	require.NoError(t, err)
-
-	key := models.Key{
-		ID:        1,
-		Address:   address,
-		CreatedAt: now,
-		UpdatedAt: now,
-		NextNonce: nextNonce,
-		LastUsed:  &now,
-		IsFunding: true,
+	key := ethkey.KeyV2{
+		Address:      address,
+		EIP55Address: eip55address,
 	}
 
-	r, err := NewETHKeyResource(key,
+	state := ethkey.State{
+		ID:         1,
+		EVMChainID: *sqlutil.NewI(42),
+		Address:    eip55address,
+		CreatedAt:  now,
+		UpdatedAt:  now,
+		Disabled:   true,
+	}
+
+	r := NewETHKeyResource(key, state,
 		SetETHKeyEthBalance(assets.NewEth(1)),
-		SetETHKeyLinkBalance(assets.NewLink(1)),
+		SetETHKeyLinkBalance(commonassets.NewLinkFromJuels(1)),
+		SetETHKeyMaxGasPriceWei(sqlutil.NewI(12345)),
 	)
-	require.NoError(t, err)
 
 	assert.Equal(t, assets.NewEth(1), r.EthBalance)
-	assert.Equal(t, assets.NewLink(1), r.LinkBalance)
+	assert.Equal(t, commonassets.NewLinkFromJuels(1), r.LinkBalance)
+	assert.Equal(t, sqlutil.NewI(12345), r.MaxGasPriceWei)
 
 	b, err := jsonapi.Marshal(r)
 	require.NoError(t, err)
 
-	expected := `
+	expected := fmt.Sprintf(`
 	{
 		"data":{
 		   "type":"eTHKeys",
-		   "id":"0x2aCFF2ec69aa9945Ed84f4F281eCCF6911A3B0eD",
+		   "id":"42/%s",
 		   "attributes":{
-			  "address":"0x2aCFF2ec69aa9945Ed84f4F281eCCF6911A3B0eD",
+			  "address":"%s",
+			  "evmChainID":"42",
 			  "ethBalance":"1",
 			  "linkBalance":"1",
-			  "nextNonce":1,
-			  "lastUsed":"2000-01-01T00:00:00Z",
-			  "isFunding":true,
+			  "disabled":true,
 			  "createdAt":"2000-01-01T00:00:00Z",
 			  "updatedAt":"2000-01-01T00:00:00Z",
-			  "deletedAt":null
+			  "maxGasPriceWei":"12345"
 		   }
 		}
 	 }
-	`
+	`, addressStr, addressStr)
+
+	assert.JSONEq(t, expected, string(b))
+
+	r = NewETHKeyResource(key, state,
+		SetETHKeyEthBalance(nil),
+		SetETHKeyLinkBalance(nil),
+		SetETHKeyMaxGasPriceWei(nil),
+	)
+	b, err = jsonapi.Marshal(r)
+	require.NoError(t, err)
+
+	expected = fmt.Sprintf(`
+	{
+		"data": {
+			"type":"eTHKeys",
+			"id":"42/%s",
+			"attributes":{
+				"address":"%s",
+			  	"evmChainID":"42",
+				"ethBalance":null,
+				"linkBalance":null,
+				"disabled":true,
+				"createdAt":"2000-01-01T00:00:00Z",
+				"updatedAt":"2000-01-01T00:00:00Z",
+				"maxGasPriceWei":null
+			}
+		}
+	}`,
+		addressStr, addressStr,
+	)
 
 	assert.JSONEq(t, expected, string(b))
 }

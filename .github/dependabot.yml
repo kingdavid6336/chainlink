@@ -1,0 +1,42 @@
+version: 2
+updates:
+  # Go: Dependabot still resolves the module graph, but opens no PRs.
+  # Security patches are handled by our own workflow via the alerts API. See ./workflows/dependabump.yml
+  - package-ecosystem: "gomod"
+    directories: [ "**/*" ]
+    schedule:
+      interval: "weekly"
+    ignore:
+      - dependency-name: "*"
+  - package-ecosystem: npm
+    directory: "/"
+    schedule:
+      interval: monthly
+    open-pull-requests-limit: 0
+    ignore:
+      - dependency-name: webpack
+        versions:
+          - 5.19.0
+          - 5.24.2
+      - dependency-name: lodash
+        versions:
+          - 4.17.21
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: monthly
+    open-pull-requests-limit: 0
+  # Base image digests. apt packages are upgraded at build time, so these PRs
+  # are low-urgency: merging refreshes the base layer, ignoring them is safe.
+  - package-ecosystem: docker
+    directories: [ "/core", "/plugins", "/devenv/fakes" ]
+    schedule:
+      interval: monthly
+    open-pull-requests-limit: 1
+    groups:
+      docker-base-images:
+        patterns: [ "*" ]
+    ignore:
+      # Version bumps stay manual (Go is also pinned in go.mod/CI); digest-only updates still flow.
+      - dependency-name: "*"
+        update-types: [ "version-update:semver-major", "version-update:semver-minor", "version-update:semver-patch" ]

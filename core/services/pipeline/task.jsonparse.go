@@ -1,21 +1,34 @@
 package pipeline
 
 import (
+	"bytes"
 	"context"
-	"database/sql/driver"
-	"encoding/json"
-	"math/big"
+	stderrors "errors"
 	"strings"
 
+	"github.com/goccy/go-json"
 	"github.com/pkg/errors"
+
+	"github.com/smartcontractkit/chainlink-common/pkg/logger"
+	"github.com/smartcontractkit/chainlink-common/pkg/utils/jsonserializable"
 )
 
+// Return types:
+//
+//	float64
+//	string
+//	bool
+//	map[string]interface{}
+//	[]interface{}
+//	nil
 type JSONParseTask struct {
-	BaseTask `mapstructure:",squash"`
-	Path     JSONPath `json:"path"`
+	BaseTask  `mapstructure:",squash"`
+	Path      string `json:"path"`
+	Separator string `json:"separator"`
+	Data      string `json:"data"`
 	// Lax when disabled will return an error if the path does not exist
 	// Lax when enabled will return nil with no error if the path does not exist
-	Lax bool
+	Lax string
 }
 
 var _ Task = (*JSONParseTask)(nil)
@@ -24,84 +37,45 @@ func (t *JSONParseTask) Type() TaskType {
 	return TaskTypeJSONParse
 }
 
-func (t *JSONParseTask) SetDefaults(inputValues map[string]string, g TaskDAG, self taskDAGNode) error {
-	return nil
-}
-
-func (t *JSONParseTask) Run(_ context.Context, _ JSONSerializable, inputs []Result) (result Result) {
-	if len(inputs) != 1 {
-		return Result{Error: errors.Wrapf(ErrWrongInputCardinality, "JSONParseTask requires a single input")}
-	} else if inputs[0].Error != nil {
-		return Result{Error: inputs[0].Error}
-	}
-
-	var bs []byte
-	switch v := inputs[0].Value.(type) {
-	case []byte:
-		bs = v
-	case string:
-		bs = []byte(v)
-	default:
-		return Result{Error: errors.Errorf("JSONParseTask does not accept inputs of type %T", inputs[0].Value)}
-	}
-
-	var decoded interface{}
-	err := json.Unmarshal(bs, &decoded)
+func (t *JSONParseTask) Run(_ context.Context, _ logger.Logger, vars Vars, inputs []Result) (result Result, runInfo RunInfo) {
+	_, err := CheckInputs(inputs, 0, 1, 0)
 	if err != nil {
-		return Result{Error: err}
+		return Result{Error: errors.Wrap(err, "task inputs")}, runInfo
 	}
 
-	for _, part := range t.Path {
-		switch d := decoded.(type) {
-		case map[string]interface{}:
-			var exists bool
-			decoded, exists = d[part]
-			if !exists && t.Lax {
-				return Result{Value: nil}
-			} else if !exists {
-				return Result{Error: errors.Errorf(`could not resolve path ["%v"] in %s`, strings.Join(t.Path, `","`), bs)}
-			}
-
-		case []interface{}:
-			bigindex, ok := big.NewInt(0).SetString(part, 10)
-			if !ok {
-				return Result{Error: errors.Errorf("JSONParse task error: %v is not a valid array index", part)}
-			} else if !bigindex.IsInt64() {
-				if t.Lax {
-					return Result{Value: nil}
-				}
-				return Result{Error: errors.Errorf(`could not resolve path ["%v"] in %s`, strings.Join(t.Path, `","`), bs)}
-			}
-			index := int(bigindex.Int64())
-			if index < 0 {
-				index = len(d) + index
-			}
-
-			exists := index >= 0 && index < len(d)
-			if !exists && t.Lax {
-				return Result{Value: nil}
-			} else if !exists {
-				return Result{Error: errors.Errorf(`could not resolve path ["%v"] in %s`, strings.Join(t.Path, `","`), bs)}
-			}
-			decoded = d[index]
-
-		default:
-			return Result{Error: errors.Errorf(`could not resolve path ["%v"] in %s`, strings.Join(t.Path, `","`), bs)}
-		}
+	var sep StringParam
+	err = errors.Wrap(ResolveParam(&sep, From(t.Separator)), "separator")
+	var (
+		path = NewJSONPathParam(string(sep))
+		data BytesParam
+		lax  BoolParam
+	)
+	err = stderrors.Join(err,
+		errors.Wrap(ResolveParam(&path, From(VarExpr(t.Path, vars), t.Path)), "path"),
+		errors.Wrap(ResolveParam(&data, From(VarExpr(t.Data, vars), Input(inputs, 0))), "data"),
+		errors.Wrap(ResolveParam(&lax, From(NonemptyString(t.Lax), false)), "lax"),
+	)
+	if err != nil {
+		return Result{Error: err}, runInfo
 	}
-	return Result{Value: decoded}
-}
 
-type JSONPath []string
+	var decoded any
+	d := json.NewDecoder(bytes.NewReader(data))
+	d.UseNumber()
+	err = d.Decode(&decoded)
+	if err != nil {
+		return Result{Error: err}, runInfo
+	}
 
-func (p *JSONPath) UnmarshalText(bs []byte) error {
-	*p = strings.Split(string(bs), ",")
-	return nil
-}
+	decoded, err = traverseJSONPath(decoded, path, bool(lax))
+	if err != nil {
+		return Result{Error: errors.Wrapf(err, `could not resolve path ["%v"] in %s`, strings.Join(path, `","`), data)}, runInfo
+	}
 
-func (p *JSONPath) Scan(value interface{}) error {
-	return json.Unmarshal(value.([]byte), p)
-}
-func (p JSONPath) Value() (driver.Value, error) {
-	return json.Marshal(p)
+	decoded, err = jsonserializable.ReinterpretJSONNumbers(decoded)
+	if err != nil {
+		return Result{Error: stderrors.Join(ErrBadInput, err)}, runInfo
+	}
+
+	return Result{Value: decoded}, runInfo
 }

@@ -1,0 +1,112 @@
+package pipeline
+
+import (
+	"context"
+	"encoding/json"
+	stderrors "errors"
+	"fmt"
+	"math/big"
+
+	"github.com/pkg/errors"
+	"github.com/shopspring/decimal"
+
+	"github.com/smartcontractkit/chainlink-common/pkg/logger"
+)
+
+// Return types:
+//
+//	map[string]interface{}{
+//	    "results": []interface{} containing any other type other pipeline tasks can return
+//	    "occurrences": (int64)
+//	}
+type ModeTask struct {
+	BaseTask      `mapstructure:",squash"`
+	Values        string `json:"values"`
+	AllowedFaults string `json:"allowedFaults"`
+}
+
+var _ Task = (*ModeTask)(nil)
+
+func (t *ModeTask) Type() TaskType {
+	return TaskTypeMode
+}
+
+func (t *ModeTask) Run(_ context.Context, _ logger.Logger, vars Vars, inputs []Result) (result Result, runInfo RunInfo) {
+	var (
+		maybeAllowedFaults MaybeUint64Param
+		valuesAndErrs      SliceParam
+		allowedFaults      int
+		faults             int
+	)
+	err := stderrors.Join(
+		errors.Wrap(ResolveParam(&maybeAllowedFaults, From(t.AllowedFaults)), "allowedFaults"),
+		errors.Wrap(ResolveParam(&valuesAndErrs, From(VarExpr(t.Values, vars), JSONWithVarExprs(t.Values, vars, true), Inputs(inputs))), "values"),
+	)
+	if err != nil {
+		return Result{Error: err}, runInfo
+	}
+
+	if allowed, isSet := maybeAllowedFaults.Uint64(); isSet {
+		allowedFaults = int(allowed) //nolint:gosec // G115
+	} else {
+		allowedFaults = len(valuesAndErrs) - 1
+	}
+
+	values, faults := valuesAndErrs.FilterErrors()
+	if faults > allowedFaults {
+		return Result{Error: errors.Wrapf(ErrTooManyErrors, "Number of faulty inputs %v to mode task > number allowed faults %v", faults, allowedFaults)}, runInfo
+	} else if len(values) == 0 {
+		return Result{Error: errors.Wrap(ErrWrongInputCardinality, "values")}, runInfo
+	}
+
+	type entry struct {
+		count    uint64
+		original any
+	}
+
+	var (
+		m        = make(map[string]entry, len(values))
+		maxCount uint64
+		modes    []any
+	)
+	for _, val := range values {
+		var comparableStr string
+		switch v := val.(type) {
+		case []byte:
+			comparableStr = string(v)
+		case int, int8, int16, int32, int64, uint, uint8, uint16, uint32, uint64, float64, float32,
+			string, bool:
+			comparableStr = fmt.Sprintf("%v", v)
+		case *big.Int:
+			comparableStr = v.String()
+		case big.Int:
+			comparableStr = v.String()
+		case *decimal.Decimal:
+			comparableStr = v.String()
+		case decimal.Decimal:
+			comparableStr = v.String()
+		default:
+			bs, err := json.Marshal(v)
+			if err != nil {
+				return Result{Error: errors.Wrapf(ErrBadInput, "could not json stringify value: %v", err)}, runInfo
+			}
+			comparableStr = string(bs)
+		}
+
+		m[comparableStr] = entry{
+			count:    m[comparableStr].count + 1,
+			original: val,
+		}
+
+		if m[comparableStr].count > maxCount {
+			modes = []any{val}
+			maxCount = m[comparableStr].count
+		} else if m[comparableStr].count == maxCount {
+			modes = append(modes, val)
+		}
+	}
+	return Result{Value: map[string]any{
+		"results":     modes,
+		"occurrences": maxCount,
+	}}, runInfo
+}
